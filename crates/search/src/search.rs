@@ -90,7 +90,12 @@ impl GoogleSearch {
     ///
     /// Returns [`GthingsError::Other`] if the daemon cannot be reached
     /// or returns an error response.
-    pub async fn query(&self, q: &str, count: usize) -> Result<Vec<SearchResult>, GthingsError> {
+    pub async fn query(
+        &self,
+        q: &str,
+        count: usize,
+        deny_hosts: Option<&[String]>,
+    ) -> Result<Vec<SearchResult>, GthingsError> {
         let start = Instant::now();
 
         let result = send_request(
@@ -145,6 +150,16 @@ impl GoogleSearch {
             }
         }
 
+        // Apply deny_hosts filter if provided
+        if let Some(hosts) = deny_hosts {
+            if !hosts.is_empty() {
+                search_results = Self::filter_deny_hosts(search_results, hosts);
+            }
+        }
+
+        // Rank results
+        Self::rank_results(&mut search_results);
+
         let elapsed = start.elapsed().as_millis() as u64;
         tracing::debug!(
             query = q,
@@ -154,6 +169,40 @@ impl GoogleSearch {
         );
 
         Ok(search_results)
+    }
+
+    /// Filter out results from denied hostnames.
+    pub fn filter_deny_hosts(
+        results: Vec<SearchResult>,
+        deny_hosts: &[String],
+    ) -> Vec<SearchResult> {
+        results
+            .into_iter()
+            .filter(|r| {
+                if let Ok(url) = url::Url::parse(&r.url) {
+                    let host = url.host_str().unwrap_or("");
+                    !deny_hosts
+                        .iter()
+                        .any(|d| host == d || host.ends_with(&format!(".{}", d)))
+                } else {
+                    true
+                }
+            })
+            .collect()
+    }
+
+    /// Rank results by quality score.
+    /// Prefers: organic blocks > longer snippets > https > shorter URLs.
+    pub fn rank_results(results: &mut Vec<SearchResult>) {
+        results.sort_by(|a, b| {
+            // Prefer longer snippets (more context)
+            let snippet_cmp = b.snippet.len().cmp(&a.snippet.len());
+            // Tiebreak: prefer https
+            let a_https = a.url.starts_with("https://");
+            let b_https = b.url.starts_with("https://");
+            let https_cmp = b_https.cmp(&a_https);
+            snippet_cmp.then(https_cmp)
+        });
     }
 
     /// Batch search multiple queries.
@@ -168,6 +217,7 @@ impl GoogleSearch {
         &self,
         queries: &[String],
         count: usize,
+        deny_hosts: Option<&[String]>,
     ) -> Result<BatchSearchResult, GthingsError> {
         if queries.is_empty() {
             return Ok(BatchSearchResult {
@@ -184,7 +234,7 @@ impl GoogleSearch {
         let mut all_results = Vec::new();
 
         for q in queries {
-            let mut results = self.query(q, count).await?;
+            let mut results = self.query(q, count, deny_hosts).await?;
             all_results.append(&mut results);
         }
 

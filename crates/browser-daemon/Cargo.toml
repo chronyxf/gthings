@@ -17,6 +17,7 @@ clap = { workspace = true, features = ["derive"] }
 reqwest = { workspace = true }
 url = { workspace = true }
 urlencoding = "2"
+futures = "0.3"
 
 [lints]
 workspace = true

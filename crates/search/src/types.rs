@@ -89,7 +89,8 @@ pub struct HarvestMeta {
 }
 
 /// Options for the [`PageFollower`](crate::PageFollower) operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct FollowOpts {
     /// CSS selector to identify the main content element.
     pub selector: String,
@@ -101,6 +102,8 @@ pub struct FollowOpts {
     pub timeout_ms: u64,
     /// Whether to retry with fallback selector if content quality is low.
     pub retry_on_low_quality: bool,
+    /// Number of pages to fetch concurrently.
+    pub concurrency: usize,
 }
 
 impl Default for FollowOpts {
@@ -111,6 +114,74 @@ impl Default for FollowOpts {
             max_length: 15000,
             timeout_ms: 30000,
             retry_on_low_quality: true,
+            concurrency: 1,
         }
     }
+}
+
+// ── Daemon RPC request types ──
+
+/// Parameters for a batch search RPC to the daemon.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BatchSearchRequest {
+    pub queries: Vec<String>,
+    pub count: usize,
+    pub concurrency: usize,
+    pub deny_hosts: Vec<String>,
+}
+
+/// Parameters for a batch follow RPC to the daemon.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BatchFollowRequest {
+    pub urls: Vec<String>,
+    pub selector: Option<String>,
+    pub max_chars: usize,
+    pub concurrency: usize,
+}
+
+/// Parameters for the combined harvest RPC to the daemon.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HarvestRequest {
+    pub queries: Vec<String>,
+    pub count: usize,
+    pub follow_top_k: usize,
+    pub search_concurrency: usize,
+    pub follow_concurrency: usize,
+    pub max_chars: usize,
+    pub deny_hosts: Vec<String>,
+}
+
+/// A single search hit from daemon batch search.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SearchHit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+    pub query: Option<String>,
+    pub block_rank: Option<usize>,
+}
+
+// ── Daemon RPC response types ──
+
+/// Response from daemon batch search.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BatchSearchResponse {
+    pub results: Vec<SearchHit>,
+    pub total: usize,
+    pub duration_ms: u64,
+}
+
+/// Response from daemon batch follow.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BatchFollowResponse {
+    pub pages: Vec<FollowResult>,
+    pub duration_ms: u64,
+}
+
+/// Response from daemon harvest RPC.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HarvestResponse {
+    pub search_results: Vec<SearchHit>,
+    pub read_pages: Vec<FollowResult>,
+    pub meta: HarvestMeta,
 }

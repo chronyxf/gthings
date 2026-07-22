@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use futures::future::join_all;
 
 use cdp_core::CdpConnection;
+use cdp_core::session_pool::SessionPool;
 use common::GthingsError;
 
 use crate::chrome::ChromeInstance;
@@ -68,19 +70,59 @@ const EXTRACTION_JS: &str = r#"(offset, maxLen, sel) => {
     return JSON.stringify({content:sliced,total_length:text.length,returned_length:sliced.length,offset,truncated:sliced.length < text.length - offset,sections});
 }"#;
 
-/// Google SERP extraction JS — returns JSON array: [{title, url, snippet}]
+/// Google SERP extraction JS — returns JSON array: [{title, url, snippet, block_rank}]
+/// Uses organic result container detection where available (Google data-hveid blocks),
+/// falls back to external link filtering.
 const SEARCH_JS: &str = r#"(count) => {
-    const items = Array.from(document.querySelectorAll('a[href]'))
-        .filter(a => {
-            const href = a.href || '';
+    // Strategy 1: Try organic result containers (Google's data-hveid blocks)
+    const organicBlocks = document.querySelectorAll('div[data-hveid]');
+    let results = [];
+    if (organicBlocks.length > 0) {
+        for (var i = 0; i < organicBlocks.length && results.length < count; i++) {
+            let block = organicBlocks[i];
+            let link = block.querySelector('a[href]');
+            if (!link) continue;
             try {
-                const u = new URL(href);
-                return u.hostname !== location.hostname && u.pathname !== '/search' && a.innerText.trim().length > 0;
-            } catch(e) { return false; }
-        })
-        .slice(0, count)
-        .map(a => ({title: a.innerText.trim(), url: a.href, snippet: ''}));
-    return JSON.stringify(items);
+                let u = new URL(link.href);
+                // Skip Google internal pages
+                if (u.hostname.includes('google.com') && u.hostname !== 'www.google.com') continue;
+                if (u.hostname === 'www.google.com' && (u.pathname.startsWith('/search') || u.pathname.startsWith('/imgres'))) continue;
+                // Skip empty links
+                if (!link.innerText.trim()) continue;
+                results.push({
+                    title: link.innerText.trim(),
+                    url: link.href,
+                    snippet: '',
+                    block_rank: i + 1
+                });
+            } catch(e) {}
+        }
+    }
+
+    // Strategy 2: Fallback to external link filtering (if organic strategy gave < count/2)
+    if (results.length < Math.max(1, Math.floor(count / 2))) {
+        const fallback = Array.from(document.querySelectorAll('a[href]'))
+            .filter(a => {
+                try {
+                    const u = new URL(a.href);
+                    // Exclude Google chrome pages
+                    if (u.hostname.includes('google.com') && !['www.google.com', 'scholar.google.com'].includes(u.hostname)) return false;
+                    if (u.pathname.startsWith('/search') || u.pathname.startsWith('/url?')) return false;
+                    return a.innerText.trim().length > 0;
+                } catch(e) { return false; }
+            })
+            .slice(0, count)
+            .map((a, i) => ({title: a.innerText.trim(), url: a.href, snippet: '', block_rank: null}));
+        // Merge fallback into results, dedup by URL
+        const seenUrls = new Set(results.map(r => r.url));
+        for (let fb of fallback) {
+            if (!seenUrls.has(fb.url) && results.length < count) {
+                results.push(fb);
+                seenUrls.add(fb.url);
+            }
+        }
+    }
+    return JSON.stringify(results);
 }"#;
 
 /// Configuration for the CDP daemon.
@@ -115,6 +157,7 @@ pub struct CdpDaemon {
     pub browser: Option<cdp_core::Browser>,
     pub started_at: Option<std::time::Instant>,
     pub chrome_pid: Option<u32>,
+    pub pool: Option<Arc<SessionPool>>,
 }
 
 impl CdpDaemon {
@@ -125,6 +168,7 @@ impl CdpDaemon {
             browser: None,
             started_at: None,
             chrome_pid: None,
+            pool: None,
         }
     }
 
@@ -203,6 +247,10 @@ impl CdpDaemon {
         self.conn = Some(conn);
         self.started_at = Some(std::time::Instant::now());
 
+        // Initialize session pool
+        let pool = SessionPool::new(self.conn.as_ref().unwrap().clone(), 8);
+        self.pool = Some(Arc::new(pool));
+
         // ── Start UDS server ──────────────────────────────────────────
         let daemon = Arc::new(self);
         let server =
@@ -252,6 +300,9 @@ impl CdpDaemon {
             "follow" => self.handle_follow_exec(req.id, req.params).await,
             "screenshot" => self.handle_screenshot_exec(req.id, req.params).await,
             "scrape" => self.handle_scrape_exec(req.id, req.params).await,
+            "search.batch" => self.handle_search_batch(req.id, req.params).await,
+            "follow.batch" => self.handle_follow_batch(req.id, req.params).await,
+            "harvest" => self.handle_harvest(req.id, req.params).await,
             _ => DaemonResponse {
                 id: req.id,
                 ok: false,
@@ -1350,6 +1401,227 @@ impl CdpDaemon {
         }
     }
 
+    // ── Batch RPC handlers ────────────────────────────────────────────
+
+    async fn handle_search_batch(&self, id: u64, params: Option<serde_json::Value>) -> DaemonResponse {
+        let params = params.unwrap_or_default();
+        let queries: Vec<String> = params["queries"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if queries.is_empty() {
+            return error_response(id, "Missing or empty 'queries' parameter");
+        }
+        let count = params["count"].as_u64().unwrap_or(10) as usize;
+        let concurrency = params["concurrency"].as_u64().unwrap_or(3) as usize;
+        let deny_hosts: Vec<String> = params["deny_hosts"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let pool = match &self.pool {
+            Some(p) => p.clone(),
+            None => return error_response(id, "Session pool not initialized"),
+        };
+
+        let start = std::time::Instant::now();
+        let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut handles = Vec::new();
+
+        for query in &queries {
+            let pool = pool.clone();
+            let sem = sem.clone();
+            let q = query.clone();
+            let deny = deny_hosts.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                execute_search_batch(&pool, &q, count, &deny).await
+            }));
+        }
+
+        let results: Vec<serde_json::Value> = join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .flatten()
+            .collect();
+
+        // Merge results
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for item in results {
+            if let Some(url) = item["url"].as_str() {
+                if seen.insert(url.to_string()) {
+                    deduped.push(item);
+                }
+            }
+        }
+
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        success_response(id, serde_json::json!({
+            "results": deduped,
+            "total": deduped.len(),
+            "duration_ms": elapsed,
+        }))
+    }
+
+    async fn handle_follow_batch(&self, id: u64, params: Option<serde_json::Value>) -> DaemonResponse {
+        let params = params.unwrap_or_default();
+        let urls: Vec<String> = params["urls"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if urls.is_empty() {
+            return error_response(id, "Missing or empty 'urls' parameter");
+        }
+        let max_chars = params["max_chars"].as_u64().unwrap_or(50_000) as usize;
+        let concurrency = params["concurrency"].as_u64().unwrap_or(3) as usize;
+
+        let pool = match &self.pool {
+            Some(p) => p.clone(),
+            None => return error_response(id, "Session pool not initialized"),
+        };
+
+        let start = std::time::Instant::now();
+        let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut handles = Vec::new();
+
+        for url in urls {
+            let pool = pool.clone();
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                execute_follow_batch(&pool, &url, max_chars).await
+            }));
+        }
+
+        let pages: Vec<serde_json::Value> = join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        success_response(id, serde_json::json!({
+            "pages": pages,
+            "duration_ms": elapsed,
+        }))
+    }
+
+    async fn handle_harvest(&self, id: u64, params: Option<serde_json::Value>) -> DaemonResponse {
+        let params = params.unwrap_or_default();
+        let queries: Vec<String> = params["queries"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if queries.is_empty() {
+            return error_response(id, "Missing or empty 'queries' parameter");
+        }
+        let count = params["count"].as_u64().unwrap_or(10) as usize;
+        let follow_top_k = params["follow_top_k"].as_u64().unwrap_or(3) as usize;
+        let search_concurrency = params["search_concurrency"].as_u64().unwrap_or(3) as usize;
+        let follow_concurrency = params["follow_concurrency"].as_u64().unwrap_or(3) as usize;
+        let max_chars = params["max_chars"].as_u64().unwrap_or(50_000) as usize;
+        let deny_hosts: Vec<String> = params["deny_hosts"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let pool = match &self.pool {
+            Some(p) => p.clone(),
+            None => return error_response(id, "Session pool not initialized"),
+        };
+
+        let start = std::time::Instant::now();
+
+        // ── Phase 1: Batch search ──────────────────────────────────
+        let sem = Arc::new(tokio::sync::Semaphore::new(search_concurrency));
+        let mut handles = Vec::new();
+
+        for query in &queries {
+            let pool = pool.clone();
+            let sem = sem.clone();
+            let q = query.clone();
+            let deny = deny_hosts.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                execute_search_batch(&pool, &q, count, &deny).await
+            }));
+        }
+
+        let all_results: Vec<serde_json::Value> = join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .flatten()
+            .collect();
+
+        // Dedup by URL
+        let mut seen_urls = std::collections::HashSet::new();
+        let mut deduped: Vec<serde_json::Value> = Vec::new();
+        for item in all_results {
+            let url = item["url"].as_str().unwrap_or("");
+            if seen_urls.insert(url.to_string()) {
+                deduped.push(item);
+            }
+        }
+
+        // Rank by snippet length descending, then https
+        deduped.sort_by(|a, b| {
+            let a_snippet = a["snippet"].as_str().unwrap_or("").len();
+            let b_snippet = b["snippet"].as_str().unwrap_or("").len();
+            b_snippet.cmp(&a_snippet)
+                .then_with(|| {
+                    let a_https = a["url"].as_str().unwrap_or("").starts_with("https://");
+                    let b_https = b["url"].as_str().unwrap_or("").starts_with("https://");
+                    b_https.cmp(&a_https)
+                })
+        });
+
+        // Take top_k
+        let top_urls: Vec<String> = deduped.iter()
+            .take(follow_top_k)
+            .filter_map(|v| v["url"].as_str().map(String::from))
+            .collect();
+
+        let total_search_results = deduped.len();
+        let unique_urls = seen_urls.len();
+
+        // ── Phase 2: Batch follow ──────────────────────────────────
+        let sem = Arc::new(tokio::sync::Semaphore::new(follow_concurrency));
+        let mut handles = Vec::new();
+
+        for url in &top_urls {
+            let pool = pool.clone();
+            let sem = sem.clone();
+            let u = url.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                execute_follow_batch(&pool, &u, max_chars).await
+            }));
+        }
+
+        let read_pages: Vec<serde_json::Value> = join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let pages_followed = read_pages.len();
+        let pages_skipped = read_pages.iter().filter(|p| p["success"].as_bool().unwrap_or(false) == false).count();
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        success_response(id, serde_json::json!({
+            "search_results": deduped,
+            "read_pages": read_pages,
+            "meta": {
+                "queries": queries,
+                "total_search_results": total_search_results,
+                "unique_urls": unique_urls,
+                "pages_followed": pages_followed,
+                "pages_skipped": pages_skipped,
+                "duration_ms": elapsed,
+            }
+        }))
+    }
+
     // ── Lifecycle helpers ──────────────────────────────────────────────
 
     /// Write our PID to the PID file atomically (tmp + rename).
@@ -1434,4 +1706,177 @@ async fn close_tab(conn: &CdpConnection, session_id: &str, target_id: &str) {
             Some(serde_json::json!({"targetId": target_id})),
         )
         .await;
+}
+
+// ── Batch operation helpers (free functions, not on CdpDaemon) ──────────────
+
+/// Execute a single search query using a pooled session.
+async fn execute_search_batch(
+    pool: &Arc<SessionPool>,
+    query: &str,
+    count: usize,
+    deny_hosts: &[String],
+) -> Vec<serde_json::Value> {
+    let pooled = match pool.checkout().await {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    // Navigate to Google
+    let search_url = format!(
+        "https://www.google.com/search?q={}&num={}&hl=en",
+        urlencoding::encode(query),
+        count.min(100)
+    );
+
+    // Page.enable
+    let _ = pooled.session().call("Page.enable", None).await;
+
+    // Navigate
+    if let Err(_) = pooled.session().call("Page.navigate", Some(serde_json::json!({"url": search_url}))).await {
+        return Vec::new();
+    }
+
+    // Wait for domcontentloaded + settle (800ms)
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // Check readyState
+    for _ in 0..20 {
+        if let Ok(ready) = pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
+            "expression": "document.readyState",
+            "returnByValue": true
+        }))).await {
+            if ready["result"]["value"].as_str() == Some("complete") {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    // Add an extra 800ms settle for JS rendering
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    // Execute SEARCH_JS
+    let js = format!("({})({})", SEARCH_JS, count);
+    let items = match pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
+        "expression": js,
+        "returnByValue": true,
+        "awaitPromise": true
+    }))).await {
+        Ok(v) => {
+            let items_str = v["result"]["value"].as_str().unwrap_or("[]");
+            serde_json::from_str::<Vec<serde_json::Value>>(items_str).unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    };
+
+    // Retry once with trailing space if empty
+    let items = if items.is_empty() {
+        let retry_url = format!(
+            "https://www.google.com/search?q={}&num={}&hl=en",
+            urlencoding::encode(&format!("{} ", query)),
+            count.min(100)
+        );
+        let _ = pooled.session().call("Page.navigate", Some(serde_json::json!({"url": retry_url}))).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        for _ in 0..20 {
+            if let Ok(ready) = pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
+                "expression": "document.readyState",
+                "returnByValue": true
+            }))).await {
+                if ready["result"]["value"].as_str() == Some("complete") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        let js = format!("({})({})", SEARCH_JS, count);
+        match pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
+            "expression": js,
+            "returnByValue": true,
+            "awaitPromise": true
+        }))).await {
+            Ok(v) => {
+                let items_str = v["result"]["value"].as_str().unwrap_or("[]");
+                serde_json::from_str::<Vec<serde_json::Value>>(items_str).unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        }
+    } else {
+        items
+    };
+
+    // Filter deny_hosts
+    let items: Vec<serde_json::Value> = items.into_iter().filter(|item| {
+        let url = item["url"].as_str().unwrap_or("");
+        let host = url.split('/').nth(2).unwrap_or("");
+        !deny_hosts.iter().any(|d| host == d || host.ends_with(&format!(".{}", d)))
+    }).collect();
+
+    items
+}
+
+/// Follow a single URL using a pooled session.
+async fn execute_follow_batch(
+    pool: &Arc<SessionPool>,
+    url: &str,
+    max_chars: usize,
+) -> serde_json::Value {
+    let pooled = match pool.checkout().await {
+        Ok(s) => s,
+        Err(_) => return serde_json::json!({"success": false, "url": url, "error": "session checkout failed"}),
+    };
+
+    // Normalise arXiv URLs (same logic as existing)
+    let normalised = if url.contains("arxiv.org") {
+        let u = url.replace("export.arxiv.org", "arxiv.org");
+        let u = u.replace("/pdf/", "/abs/");
+        u.strip_suffix(".pdf").unwrap_or(&u).to_string()
+    } else {
+        url.to_string()
+    };
+
+    // Page.enable
+    let _ = pooled.session().call("Page.enable", None).await;
+
+    // Navigate
+    if let Err(_) = pooled.session().call("Page.navigate", Some(serde_json::json!({"url": normalised}))).await {
+        return serde_json::json!({"success": false, "url": url, "error": "navigation failed"});
+    }
+
+    // Wait for complete or timeout after 20s
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok(ready) = pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
+            "expression": "document.readyState",
+            "returnByValue": true
+        }))).await {
+            if ready["result"]["value"].as_str() == Some("complete") {
+                break;
+            }
+        }
+    }
+
+    // Extract content using EXTRACTION_JS with the configured max_chars
+    let js = format!(
+        "({})(0,{},'article,main,[role=main]')",
+        EXTRACTION_JS, max_chars
+    );
+
+    match pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
+        "expression": js,
+        "returnByValue": true,
+        "awaitPromise": true
+    }))).await {
+        Ok(v) => {
+            let content_str = v["result"]["value"].as_str().unwrap_or("{}");
+            let mut content: serde_json::Value = serde_json::from_str(content_str).unwrap_or_default();
+            content["url"] = serde_json::Value::String(url.to_string());
+            content["success"] = serde_json::Value::Bool(true);
+            content
+        }
+        Err(e) => serde_json::json!({"success": false, "url": url, "error": e.to_string()})
+    }
 }

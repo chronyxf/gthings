@@ -33,7 +33,7 @@ pub async fn handle_search_query(
     json: bool,
 ) -> Result<(), anyhow::Error> {
     let searcher = search::GoogleSearch::new(config.clone());
-    let results = searcher.query(query, count).await?;
+    let results = searcher.query(query, count, None).await?;
 
     let meta = SearchMeta {
         total: results.len(),
@@ -59,16 +59,28 @@ pub async fn handle_search_batch(
     Ok(())
 }
 
-/// Handler for `search harvest <queries...> [--count N] [--max N]`
+/// Handler for `search harvest <queries...> [--count N] [--max N] [--concurrency N] [--follow-concurrency N]`
 pub async fn handle_search_harvest(
     config: &GthingsConfig,
     queries: &[String],
     count: usize,
     max: Option<usize>,
+    concurrency: Option<usize>,
+    follow_concurrency: Option<usize>,
     json: bool,
 ) -> Result<(), anyhow::Error> {
     let max_pages = max.unwrap_or(count);
-    let processor = search::BatchProcessor::new(config.clone());
+
+    // Apply CLI overrides to config
+    let mut config = config.clone();
+    if let Some(c) = concurrency {
+        config.search_concurrency = c;
+    }
+    if let Some(fc) = follow_concurrency {
+        config.follow_concurrency = fc;
+    }
+
+    let processor = search::BatchProcessor::new(config);
     let result = processor.harvest(queries, count, max_pages).await?;
 
     if json {

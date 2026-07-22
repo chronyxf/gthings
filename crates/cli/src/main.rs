@@ -94,6 +94,12 @@ enum SearchCommand {
         count: usize,
         #[arg(long)]
         max: Option<usize>,
+        /// Max concurrent search tabs (default: from env or 3)
+        #[arg(long)]
+        concurrency: Option<usize>,
+        /// Max concurrent follow tabs (default: from env or 3)
+        #[arg(long, name = "follow-concurrency")]
+        follow_concurrency: Option<usize>,
     },
 }
 
@@ -211,9 +217,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 queries,
                 count,
                 max,
+                concurrency,
+                follow_concurrency,
             } => {
-                search_commands::handle_search_harvest(&config, queries, *count, *max, cli.json)
-                    .await
+                search_commands::handle_search_harvest(
+                    &config, queries, *count, *max, *concurrency, *follow_concurrency, cli.json,
+                )
+                .await
             }
         },
         Command::Follow(args) => match &args.command {
@@ -350,9 +360,17 @@ fn command_metadata(cmd: &Command) -> (&'static str, serde_json::Value) {
                 queries,
                 count,
                 max,
+                concurrency,
+                follow_concurrency,
             } => (
                 "search_harvest",
-                serde_json::json!({"queries_count": queries.len(), "count": count, "max": max}),
+                serde_json::json!({
+                    "queries_count": queries.len(),
+                    "count": count,
+                    "max": max,
+                    "concurrency": concurrency,
+                    "follow_concurrency": follow_concurrency,
+                }),
             ),
         },
         Command::Follow(args) => match &args.command {

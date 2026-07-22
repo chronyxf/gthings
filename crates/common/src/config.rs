@@ -15,6 +15,14 @@ pub struct GthingsConfig {
     pub log_level: String,
     /// Request timeout in milliseconds.
     pub request_timeout_ms: u64,
+    /// Max concurrent tabs for search phase (default 3).
+    pub search_concurrency: usize,
+    /// Max concurrent tabs for follow phase (default 3).
+    pub follow_concurrency: usize,
+    /// Max chars per page extraction (default 50000).
+    pub max_chars: usize,
+    /// Hostnames to exclude from SERP results (e.g. Google chrome pages).
+    pub deny_hosts: Vec<String>,
 }
 
 impl Default for GthingsConfig {
@@ -27,6 +35,14 @@ impl Default for GthingsConfig {
             cache_ttl_secs: 3600,
             log_level: "info".to_string(),
             request_timeout_ms: 30_000,
+            search_concurrency: 3,
+            follow_concurrency: 3,
+            max_chars: 50_000,
+            deny_hosts: vec![
+                "accounts.google.com".to_string(),
+                "support.google.com".to_string(),
+                "policies.google.com".to_string(),
+            ],
         }
     }
 }
@@ -46,6 +62,10 @@ impl GthingsConfig {
     /// | `GTHINGS_CACHE_TTL_SECS`  | `cache_ttl_secs`   |
     /// | `GTHINGS_LOG_LEVEL`       | `log_level`        |
     /// | `GTHINGS_REQUEST_TIMEOUT` | `request_timeout_ms` |
+    /// | `GTHINGS_SEARCH_CONCURRENCY` | `search_concurrency` |
+    /// | `GTHINGS_FOLLOW_CONCURRENCY` | `follow_concurrency` |
+    /// | `GTHINGS_MAX_CHARS`       | `max_chars`        |
+    /// | `GTHINGS_DENY_HOSTS`      | `deny_hosts`       |
     pub fn from_env() -> Self {
         let defaults = Self::default();
 
@@ -75,6 +95,27 @@ impl GthingsConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(defaults.request_timeout_ms),
+            search_concurrency: std::env::var("GTHINGS_SEARCH_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.search_concurrency),
+            follow_concurrency: std::env::var("GTHINGS_FOLLOW_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.follow_concurrency),
+            max_chars: std::env::var("GTHINGS_MAX_CHARS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.max_chars),
+            deny_hosts: std::env::var("GTHINGS_DENY_HOSTS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or(defaults.deny_hosts),
         }
     }
 }
