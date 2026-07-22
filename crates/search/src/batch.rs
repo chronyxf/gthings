@@ -43,7 +43,10 @@ async fn send_request_value(method: &str, params: Option<Value>) -> Result<Value
 
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    reader.read_line(&mut line).await.map_err(GthingsError::Io)?;
+    reader
+        .read_line(&mut line)
+        .await
+        .map_err(GthingsError::Io)?;
 
     let response: Value =
         serde_json::from_str(&line).map_err(|e| GthingsError::Parse(e.to_string()))?;
@@ -249,9 +252,8 @@ impl BatchProcessor {
 
         let meta = HarvestMeta {
             queries: queries.to_vec(),
-            total_search_results: result["meta"]["total_search_results"]
-                .as_u64()
-                .unwrap_or(0) as usize,
+            total_search_results: result["meta"]["total_search_results"].as_u64().unwrap_or(0)
+                as usize,
             unique_urls: result["meta"]["unique_urls"].as_u64().unwrap_or(0) as usize,
             pages_followed: result["meta"]["pages_followed"].as_u64().unwrap_or(0) as usize,
             pages_skipped: result["meta"]["pages_skipped"].as_u64().unwrap_or(0) as usize,

@@ -1,14 +1,14 @@
+use futures::future::join_all;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use futures::future::join_all;
 
 use cdp_core::CdpConnection;
 use cdp_core::session_pool::SessionPool;
 use common::GthingsError;
 
 use crate::chrome::ChromeInstance;
-use crate::ipc::{DaemonRequest, DaemonResponse};
+use crate::ipc::{DaemonContext, DaemonRequest, DaemonResponse};
 
 #[cfg(target_os = "macos")]
 use std::process::Command as StdCommand;
@@ -158,6 +158,8 @@ pub struct CdpDaemon {
     pub started_at: Option<std::time::Instant>,
     pub chrome_pid: Option<u32>,
     pub pool: Option<Arc<SessionPool>>,
+    pub browser_type: String,
+    pub connection_method: String, // "discovered" or "launched"
 }
 
 impl CdpDaemon {
@@ -169,6 +171,8 @@ impl CdpDaemon {
             started_at: None,
             chrome_pid: None,
             pool: None,
+            browser_type: "unknown".into(),
+            connection_method: "unknown".into(),
         }
     }
 
@@ -190,6 +194,16 @@ impl CdpDaemon {
                 tracing::info!(
                     "Discovered existing Chrome on port {}",
                     self.config.cdp_port
+                );
+
+                // Capture browser identity even when reusing an existing browser
+                self.chrome_pid = ChromeInstance::get_browser_pid(self.config.cdp_port);
+                self.browser_type = ChromeInstance::detect_browser_type(self.config.cdp_port).await;
+                self.connection_method = "discovered".into();
+                tracing::info!(
+                    browser_type = %self.browser_type,
+                    browser_pid = ?self.chrome_pid,
+                    "Discovered existing browser"
                 );
                 url
             }
@@ -216,6 +230,8 @@ impl CdpDaemon {
                 });
 
                 self.chrome_pid = Some(chrome_pid);
+                self.browser_type = ChromeInstance::detect_browser_type(self.config.cdp_port).await;
+                self.connection_method = "launched".into();
                 url
             }
         };
@@ -303,6 +319,7 @@ impl CdpDaemon {
             "search.batch" => self.handle_search_batch(req.id, req.params).await,
             "follow.batch" => self.handle_follow_batch(req.id, req.params).await,
             "harvest" => self.handle_harvest(req.id, req.params).await,
+            "get_context" => self.handle_get_context(req.id).await,
             _ => DaemonResponse {
                 id: req.id,
                 ok: false,
@@ -339,11 +356,47 @@ impl CdpDaemon {
             result: Some(serde_json::json!({
                 "running": running,
                 "pid": pid,
+                "browser_pid": self.chrome_pid,
+                "browser_type": self.browser_type,
+                "connection_method": self.connection_method,
                 "cdp_port": cdp_port,
                 "chrome_connected": chrome_connected,
                 "uptime_secs": uptime_secs,
                 "version": version,
             })),
+            error: None,
+        }
+    }
+
+    async fn handle_get_context(&self, id: u64) -> DaemonResponse {
+        let version = if let Some(ref conn) = self.conn {
+            match conn.call("Browser.getVersion", None).await {
+                Ok(v) => v
+                    .get("product")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                Err(_) => "unknown".into(),
+            }
+        } else {
+            "unknown".into()
+        };
+
+        let ctx = DaemonContext {
+            daemon_pid: std::process::id(),
+            browser_pid: self.chrome_pid,
+            browser_type: self.browser_type.clone(),
+            browser_version: version,
+            cdp_port: self.config.cdp_port,
+            connection_method: self.connection_method.clone(),
+            uptime_secs: self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+            chrome_connected: self.conn.is_some(),
+        };
+
+        DaemonResponse {
+            id,
+            ok: true,
+            result: Some(serde_json::to_value(&ctx).unwrap_or_default()),
             error: None,
         }
     }
@@ -1403,18 +1456,32 @@ impl CdpDaemon {
 
     // ── Batch RPC handlers ────────────────────────────────────────────
 
-    async fn handle_search_batch(&self, id: u64, params: Option<serde_json::Value>) -> DaemonResponse {
+    async fn handle_search_batch(
+        &self,
+        id: u64,
+        params: Option<serde_json::Value>,
+    ) -> DaemonResponse {
         let params = params.unwrap_or_default();
-        let queries: Vec<String> = params["queries"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        let queries: Vec<String> = params["queries"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         if queries.is_empty() {
             return error_response(id, "Missing or empty 'queries' parameter");
         }
         let count = params["count"].as_u64().unwrap_or(10) as usize;
         let concurrency = params["concurrency"].as_u64().unwrap_or(3) as usize;
-        let deny_hosts: Vec<String> = params["deny_hosts"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        let deny_hosts: Vec<String> = params["deny_hosts"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let pool = match &self.pool {
@@ -1457,17 +1524,29 @@ impl CdpDaemon {
 
         let elapsed = start.elapsed().as_millis() as u64;
 
-        success_response(id, serde_json::json!({
-            "results": deduped,
-            "total": deduped.len(),
-            "duration_ms": elapsed,
-        }))
+        success_response(
+            id,
+            serde_json::json!({
+                "results": deduped,
+                "total": deduped.len(),
+                "duration_ms": elapsed,
+            }),
+        )
     }
 
-    async fn handle_follow_batch(&self, id: u64, params: Option<serde_json::Value>) -> DaemonResponse {
+    async fn handle_follow_batch(
+        &self,
+        id: u64,
+        params: Option<serde_json::Value>,
+    ) -> DaemonResponse {
         let params = params.unwrap_or_default();
-        let urls: Vec<String> = params["urls"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        let urls: Vec<String> = params["urls"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         if urls.is_empty() {
             return error_response(id, "Missing or empty 'urls' parameter");
@@ -1501,16 +1580,24 @@ impl CdpDaemon {
 
         let elapsed = start.elapsed().as_millis() as u64;
 
-        success_response(id, serde_json::json!({
-            "pages": pages,
-            "duration_ms": elapsed,
-        }))
+        success_response(
+            id,
+            serde_json::json!({
+                "pages": pages,
+                "duration_ms": elapsed,
+            }),
+        )
     }
 
     async fn handle_harvest(&self, id: u64, params: Option<serde_json::Value>) -> DaemonResponse {
         let params = params.unwrap_or_default();
-        let queries: Vec<String> = params["queries"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        let queries: Vec<String> = params["queries"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         if queries.is_empty() {
             return error_response(id, "Missing or empty 'queries' parameter");
@@ -1520,8 +1607,13 @@ impl CdpDaemon {
         let search_concurrency = params["search_concurrency"].as_u64().unwrap_or(3) as usize;
         let follow_concurrency = params["follow_concurrency"].as_u64().unwrap_or(3) as usize;
         let max_chars = params["max_chars"].as_u64().unwrap_or(50_000) as usize;
-        let deny_hosts: Vec<String> = params["deny_hosts"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        let deny_hosts: Vec<String> = params["deny_hosts"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let pool = match &self.pool {
@@ -1567,16 +1659,16 @@ impl CdpDaemon {
         deduped.sort_by(|a, b| {
             let a_snippet = a["snippet"].as_str().unwrap_or("").len();
             let b_snippet = b["snippet"].as_str().unwrap_or("").len();
-            b_snippet.cmp(&a_snippet)
-                .then_with(|| {
-                    let a_https = a["url"].as_str().unwrap_or("").starts_with("https://");
-                    let b_https = b["url"].as_str().unwrap_or("").starts_with("https://");
-                    b_https.cmp(&a_https)
-                })
+            b_snippet.cmp(&a_snippet).then_with(|| {
+                let a_https = a["url"].as_str().unwrap_or("").starts_with("https://");
+                let b_https = b["url"].as_str().unwrap_or("").starts_with("https://");
+                b_https.cmp(&a_https)
+            })
         });
 
         // Take top_k
-        let top_urls: Vec<String> = deduped.iter()
+        let top_urls: Vec<String> = deduped
+            .iter()
             .take(follow_top_k)
             .filter_map(|v| v["url"].as_str().map(String::from))
             .collect();
@@ -1605,21 +1697,27 @@ impl CdpDaemon {
             .collect();
 
         let pages_followed = read_pages.len();
-        let pages_skipped = read_pages.iter().filter(|p| p["success"].as_bool().unwrap_or(false) == false).count();
+        let pages_skipped = read_pages
+            .iter()
+            .filter(|p| p["success"].as_bool().unwrap_or(false) == false)
+            .count();
         let elapsed = start.elapsed().as_millis() as u64;
 
-        success_response(id, serde_json::json!({
-            "search_results": deduped,
-            "read_pages": read_pages,
-            "meta": {
-                "queries": queries,
-                "total_search_results": total_search_results,
-                "unique_urls": unique_urls,
-                "pages_followed": pages_followed,
-                "pages_skipped": pages_skipped,
-                "duration_ms": elapsed,
-            }
-        }))
+        success_response(
+            id,
+            serde_json::json!({
+                "search_results": deduped,
+                "read_pages": read_pages,
+                "meta": {
+                    "queries": queries,
+                    "total_search_results": total_search_results,
+                    "unique_urls": unique_urls,
+                    "pages_followed": pages_followed,
+                    "pages_skipped": pages_skipped,
+                    "duration_ms": elapsed,
+                }
+            }),
+        )
     }
 
     // ── Lifecycle helpers ──────────────────────────────────────────────
@@ -1733,7 +1831,14 @@ async fn execute_search_batch(
     let _ = pooled.session().call("Page.enable", None).await;
 
     // Navigate
-    if let Err(_) = pooled.session().call("Page.navigate", Some(serde_json::json!({"url": search_url}))).await {
+    if let Err(_) = pooled
+        .session()
+        .call(
+            "Page.navigate",
+            Some(serde_json::json!({"url": search_url})),
+        )
+        .await
+    {
         return Vec::new();
     }
 
@@ -1742,10 +1847,17 @@ async fn execute_search_batch(
 
     // Check readyState
     for _ in 0..20 {
-        if let Ok(ready) = pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
-            "expression": "document.readyState",
-            "returnByValue": true
-        }))).await {
+        if let Ok(ready) = pooled
+            .session()
+            .call(
+                "Runtime.evaluate",
+                Some(serde_json::json!({
+                    "expression": "document.readyState",
+                    "returnByValue": true
+                })),
+            )
+            .await
+        {
             if ready["result"]["value"].as_str() == Some("complete") {
                 break;
             }
@@ -1758,11 +1870,18 @@ async fn execute_search_batch(
 
     // Execute SEARCH_JS
     let js = format!("({})({})", SEARCH_JS, count);
-    let items = match pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
-        "expression": js,
-        "returnByValue": true,
-        "awaitPromise": true
-    }))).await {
+    let items = match pooled
+        .session()
+        .call(
+            "Runtime.evaluate",
+            Some(serde_json::json!({
+                "expression": js,
+                "returnByValue": true,
+                "awaitPromise": true
+            })),
+        )
+        .await
+    {
         Ok(v) => {
             let items_str = v["result"]["value"].as_str().unwrap_or("[]");
             serde_json::from_str::<Vec<serde_json::Value>>(items_str).unwrap_or_default()
@@ -1777,14 +1896,24 @@ async fn execute_search_batch(
             urlencoding::encode(&format!("{} ", query)),
             count.min(100)
         );
-        let _ = pooled.session().call("Page.navigate", Some(serde_json::json!({"url": retry_url}))).await;
+        let _ = pooled
+            .session()
+            .call("Page.navigate", Some(serde_json::json!({"url": retry_url})))
+            .await;
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
         for _ in 0..20 {
-            if let Ok(ready) = pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
-                "expression": "document.readyState",
-                "returnByValue": true
-            }))).await {
+            if let Ok(ready) = pooled
+                .session()
+                .call(
+                    "Runtime.evaluate",
+                    Some(serde_json::json!({
+                        "expression": "document.readyState",
+                        "returnByValue": true
+                    })),
+                )
+                .await
+            {
                 if ready["result"]["value"].as_str() == Some("complete") {
                     break;
                 }
@@ -1793,11 +1922,18 @@ async fn execute_search_batch(
         }
 
         let js = format!("({})({})", SEARCH_JS, count);
-        match pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
-            "expression": js,
-            "returnByValue": true,
-            "awaitPromise": true
-        }))).await {
+        match pooled
+            .session()
+            .call(
+                "Runtime.evaluate",
+                Some(serde_json::json!({
+                    "expression": js,
+                    "returnByValue": true,
+                    "awaitPromise": true
+                })),
+            )
+            .await
+        {
             Ok(v) => {
                 let items_str = v["result"]["value"].as_str().unwrap_or("[]");
                 serde_json::from_str::<Vec<serde_json::Value>>(items_str).unwrap_or_default()
@@ -1809,11 +1945,16 @@ async fn execute_search_batch(
     };
 
     // Filter deny_hosts
-    let items: Vec<serde_json::Value> = items.into_iter().filter(|item| {
-        let url = item["url"].as_str().unwrap_or("");
-        let host = url.split('/').nth(2).unwrap_or("");
-        !deny_hosts.iter().any(|d| host == d || host.ends_with(&format!(".{}", d)))
-    }).collect();
+    let items: Vec<serde_json::Value> = items
+        .into_iter()
+        .filter(|item| {
+            let url = item["url"].as_str().unwrap_or("");
+            let host = url.split('/').nth(2).unwrap_or("");
+            !deny_hosts
+                .iter()
+                .any(|d| host == d || host.ends_with(&format!(".{}", d)))
+        })
+        .collect();
 
     items
 }
@@ -1826,7 +1967,9 @@ async fn execute_follow_batch(
 ) -> serde_json::Value {
     let pooled = match pool.checkout().await {
         Ok(s) => s,
-        Err(_) => return serde_json::json!({"success": false, "url": url, "error": "session checkout failed"}),
+        Err(_) => {
+            return serde_json::json!({"success": false, "url": url, "error": "session checkout failed"});
+        }
     };
 
     // Normalise arXiv URLs (same logic as existing)
@@ -1842,17 +1985,31 @@ async fn execute_follow_batch(
     let _ = pooled.session().call("Page.enable", None).await;
 
     // Navigate
-    if let Err(_) = pooled.session().call("Page.navigate", Some(serde_json::json!({"url": normalised}))).await {
+    if let Err(_) = pooled
+        .session()
+        .call(
+            "Page.navigate",
+            Some(serde_json::json!({"url": normalised})),
+        )
+        .await
+    {
         return serde_json::json!({"success": false, "url": url, "error": "navigation failed"});
     }
 
     // Wait for complete or timeout after 20s
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Ok(ready) = pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
-            "expression": "document.readyState",
-            "returnByValue": true
-        }))).await {
+        if let Ok(ready) = pooled
+            .session()
+            .call(
+                "Runtime.evaluate",
+                Some(serde_json::json!({
+                    "expression": "document.readyState",
+                    "returnByValue": true
+                })),
+            )
+            .await
+        {
             if ready["result"]["value"].as_str() == Some("complete") {
                 break;
             }
@@ -1865,18 +2022,26 @@ async fn execute_follow_batch(
         EXTRACTION_JS, max_chars
     );
 
-    match pooled.session().call("Runtime.evaluate", Some(serde_json::json!({
-        "expression": js,
-        "returnByValue": true,
-        "awaitPromise": true
-    }))).await {
+    match pooled
+        .session()
+        .call(
+            "Runtime.evaluate",
+            Some(serde_json::json!({
+                "expression": js,
+                "returnByValue": true,
+                "awaitPromise": true
+            })),
+        )
+        .await
+    {
         Ok(v) => {
             let content_str = v["result"]["value"].as_str().unwrap_or("{}");
-            let mut content: serde_json::Value = serde_json::from_str(content_str).unwrap_or_default();
+            let mut content: serde_json::Value =
+                serde_json::from_str(content_str).unwrap_or_default();
             content["url"] = serde_json::Value::String(url.to_string());
             content["success"] = serde_json::Value::Bool(true);
             content
         }
-        Err(e) => serde_json::json!({"success": false, "url": url, "error": e.to_string()})
+        Err(e) => serde_json::json!({"success": false, "url": url, "error": e.to_string()}),
     }
 }

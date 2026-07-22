@@ -131,10 +131,7 @@ impl SessionPool {
     /// 2. `Target.attachToTarget` with `flatten: true` (via `Session::attach`)
     async fn create_session(&self) -> Result<Session, CdpError> {
         let params = serde_json::json!({"url": "about:blank"});
-        let result = self
-            .conn
-            .call("Target.createTarget", Some(params))
-            .await?;
+        let result = self.conn.call("Target.createTarget", Some(params)).await?;
         let target_id = result["targetId"]
             .as_str()
             .ok_or_else(|| {

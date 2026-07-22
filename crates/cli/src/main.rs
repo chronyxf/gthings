@@ -6,6 +6,8 @@ mod search_commands;
 use clap::Parser;
 use std::io::Write;
 use std::time::SystemTime;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 #[derive(clap::Parser)]
 #[command(
@@ -181,6 +183,40 @@ enum BrowserCommand {
     },
 }
 
+/// Fetch the daemon context from the UDS socket for trace enrichment.
+///
+/// Returns `None` if the daemon is not reachable (commands that need the
+/// daemon will fail separately; this is best-effort enrichment).
+async fn fetch_daemon_context() -> Option<serde_json::Value> {
+    let socket_path = std::env::var("GTHINGS_DAEMON_SOCKET")
+        .unwrap_or_else(|_| "/tmp/gthings-daemon.sock".to_string());
+
+    let stream = match UnixStream::connect(&socket_path).await {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let (reader, mut writer) = stream.into_split();
+    let request = serde_json::json!({"id": 1, "method": "get_context", "params": null});
+    let mut buf = serde_json::to_vec(&request).ok()?;
+    buf.push(b'\n');
+    writer.write_all(&buf).await.ok()?;
+    writer.shutdown().await.ok()?;
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.ok()?;
+
+    let response: serde_json::Value = serde_json::from_str(&line).ok()?;
+    if response["ok"].as_bool().unwrap_or(false) {
+        response["result"]
+            .as_object()
+            .map(|_| response["result"].clone())
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
@@ -202,6 +238,9 @@ async fn main() -> Result<(), anyhow::Error> {
             .as_nanos()
     );
     let trace_path = cli.trace.clone();
+    // Fetch daemon context for trace enrichment (best-effort)
+    let daemon_context = fetch_daemon_context().await;
+
     let cmd_start = std::time::Instant::now();
     let (tool_name, tool_args) = command_metadata(&cli.command);
 
@@ -221,7 +260,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 follow_concurrency,
             } => {
                 search_commands::handle_search_harvest(
-                    &config, queries, *count, *max, *concurrency, *follow_concurrency, cli.json,
+                    &config,
+                    queries,
+                    *count,
+                    *max,
+                    *concurrency,
+                    *follow_concurrency,
+                    cli.json,
                 )
                 .await
             }
@@ -316,7 +361,7 @@ async fn main() -> Result<(), anyhow::Error> {
             "duration_ms": cmd_duration_ms,
             "exit": exit_code,
         });
-        write_trace(path, &record);
+        write_trace(path, &record, &daemon_context);
     }
 
     result
@@ -324,13 +369,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
 /// Write a trace record to the trace file (if configured).
 /// Format: JSONL — one JSON object per line.
-fn write_trace(trace_path: &str, record: &serde_json::Value) {
+fn write_trace(trace_path: &str, record: &serde_json::Value, context: &Option<serde_json::Value>) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(trace_path)
     {
-        let mut line = serde_json::to_string(record).unwrap_or_default();
+        let mut record = record.clone();
+        if let Some(ctx) = context {
+            record["context"] = ctx.clone();
+        }
+        let mut line = serde_json::to_string(&record).unwrap_or_default();
         line.push('\n');
         let _ = file.write_all(line.as_bytes());
     }

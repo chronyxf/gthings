@@ -1,7 +1,10 @@
+use std::fs::File;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tracing_subscriber::prelude::*;
 
 use browser_daemon::{CdpDaemon, DaemonConfig};
 
@@ -45,6 +48,40 @@ async fn main() -> Result<()> {
                 profile_dir: profile_dir.map(PathBuf::from),
                 ..Default::default()
             };
+            // ── Initialize tracing ──────────────────────────────────────────
+            // Write JSONL trace to the daemon log file for diagnostics.
+            // The CLI's --trace captures command telemetry; this captures
+            // daemon-internal events (discovery, connection, errors).
+            let log_path = config.log_path.clone();
+            if let Ok(log_file) = File::create(&log_path) {
+                let file_layer = tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(Arc::new(log_file))
+                    .with_target(true)
+                    .with_thread_ids(true);
+                let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(file_layer)
+                    .init();
+
+                tracing::info!(path = %log_path.display(), "daemon logging initialized");
+            } else {
+                eprintln!(
+                    "Warning: Could not create daemon log at {}",
+                    log_path.display()
+                );
+                // Fallback to stderr logging
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    )
+                    .init();
+            }
+
             let daemon = CdpDaemon::new(config);
             daemon.run().await?;
         }

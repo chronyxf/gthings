@@ -209,6 +209,193 @@ impl ChromeInstance {
         None
     }
 
+    /// Known DevToolsActivePort paths for all supported browsers.
+    fn devtools_active_port_paths() -> Vec<PathBuf> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        vec![
+            PathBuf::from(format!(
+                "{home}/Library/Application Support/Dia/User Data/DevToolsActivePort"
+            )),
+            PathBuf::from(format!(
+                "{home}/Library/Application Support/Dia/DevToolsActivePort"
+            )),
+            PathBuf::from(format!(
+                "{home}/Library/Application Support/Google/Chrome/DevToolsActivePort"
+            )),
+            PathBuf::from(format!(
+                "{home}/Library/Application Support/Chromium/DevToolsActivePort"
+            )),
+            PathBuf::from(format!(
+                "{home}/Library/Application Support/Microsoft Edge/DevToolsActivePort"
+            )),
+            PathBuf::from(format!(
+                "{home}/Library/Application Support/BraveSoftware/Brave-Browser/DevToolsActivePort"
+            )),
+        ]
+    }
+
+    /// Read the browser PID from DevToolsActivePort files.
+    ///
+    /// DevToolsActivePort format:
+    ///   Line 0: port number
+    ///   Line 1: WebSocket path (e.g. /devtools/browser/...)
+    ///   Line 2: browser PID (optional, present in Dia and some Chrome versions)
+    ///
+    /// Returns `Some(pid)` if a file with matching port is found and line 2
+    /// contains a valid PID, `None` otherwise.
+    pub fn get_browser_pid(port: u16) -> Option<u32> {
+        for path in Self::devtools_active_port_paths() {
+            let content = std::fs::read_to_string(&path).ok()?;
+            let lines: Vec<&str> = content.trim().lines().collect();
+            if lines.len() >= 3 {
+                // Line 0: port
+                let file_port: u16 = lines[0].trim().parse().ok()?;
+                if file_port == port {
+                    // Line 2: PID
+                    if let Ok(pid) = lines[2].trim().parse::<u32>() {
+                        if pid > 0 {
+                            return Some(pid);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Detect which browser is listening on the given CDP port.
+    ///
+    /// Uses a combination of HTTP endpoint behavior and DevToolsActivePort
+    /// file paths to determine the browser type.
+    ///
+    /// Returns a string identifier: "chrome", "dia", "chromium", "edge",
+    /// "brave", "opera", "vivaldi", "arc", or "unknown".
+    pub async fn detect_browser_type(port: u16) -> String {
+        // Try HTTP /json/version — returns 404 for Dia but works for Chrome/Edge/Brave
+        let version_url = format!("http://127.0.0.1:{port}/json/version");
+        match reqwest::get(&version_url).await {
+            Ok(resp) if resp.status().is_success() => {
+                // Standard Chrome-like endpoint — try to identify from product string
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(product) = json["product"].as_str() {
+                        let lower = product.to_lowercase();
+                        if lower.contains("dia") {
+                            return "dia".into();
+                        }
+                        if lower.contains("chrome") {
+                            return "chrome".into();
+                        }
+                        if lower.contains("chromium") {
+                            return "chromium".into();
+                        }
+                        if lower.contains("edge") {
+                            return "edge".into();
+                        }
+                        if lower.contains("brave") {
+                            return "brave".into();
+                        }
+                        if lower.contains("opera") {
+                            return "opera".into();
+                        }
+                        if lower.contains("vivaldi") {
+                            return "vivaldi".into();
+                        }
+                        if lower.contains("arc") {
+                            return "arc".into();
+                        }
+                    }
+                }
+                "chrome".to_string() // default for standard CDP without identifiable product
+            }
+            Ok(_) => {
+                // HTTP response but non-success (e.g. 404) — Dia's /json/version returns 404
+                // Check if /json works instead (Dia-specific)
+                let json_url = format!("http://127.0.0.1:{port}/json");
+                match reqwest::get(&json_url).await {
+                    Ok(resp) if resp.status().is_success() => {
+                        // /json succeeded but /json/version failed — likely Dia
+                        // Double-check via DevToolsActivePort paths
+                        if Self::has_dia_active_port(port) {
+                            return "dia".into();
+                        }
+                        // If no Dia port file but /json works without /json/version,
+                        // assume Dia-like (non-standard Chrome)
+                        return "dia".into();
+                    }
+                    _ => {}
+                }
+                // Fallback: check DevToolsActivePort paths
+                Self::detect_from_active_port(port)
+            }
+            Err(_) => {
+                // Network error (connection refused, etc.) — check files
+                Self::detect_from_active_port(port)
+            }
+        }
+    }
+
+    /// Check if a Dia DevToolsActivePort file exists for the given port.
+    fn has_dia_active_port(port: u16) -> bool {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dia_paths = [
+            format!("{home}/Library/Application Support/Dia/User Data/DevToolsActivePort"),
+            format!("{home}/Library/Application Support/Dia/DevToolsActivePort"),
+        ];
+        for path in &dia_paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(first_line) = content.lines().next() {
+                    if first_line.trim().parse::<u16>() == Ok(port) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Detect browser type from DevToolsActivePort file paths.
+    fn detect_from_active_port(port: u16) -> String {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let checks = [
+            (
+                "dia",
+                format!("{home}/Library/Application Support/Dia/User Data/DevToolsActivePort"),
+            ),
+            (
+                "dia",
+                format!("{home}/Library/Application Support/Dia/DevToolsActivePort"),
+            ),
+            (
+                "chrome",
+                format!("{home}/Library/Application Support/Google/Chrome/DevToolsActivePort"),
+            ),
+            (
+                "chromium",
+                format!("{home}/Library/Application Support/Chromium/DevToolsActivePort"),
+            ),
+            (
+                "edge",
+                format!("{home}/Library/Application Support/Microsoft Edge/DevToolsActivePort"),
+            ),
+            (
+                "brave",
+                format!(
+                    "{home}/Library/Application Support/BraveSoftware/Brave-Browser/DevToolsActivePort"
+                ),
+            ),
+        ];
+        for (browser, path) in &checks {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(first_line) = content.lines().next() {
+                    if first_line.trim().parse::<u16>() == Ok(port) {
+                        return browser.to_string();
+                    }
+                }
+            }
+        }
+        "unknown".into()
+    }
+
     /// Discover Chrome WebSocket URL from HTTP endpoint.
     /// Tries /json/version first, falls back to /json and /json/list.
     /// Then reads DevToolsActivePort files (Dia Browser doesn't expose HTTP
@@ -272,17 +459,7 @@ impl ChromeInstance {
         // Fallback: read DevToolsActivePort files (Dia Browser).
         // Dia doesn't expose /json/* HTTP endpoints but writes the WS path
         // to its profile's DevToolsActivePort file.
-        let home = std::env::var("HOME").unwrap_or_default();
-        let active_port_paths = [
-            format!("{home}/Library/Application Support/Dia/User Data/DevToolsActivePort"),
-            format!("{home}/Library/Application Support/Dia/DevToolsActivePort"),
-            format!("{home}/Library/Application Support/Google/Chrome/DevToolsActivePort"),
-            format!("{home}/Library/Application Support/Chromium/DevToolsActivePort"),
-            format!("{home}/Library/Application Support/Microsoft Edge/DevToolsActivePort"),
-            format!(
-                "{home}/Library/Application Support/BraveSoftware/Brave-Browser/DevToolsActivePort"
-            ),
-        ];
+        let active_port_paths = Self::devtools_active_port_paths();
 
         for path in &active_port_paths {
             if let Ok(content) = tokio::fs::read_to_string(path).await {
