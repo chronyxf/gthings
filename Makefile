@@ -65,3 +65,12 @@ version:
 # Full release workflow
 release: check version
 	@echo "Ready to commit. Review changes with git diff."
+
+# Install skills to global agent directory
+install-skills:
+	@bash scripts/install-skills.sh
+	@echo "Skills installed. AI agents can now load: skill gthings"
+
+# Full setup: build + test + install skills
+setup: build test install-skills
+	@echo "Setup complete. Run: gthings browser start --port 9222"
