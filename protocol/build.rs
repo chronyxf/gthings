@@ -545,11 +545,8 @@ fn generate_property_field(
 fn main() {
     let manifest_dir_str = env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest_dir = Path::new(&manifest_dir_str);
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
-    let sdk_dir = workspace_root.join("skills").join("cdp").join("sdk");
-
-    let browser_path = sdk_dir.join("browser_protocol.json");
-    let js_path = sdk_dir.join("js_protocol.json");
+    let browser_path = manifest_dir.join("browser_protocol.json");
+    let js_path = manifest_dir.join("js_protocol.json");
 
     // Parse both protocol files
     let browser_data: Protocol =
@@ -774,10 +771,16 @@ fn main() {
     }
 
     // Write output
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("cdp.rs");
     let code = g.result();
-    std::fs::write(&dest_path, &code).unwrap();
+
+    // Write to OUT_DIR (for cargo build)
+    let out_dir = env::var("OUT_DIR").unwrap();
+    std::fs::write(Path::new(&out_dir).join("cdp.rs"), &code).unwrap();
+
+    // Also write to generated/ (for repo, committed)
+    let generated_dir = manifest_dir.join("generated");
+    std::fs::create_dir_all(&generated_dir).unwrap();
+    std::fs::write(generated_dir.join("cdp.rs"), &code).unwrap();
 
     let stats = format!(
         "Generated {} domains, {} commands, {} events",
@@ -787,8 +790,7 @@ fn main() {
     );
     println!("cargo:warning=cdp-protocol: {}", stats);
     println!(
-        "cargo:warning=cdp-protocol: wrote {} ({} bytes)",
-        dest_path.display(),
+        "cargo:warning=cdp-protocol: wrote OUT_DIR/cdp.rs + generated/cdp.rs ({} bytes)",
         code.len()
     );
 }

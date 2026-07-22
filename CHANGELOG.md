@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Minor Changes
 
+- Add SessionPool for concurrent CDP tab reuse in cdp-core
+- Add batch RPC handlers for search.batch, follow.batch, and harvest to daemon
+- Rewrite search harvest to use single daemon RPC instead of per-query UDS loop
+- Improve SEARCH_JS with organic block detection and deny_hosts filtering
+- Add --concurrency and --follow-concurrency CLI flags to search harvest
+- Add search_concurrency, follow_concurrency, max_chars, deny_hosts config
+- Benchmark: 29-35% faster after batch refactor
+
+### Patch Changes
+
+- Move cdp-protocol crate from crates/ to protocol/ directory
+- Pre-generate cdp.rs, add protocol/generated/ to .gitignore
+- JSON protocol files now self-contained in protocol/ (not skills/cdp/sdk/)
+- Remove stale skills/cdp/ directory
+
+---
+
 - Migrate from shell+TypeScript to native Rust (7 crates, static binary)
 - Add persistent daemon with UDS protocol replacing bun subprocesses
 - Add --trace flag for per-command JSONL agent telemetry

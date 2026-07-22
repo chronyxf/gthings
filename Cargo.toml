@@ -21,7 +21,7 @@ members = [
     "crates/extraction",
     "crates/search",
     "crates/cli",
-    "crates/cdp-protocol",
+    "protocol",
     "crates/cdp-core",
     "crates/browser-daemon",
 ]
