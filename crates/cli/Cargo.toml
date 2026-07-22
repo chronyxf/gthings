@@ -1,0 +1,22 @@
+[package]
+name = "gthings"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+search = { path = "../search" }
+extraction = { path = "../extraction" }
+clap = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+base64 = "0.22"
+reqwest = { workspace = true }
+
+[lints]
+workspace = true

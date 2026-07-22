@@ -1,0 +1,371 @@
+use common::cache::Sha256DiskCache;
+use extraction::html::HtmlExtractor;
+use extraction::quality::{ContentQuality, QualityResult};
+
+// ════════════════════════════════════════════════════════════════════════════════
+// CACHE TESTS (common::Sha256DiskCache)
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_cache_key_generation() {
+    let cache = Sha256DiskCache::new("/tmp/gthings-test-cache", 3600);
+    let key = cache.key("https://example.com", 0, 15000);
+    assert!(!key.is_empty(), "Cache key should not be empty");
+    // Same inputs produce same key
+    let key2 = cache.key("https://example.com", 0, 15000);
+    assert_eq!(key, key2, "Same inputs should produce same key");
+    // Different inputs produce different keys
+    let key3 = cache.key("https://example.com", 100, 15000);
+    assert_ne!(key, key3, "Different offset should produce different key");
+}
+
+#[test]
+fn test_cache_set_and_get() {
+    let tmp = std::env::temp_dir().join("gthings-int-cache-test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let cache = Sha256DiskCache::new(&tmp, 3600);
+    let key = cache.key("https://test.cache/test", 0, 100);
+
+    // Miss
+    let miss = cache.get(&key).unwrap();
+    assert!(miss.is_none(), "New cache key should miss");
+
+    // Set
+    cache.set(&key, "test data");
+
+    // Hit
+    let hit = cache.get(&key).unwrap();
+    assert_eq!(
+        hit,
+        Some("test data".to_string()),
+        "Should retrieve cached data"
+    );
+}
+
+#[test]
+fn test_cache_ttl_expiry() {
+    let tmp = std::env::temp_dir().join("gthings-int-cache-ttl");
+    let _ = std::fs::remove_dir_all(&tmp);
+    // TTL = 0 means every read expires immediately
+    let cache = Sha256DiskCache::new(&tmp, 0);
+    let key = cache.key("https://test.expiry/test", 0, 100);
+
+    cache.set(&key, "expirable data");
+    // With TTL=0, the cache should see this as expired
+    let hit = cache.get(&key).unwrap();
+    assert!(
+        hit.is_none(),
+        "TTL=0 should expire immediately. Got: {:?}",
+        hit
+    );
+}
+
+#[test]
+fn test_cache_persists_across_instances() {
+    let tmp = std::env::temp_dir().join("gthings-int-cache-persist");
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Write with one instance
+    let cache1 = Sha256DiskCache::new(&tmp, 3600);
+    let key = cache1.key("https://persist.test/data", 0, 50);
+    cache1.set(&key, "persistent data");
+
+    // Read with another instance
+    let cache2 = Sha256DiskCache::new(&tmp, 3600);
+    let hit = cache2.get(&key).unwrap();
+    assert_eq!(
+        hit,
+        Some("persistent data".to_string()),
+        "Cache should persist across instances"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// HTML EXTRACTION TESTS (extraction::HtmlExtractor)
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_html_extract_sections() {
+    let html = r#"
+        <html><body><article>
+            <h1>Financial Report 2026</h1>
+            <p>Market overview content here.</p>
+            <h2>Interest Rates</h2>
+            <p>The Fed held rates at 3.50-3.75%.</p>
+            <h2>Inflation Outlook</h2>
+            <p>PCE inflation at 4.1%.</p>
+        </article></body></html>
+    "#;
+
+    let result = HtmlExtractor::extract(html, "article").unwrap();
+    assert!(!result.sections.is_empty(), "Should detect sections");
+    assert!(
+        result
+            .sections
+            .iter()
+            .any(|s| s.heading == "Financial Report 2026"),
+        "Should find h1 heading"
+    );
+    assert!(
+        result
+            .sections
+            .iter()
+            .any(|s| s.heading == "Interest Rates"),
+        "Should find h2 heading"
+    );
+}
+
+#[test]
+fn test_html_extract_empty() {
+    let result = HtmlExtractor::extract("", "body").unwrap();
+    assert!(
+        result.content.is_empty(),
+        "Empty HTML should give empty content"
+    );
+    assert_eq!(result.total_length, 0);
+    assert!(result.sections.is_empty());
+}
+
+#[test]
+fn test_html_extract_fallback_selector() {
+    let html = r#"<html><body><p>Fallback content works.</p></body></html>"#;
+    let result = HtmlExtractor::extract(html, "nonexistent-selector").unwrap();
+    assert!(
+        result.content.contains("Fallback content"),
+        "Should fallback to body"
+    );
+}
+
+#[test]
+fn test_strip_tags_simple() {
+    let result = HtmlExtractor::strip_tags("<p>Hello <b>world</b></p>");
+    assert_eq!(result, "Hello world");
+}
+
+#[test]
+fn test_strip_tags_with_entities() {
+    let result = HtmlExtractor::strip_tags("<p>AT&amp;T &lt; test</p>");
+    assert_eq!(result, "AT&T < test");
+}
+
+#[test]
+fn test_strip_tags_empty() {
+    assert_eq!(HtmlExtractor::strip_tags(""), "");
+    assert_eq!(HtmlExtractor::strip_tags("<div></div>"), "");
+}
+
+#[test]
+fn test_detect_sections_from_text() {
+    // All-caps heading detection (needs 15+ chars)
+    let text = "INTRODUCTION TO THE STUDY\nSome intro text here.\n\nMAIN METHODOLOGY USED\nMethod details here.\n";
+    let sections = HtmlExtractor::detect_sections(text);
+    assert!(!sections.is_empty(), "Should detect ALL CAPS sections");
+    assert!(
+        sections
+            .iter()
+            .any(|s| s.heading.contains("INTRODUCTION TO THE STUDY"))
+    );
+}
+
+#[test]
+fn test_detect_sections_colon_heading() {
+    let text = "Introduction:\nIntro content.\n\nResults:\nResult content.\n";
+    let sections = HtmlExtractor::detect_sections(text);
+    assert!(!sections.is_empty(), "Should detect colon headings");
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// QUALITY VALIDATION TESTS (extraction::ContentQuality)
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_quality_valid_content() {
+    let text = "This is a sufficiently long piece of text with natural language. \
+                It has sentences, punctuation, and enough words to pass. \
+                This content should be considered acceptable.";
+    let result = ContentQuality::validate(text);
+    assert!(result.is_ok, "Valid text should pass quality gate");
+    assert!(result.score >= 0.5, "Score should be >= 0.5");
+}
+
+#[test]
+fn test_quality_empty_content() {
+    let result = ContentQuality::validate("");
+    assert!(!result.is_ok, "Empty should fail");
+    assert_eq!(result.score, 0.0);
+    assert!(result.reasons.contains(&"empty_content".to_string()));
+}
+
+#[test]
+fn test_quality_too_short() {
+    let result = ContentQuality::validate("Hi");
+    assert!(!result.is_ok);
+    assert!(result.reasons.contains(&"too_short".to_string()));
+}
+
+#[test]
+fn test_quality_bot_detection() {
+    assert!(ContentQuality::detect_bot(
+        "Checking your browser before accessing"
+    ));
+    assert!(ContentQuality::detect_bot("Just a moment..."));
+    assert!(ContentQuality::detect_bot("cloudflare challenge"));
+    assert!(!ContentQuality::detect_bot("Normal article content here"));
+}
+
+#[test]
+fn test_quality_captcha_detection() {
+    assert!(ContentQuality::detect_captcha("recaptcha widget"));
+    assert!(ContentQuality::detect_captcha("cf-turnstile"));
+    assert!(!ContentQuality::detect_captcha("normal content"));
+}
+
+#[test]
+fn test_quality_paywall_detection() {
+    assert!(ContentQuality::detect_paywall(
+        "Subscribe now to continue reading"
+    ));
+    assert!(ContentQuality::detect_paywall(
+        "Log in to read this article"
+    ));
+    assert!(!ContentQuality::detect_paywall(
+        "This is normal article content"
+    ));
+}
+
+#[test]
+fn test_quality_empty_shell() {
+    assert!(ContentQuality::detect_empty_shell("short"));
+    assert!(ContentQuality::detect_empty_shell(
+        "Please enable JavaScript to view this page."
+    ));
+    assert!(!ContentQuality::detect_empty_shell(
+        "This is a sufficiently long text with many words that should not be detected as an empty shell."
+    ));
+}
+
+#[test]
+fn test_quality_needs_recrawl() {
+    let low = QualityResult {
+        score: 0.2,
+        is_ok: false,
+        reasons: vec!["too_short".into()],
+        length: 10,
+    };
+    assert!(ContentQuality::needs_recrawl(&low));
+
+    let good = QualityResult {
+        score: 0.7,
+        is_ok: true,
+        reasons: vec![],
+        length: 1000,
+    };
+    assert!(!ContentQuality::needs_recrawl(&good));
+}
+
+#[test]
+fn test_quality_secondary_check() {
+    let result = ContentQuality::secondary_check("Just a few words");
+    assert!(result.sparse, "Few words should be sparse");
+
+    let repetitive = "This is a repeated sentence. This is a repeated sentence. This is a repeated sentence. This is a repeated sentence.";
+    let r = ContentQuality::secondary_check(repetitive);
+    assert!(r.repetitive, "Repeated content should be detected");
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// SEARCH TYPE TESTS (search::types)
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_follow_result_serialization() {
+    let result = search::types::FollowResult {
+        success: true,
+        url: "https://example.com".into(),
+        content: Some("test content".into()),
+        total_length: 12,
+        offset: 0,
+        truncated: false,
+        sections: vec![extraction::html::Section {
+            heading: "Title".into(),
+            content: "Body text".into(),
+        }],
+        error: None,
+        quality: Some(extraction::quality::QualityResult {
+            score: 1.0,
+            is_ok: true,
+            reasons: vec![],
+            length: 12,
+        }),
+    };
+
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(
+        json.contains("\"sections\""),
+        "JSON should include sections"
+    );
+    assert!(json.contains("\"quality\""), "JSON should include quality");
+    assert!(
+        json.contains("\"heading\":\"Title\""),
+        "JSON should include heading"
+    );
+
+    // Round-trip
+    let parsed: search::types::FollowResult = serde_json::from_str(&json).unwrap();
+    assert!(parsed.success);
+    assert_eq!(parsed.url, "https://example.com");
+    assert_eq!(parsed.sections.len(), 1);
+}
+
+#[test]
+fn test_harvest_meta_serialization() {
+    let meta = search::types::HarvestMeta {
+        queries: vec!["fed rates".into(), "inflation".into()],
+        total_search_results: 10,
+        unique_urls: 7,
+        pages_followed: 5,
+        pages_skipped: 2,
+        duration_ms: 3500,
+    };
+
+    let json = serde_json::to_string(&meta).unwrap();
+    assert!(
+        json.contains("\"unique_urls\":7"),
+        "Should include unique_urls"
+    );
+    assert!(
+        json.contains("\"pages_skipped\":2"),
+        "Should include pages_skipped"
+    );
+    assert!(
+        json.contains("\"duration_ms\":3500"),
+        "Should include duration_ms"
+    );
+
+    let parsed: search::types::HarvestMeta = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.unique_urls, 7);
+    assert_eq!(parsed.pages_skipped, 2);
+}
+
+#[test]
+fn test_search_result_with_query() {
+    let result = search::types::SearchResult {
+        title: "Fed Rate 2026".into(),
+        url: "https://example.com/fed".into(),
+        snippet: "The Fed kept rates at 3.50-3.75%".into(),
+        query: Some("fed rates 2026".into()),
+    };
+
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(json.contains("\"query\""), "Should include query field");
+}
+
+#[test]
+fn test_follow_opts_defaults() {
+    let opts = search::types::FollowOpts::default();
+    assert_eq!(opts.selector, "article,main,[role=main]");
+    assert_eq!(opts.offset, 0);
+    assert_eq!(opts.max_length, 15000);
+    assert_eq!(opts.timeout_ms, 30000);
+    assert!(opts.retry_on_low_quality);
+}
