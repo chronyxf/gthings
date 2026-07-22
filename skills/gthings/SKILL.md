@@ -1,3 +1,9 @@
+---
+name: gthings
+description: "Web research toolkit — search, read, extract PDFs, screenshot, scrape. Multi-topic batch harvest, page content with section detection, quality gate, and agent telemetry. Persistent daemon, zero runtime dependencies. Use ONLY for web research — not local file ops or system admin."
+compatibility: "Rust 1.85+, Chrome or Chromium browser"
+---
+
 # Skill: gthings
 
 Browser automation and web research toolkit. Native Rust binary — no shell, no TypeScript, no bun. Single static binary with a persistent daemon for all browser operations.
