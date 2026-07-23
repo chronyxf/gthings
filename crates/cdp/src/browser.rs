@@ -1,10 +1,10 @@
+use crate::connection::Connection;
+use crate::error::{CdpError, Result};
+use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::io::{BufRead, BufReader};
-use serde::{Deserialize, Serialize};
 use tracing;
-use crate::error::{Result, CdpError};
-use crate::connection::Connection;
 
 const CDP_PORT: u16 = 9222;
 
@@ -31,9 +31,8 @@ impl Browser {
         }
         tracing::info!("No existing browser found, launching new one");
 
-        let chrome_path = Self::find_chrome().ok_or_else(|| {
-            CdpError::LaunchFailed("No Chrome/Chromium browser found".into())
-        })?;
+        let chrome_path = Self::find_chrome()
+            .ok_or_else(|| CdpError::LaunchFailed("No Chrome/Chromium browser found".into()))?;
 
         let port = CDP_PORT;
 
@@ -42,11 +41,14 @@ impl Browser {
             .unwrap_or_else(|| std::path::PathBuf::from(format!("/tmp/cdp-profile-{}", port)));
         Self::clean_profile_locks(&profile_dir);
 
-        tracing::info!("Launching Chrome on port {} with profile {:?}", port, profile_dir);
+        tracing::info!(
+            "Launching Chrome on port {} with profile {:?}",
+            port,
+            profile_dir
+        );
 
         let mut cmd = Command::new(&chrome_path);
-        cmd
-            .arg(format!("--remote-debugging-port={}", port))
+        cmd.arg(format!("--remote-debugging-port={}", port))
             .arg("--no-first-run")
             .arg("--remote-allow-origins=*")
             .arg(format!("--user-data-dir={}", profile_dir.display()))
@@ -55,13 +57,14 @@ impl Browser {
             .stdout(Stdio::null())
             .stdin(Stdio::null());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            CdpError::LaunchFailed(format!("Failed to spawn Chrome: {e}"))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| CdpError::LaunchFailed(format!("Failed to spawn Chrome: {e}")))?;
 
-        let stderr = child.stderr.take().ok_or_else(|| {
-            CdpError::LaunchFailed("No stderr on Chrome process".into())
-        })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| CdpError::LaunchFailed("No stderr on Chrome process".into()))?;
 
         // Read stderr line by line looking for the DevTools URL
         let reader = BufReader::new(stderr);
@@ -176,16 +179,16 @@ impl Browser {
 
     /// Clean browser profile lock files before launching
     fn clean_profile_locks(profile_dir: &std::path::Path) {
-        let lock_files = ["SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort"];
+        let lock_files = [
+            "SingletonLock",
+            "SingletonSocket",
+            "SingletonCookie",
+            "DevToolsActivePort",
+        ];
         for name in &lock_files {
             let path = profile_dir.join(name);
             if path.exists() {
-                // Handle symlinks (Dia uses symlinks for SingletonLock)
-                if path.is_symlink() {
-                    let _ = std::fs::remove_file(&path);
-                } else if path.is_file() {
-                    let _ = std::fs::remove_file(&path);
-                }
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -235,7 +238,10 @@ impl Browser {
 
         // Probe port 9222 to see if CDP is responding
         if !Self::probe_port() {
-            tracing::warn!("Browser port {} not responding, removing stale state", CDP_PORT);
+            tracing::warn!(
+                "Browser port {} not responding, removing stale state",
+                CDP_PORT
+            );
             let _ = std::fs::remove_file(&state_path);
             return None;
         }
@@ -269,13 +275,18 @@ impl Browser {
     /// Probe port 9222 to see if it's accepting connections.
     /// Tries IPv4 first, then IPv6.
     fn probe_port() -> bool {
-        let addrs = [format!("127.0.0.1:{}", CDP_PORT), format!("[::1]:{}", CDP_PORT)];
+        let addrs = [
+            format!("127.0.0.1:{}", CDP_PORT),
+            format!("[::1]:{}", CDP_PORT),
+        ];
         for addr in &addrs {
             if let Ok(parsed) = addr.parse::<std::net::SocketAddr>() {
                 if std::net::TcpStream::connect_timeout(
                     &parsed,
                     std::time::Duration::from_millis(500),
-                ).is_ok() {
+                )
+                .is_ok()
+                {
                     return true;
                 }
             }
@@ -324,8 +335,11 @@ mod tests {
         let result = Browser::find_chrome();
         // Either finds Chrome or returns None — don't panic either way
         if let Some(path) = result {
-            assert!(std::path::Path::new(&path).exists(),
-                "Chrome path should exist: {}", path);
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "Chrome path should exist: {}",
+                path
+            );
         }
     }
 

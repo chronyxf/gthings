@@ -3,7 +3,10 @@ use common::trace::TraceWriter;
 use search::types::FollowOpts;
 
 /// Format and print a single [`search::types::FollowResult`].
-fn output_follow_result(result: &search::types::FollowResult, json: bool) -> Result<(), anyhow::Error> {
+fn output_follow_result(
+    result: &search::types::FollowResult,
+    json: bool,
+) -> Result<(), anyhow::Error> {
     if json {
         let output = serde_json::to_string_pretty(result)?;
         println!("{}", output);

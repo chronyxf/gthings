@@ -76,7 +76,12 @@ impl PageFollower {
     ///
     /// Returns [`GthingsError::Cdp`] if Chrome cannot be launched or the
     /// CDP call fails, or [`GthingsError::Parse`] if content extraction fails.
-    pub async fn follow(&self, url: &str, opts: FollowOpts, trace: Option<&mut TraceWriter>) -> Result<FollowResult, GthingsError> {
+    pub async fn follow(
+        &self,
+        url: &str,
+        opts: FollowOpts,
+        trace: Option<&mut TraceWriter>,
+    ) -> Result<FollowResult, GthingsError> {
         let start = Instant::now();
 
         // 1. Normalise arXiv URLs
@@ -128,8 +133,17 @@ impl PageFollower {
             .await
             .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
         if let Some(ref mut t) = trace {
-            t.step("session", 1, "follow", "browser_reuse", None,
-                browser_start.elapsed().as_millis() as u64, None, None, None);
+            t.step(
+                "session",
+                1,
+                "follow",
+                "browser_reuse",
+                None,
+                browser_start.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+            );
         }
 
         let mut conn = browser
@@ -143,8 +157,17 @@ impl PageFollower {
             .await
             .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
         if let Some(ref mut t) = trace {
-            t.step("session", 2, "follow", "tab_create", None,
-                tab_start.elapsed().as_millis() as u64, None, None, None);
+            t.step(
+                "session",
+                2,
+                "follow",
+                "tab_create",
+                None,
+                tab_start.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+            );
         }
 
         // Step 3: Navigate
@@ -153,9 +176,17 @@ impl PageFollower {
             .await
             .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
         if let Some(ref mut t) = trace {
-            t.step("session", 3, "follow", "navigate", Some(url),
+            t.step(
+                "session",
+                3,
+                "follow",
+                "navigate",
+                Some(url),
                 nav_start.elapsed().as_millis() as u64,
-                Some(serde_json::json!({"url": url})), None, None);
+                Some(serde_json::json!({"url": url})),
+                None,
+                None,
+            );
         }
 
         // Wait for JS rendering
@@ -179,18 +210,15 @@ impl PageFollower {
             &opts.selector
         };
 
-        let extracted =
-            HtmlExtractor::extract(&html, selector)
-                .map_err(|e| GthingsError::Parse(format!("Extraction failed: {e}")))?;
+        let extracted = HtmlExtractor::extract(&html, selector)
+            .map_err(|e| GthingsError::Parse(format!("Extraction failed: {e}")))?;
 
         let full_text = extracted.content;
         let total_length = extracted.total_length;
         let sections = extracted.sections;
 
         // 3e. Apply offset and max_length truncation
-        let (content, truncated) = if opts.offset > 0
-            || opts.max_length < full_text.len()
-        {
+        let (content, truncated) = if opts.offset > 0 || opts.max_length < full_text.len() {
             let start = opts.offset.min(full_text.len());
             let end = (start + opts.max_length).min(full_text.len());
             let is_truncated = end < total_length || opts.offset > 0;
@@ -217,7 +245,12 @@ impl PageFollower {
 
         // Trace: extraction result
         if let Some(ref mut t) = trace {
-            t.step("session", 4, "follow", "extract", Some(url),
+            t.step(
+                "session",
+                4,
+                "follow",
+                "extract",
+                Some(url),
                 0, // duration accounted per-step
                 None,
                 Some(serde_json::json!({
@@ -225,14 +258,12 @@ impl PageFollower {
                     "truncated": truncated,
                     "quality": {"is_ok": quality.is_ok, "score": quality.score}
                 })),
-                None);
+                None,
+            );
         }
 
         // 3g. Retry on low quality with body selector fallback
-        if !quality.is_ok
-            && opts.retry_on_low_quality
-            && ContentQuality::needs_recrawl(&quality)
-        {
+        if !quality.is_ok && opts.retry_on_low_quality && ContentQuality::needs_recrawl(&quality) {
             tracing::debug!(
                 url = %url,
                 score = quality.score,
@@ -246,22 +277,19 @@ impl PageFollower {
                 .await
                 .map_err(|e| GthingsError::Cdp(format!("Html retry: {e}")))?;
 
-            if let Ok(retry_extracted) =
-                HtmlExtractor::extract(&retry_html, "body")
-            {
+            if let Ok(retry_extracted) = HtmlExtractor::extract(&retry_html, "body") {
                 let retry_full_text = retry_extracted.content;
                 let retry_total_length = retry_extracted.total_length;
                 let retry_sections = retry_extracted.sections;
 
-                let (retry_content, retry_truncated) = if opts.offset > 0
-                    || opts.max_length < retry_full_text.len()
-                {
-                    let start = opts.offset.min(retry_full_text.len());
-                    let end = (start + opts.max_length).min(retry_full_text.len());
-                    (retry_full_text[start..end].to_string(), true)
-                } else {
-                    (retry_full_text, false)
-                };
+                let (retry_content, retry_truncated) =
+                    if opts.offset > 0 || opts.max_length < retry_full_text.len() {
+                        let start = opts.offset.min(retry_full_text.len());
+                        let end = (start + opts.max_length).min(retry_full_text.len());
+                        (retry_full_text[start..end].to_string(), true)
+                    } else {
+                        (retry_full_text, false)
+                    };
 
                 let retry_quality = ContentQuality::validate(&retry_content);
                 if retry_quality.is_ok {
@@ -285,8 +313,17 @@ impl PageFollower {
         let close_start = Instant::now();
         let _ = tab.close(&mut conn).await;
         if let Some(ref mut t) = trace {
-            t.step("session", 5, "follow", "tab_close", None,
-                close_start.elapsed().as_millis() as u64, None, None, None);
+            t.step(
+                "session",
+                5,
+                "follow",
+                "tab_close",
+                None,
+                close_start.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+            );
         }
 
         Ok(result)

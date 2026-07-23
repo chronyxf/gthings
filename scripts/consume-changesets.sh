@@ -139,6 +139,20 @@ for f in "${files[@]}"; do
         fi
         
         rm "$new_section"
+        
+        # Also update the crate's Cargo.toml version
+        cargo_toml="crates/$crate/Cargo.toml"
+        if [ "$crate" = "cli" ]; then
+            cargo_toml="crates/cli/Cargo.toml"
+        fi
+        if [ -f "$cargo_toml" ]; then
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                sed -i '' "s/^version = \".*\"/version = \"$new_version\"/" "$cargo_toml"
+            else
+                sed -i "s/^version = \".*\"/version = \"$new_version\"/" "$cargo_toml"
+            fi
+            echo "    Updated $cargo_toml → $new_version"
+        fi
     done
     
     # Remove consumed file

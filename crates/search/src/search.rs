@@ -13,7 +13,6 @@ use common::GthingsError;
 use common::config::GthingsConfig;
 use common::trace::TraceWriter;
 
-
 use crate::types::{BatchSearchResult, SearchMeta, SearchResult};
 
 // GoogleSearch
@@ -58,7 +57,7 @@ impl GoogleSearch {
                 query = q,
                 "search: empty result, retrying with trailing space"
             );
-            match self.query_inner(&retry_q, count, trace.as_deref_mut()).await {
+            match self.query_inner(&retry_q, count, trace).await {
                 Ok(retry_results) if !retry_results.is_empty() => retry_results,
                 _ => search_results,
             }
@@ -100,8 +99,17 @@ impl GoogleSearch {
             .await
             .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
         if let Some(ref mut t) = trace {
-            t.step("session", 1, "search", "browser_reuse", None,
-                browser_start.elapsed().as_millis() as u64, None, None, None);
+            t.step(
+                "session",
+                1,
+                "search",
+                "browser_reuse",
+                None,
+                browser_start.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+            );
         }
 
         let _conn_start = Instant::now();
@@ -116,15 +124,21 @@ impl GoogleSearch {
             .await
             .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
         if let Some(ref mut t) = trace {
-            t.step("session", 2, "search", "tab_create", None,
-                tab_start.elapsed().as_millis() as u64, None, None, None);
+            t.step(
+                "session",
+                2,
+                "search",
+                "tab_create",
+                None,
+                tab_start.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+            );
         }
 
         let encoded = urlencoding::encode(q);
-        let url = format!(
-            "https://www.google.com/search?q={}&num={}",
-            encoded, count
-        );
+        let url = format!("https://www.google.com/search?q={}&num={}", encoded, count);
 
         // Step 3: Navigate
         let nav_start = Instant::now();
@@ -132,9 +146,17 @@ impl GoogleSearch {
             .await
             .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
         if let Some(ref mut t) = trace {
-            t.step("session", 3, "search", "navigate", Some(&url),
+            t.step(
+                "session",
+                3,
+                "search",
+                "navigate",
+                Some(&url),
                 nav_start.elapsed().as_millis() as u64,
-                Some(serde_json::json!({"url": url})), None, None);
+                Some(serde_json::json!({"url": url})),
+                None,
+                None,
+            );
         }
 
         // Allow Google to render
@@ -184,8 +206,7 @@ impl GoogleSearch {
 
         let json_str = result["result"]["value"].as_str().unwrap_or("[]");
 
-        let items: Vec<serde_json::Value> =
-            serde_json::from_str(json_str).unwrap_or_default();
+        let items: Vec<serde_json::Value> = serde_json::from_str(json_str).unwrap_or_default();
 
         let search_results: Vec<SearchResult> = items
             .into_iter()
@@ -209,8 +230,17 @@ impl GoogleSearch {
         let close_start = Instant::now();
         let _ = tab.close(&mut conn).await;
         if let Some(ref mut t) = trace {
-            t.step("session", 5, "search", "tab_close", None,
-                close_start.elapsed().as_millis() as u64, None, None, None);
+            t.step(
+                "session",
+                5,
+                "search",
+                "tab_close",
+                None,
+                close_start.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+            );
         }
 
         Ok(search_results)
@@ -280,7 +310,9 @@ impl GoogleSearch {
         let mut all_results = Vec::new();
 
         for q in queries {
-            let mut results = self.query(q, count, deny_hosts, trace.as_deref_mut()).await?;
+            let mut results = self
+                .query(q, count, deny_hosts, trace.as_deref_mut())
+                .await?;
             all_results.append(&mut results);
         }
 
@@ -324,9 +356,24 @@ mod tests {
     #[test]
     fn test_filter_deny_hosts_removes_matching() {
         let results = vec![
-            SearchResult { title: "A".into(), url: "https://example.com/page".into(), snippet: "...".into(), query: None },
-            SearchResult { title: "B".into(), url: "https://evil.com/page".into(), snippet: "...".into(), query: None },
-            SearchResult { title: "C".into(), url: "https://example.org/page".into(), snippet: "...".into(), query: None },
+            SearchResult {
+                title: "A".into(),
+                url: "https://example.com/page".into(),
+                snippet: "...".into(),
+                query: None,
+            },
+            SearchResult {
+                title: "B".into(),
+                url: "https://evil.com/page".into(),
+                snippet: "...".into(),
+                query: None,
+            },
+            SearchResult {
+                title: "C".into(),
+                url: "https://example.org/page".into(),
+                snippet: "...".into(),
+                query: None,
+            },
         ];
         let deny = vec!["evil.com".to_string()];
         let filtered = GoogleSearch::filter_deny_hosts(results, &deny);
@@ -336,9 +383,12 @@ mod tests {
 
     #[test]
     fn test_filter_deny_hosts_empty_deny() {
-        let results = vec![
-            SearchResult { title: "A".into(), url: "https://example.com/page".into(), snippet: "...".into(), query: None },
-        ];
+        let results = vec![SearchResult {
+            title: "A".into(),
+            url: "https://example.com/page".into(),
+            snippet: "...".into(),
+            query: None,
+        }];
         let deny: Vec<String> = vec![];
         let filtered = GoogleSearch::filter_deny_hosts(results, &deny);
         assert_eq!(filtered.len(), 1);
@@ -355,8 +405,18 @@ mod tests {
     #[test]
     fn test_rank_results_does_not_panic() {
         let mut results = vec![
-            SearchResult { title: "B".into(), url: "https://b.com".into(), snippet: "...".into(), query: None },
-            SearchResult { title: "A".into(), url: "https://a.com".into(), snippet: "...".into(), query: None },
+            SearchResult {
+                title: "B".into(),
+                url: "https://b.com".into(),
+                snippet: "...".into(),
+                query: None,
+            },
+            SearchResult {
+                title: "A".into(),
+                url: "https://a.com".into(),
+                snippet: "...".into(),
+                query: None,
+            },
         ];
         GoogleSearch::rank_results(&mut results);
         assert_eq!(results.len(), 2);

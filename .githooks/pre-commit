@@ -2,12 +2,6 @@
 # Pre-commit hook enforcing VERSION.md workflow
 set -euo pipefail
 
-# Allow bypass
-if [ "${SKIP_CHECKS:-0}" = "1" ]; then
-    echo "[SKIP] SKIP_CHECKS=1 — skipping pre-commit checks"
-    exit 0
-fi
-
 CHANGESETS_DIR=".changesets"
 
 # Detect changes that require a changeset
@@ -27,6 +21,30 @@ for file in $STAGED_FILES; do
         break
     fi
 done
+
+# Run pre-commit checks on any code change
+if [ "$needs_changeset" = "1" ]; then
+    echo "[CHECK] Running pre-commit checks..."
+    echo ""
+
+    echo "  cargo fmt --check"
+    cargo fmt --all -- --check 2>/dev/null || { echo "[FAIL] Formatting check failed. Run: cargo fmt --all"; exit 1; }
+
+    echo "  cargo clippy"
+    cargo clippy --workspace --all-targets --all-features -- -D warnings 2>/dev/null || { echo "[FAIL] Clippy failed"; exit 1; }
+
+    echo "  cargo build"
+    cargo build --workspace 2>/dev/null || { echo "[FAIL] Build failed"; exit 1; }
+
+    echo "  cargo test (unit + integration)"
+    cargo test --workspace --lib --test integration --test cli_tests 2>/dev/null || { echo "[FAIL] Tests failed"; exit 1; }
+
+    echo "  cargo test (e2e)"
+    cargo test --test e2e -- --test-threads=1 2>/dev/null || { echo "[FAIL] E2E tests failed"; exit 1; }
+
+    echo ""
+    echo "[PASS] All pre-commit checks passed"
+fi
 
 # Check for changesets
 if [ "$needs_changeset" = "1" ]; then
@@ -52,31 +70,8 @@ if [ "$needs_changeset" = "1" ]; then
         echo "     git add -A"
         echo "     git commit ..."
         echo ""
-        echo "  To bypass: SKIP_CHECKS=1 git commit ..."
-        echo ""
         exit 1
     fi
-fi
-
-# Run pre-commit checks (only if code files changed)
-if [ "$needs_changeset" = "1" ]; then
-    echo "[CHECK] Running pre-commit checks..."
-    echo ""
-
-    echo "  cargo fmt --check"
-    cargo fmt --all -- --check 2>/dev/null || { echo "[FAIL] Formatting check failed. Run: cargo fmt --all"; exit 1; }
-
-    echo "  cargo clippy"
-    cargo clippy --workspace --all-targets --all-features -- -D warnings 2>/dev/null || { echo "[FAIL] Clippy failed"; exit 1; }
-
-    echo "  cargo build"
-    cargo build --workspace 2>/dev/null || { echo "[FAIL] Build failed"; exit 1; }
-
-    echo "  cargo test"
-    cargo test --workspace 2>/dev/null || { echo "[FAIL] Tests failed"; exit 1; }
-
-    echo ""
-    echo "[PASS] All pre-commit checks passed"
 fi
 
 exit 0

@@ -160,8 +160,9 @@ impl HtmlExtractor {
         let result = tag_re.replace_all(html, " ");
 
         static ENTITY_RE: OnceLock<Regex> = OnceLock::new();
-        let entity_re = ENTITY_RE
-            .get_or_init(|| Regex::new(r"&(amp|lt|gt|quot|nbsp|apos|#x?[0-9a-fA-F]+);").expect("valid regex"));
+        let entity_re = ENTITY_RE.get_or_init(|| {
+            Regex::new(r"&(amp|lt|gt|quot|nbsp|apos|#x?[0-9a-fA-F]+);").expect("valid regex")
+        });
         let result = entity_re.replace_all(&result, |caps: &regex::Captures| -> String {
             match &caps[1] {
                 "amp" => "&".to_string(),
@@ -361,7 +362,7 @@ mod tests {
     fn test_invalid_selector() {
         let html = "<html><body></body></html>";
         let result = HtmlExtractor::extract(html, "]]invalid[[");
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[test]

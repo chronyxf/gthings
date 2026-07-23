@@ -3,7 +3,12 @@ use std::path::Path;
 use common::config::GthingsConfig;
 
 /// Shared output helper for PDF extraction results.
-fn output_pdf_result(text: &str, source: &str, pages: Option<usize>, json: bool) -> Result<(), anyhow::Error> {
+fn output_pdf_result(
+    text: &str,
+    source: &str,
+    pages: Option<usize>,
+    json: bool,
+) -> Result<(), anyhow::Error> {
     if json {
         let value = serde_json::json!({
             "source": source,

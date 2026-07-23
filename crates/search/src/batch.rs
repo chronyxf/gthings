@@ -73,8 +73,17 @@ impl BatchProcessor {
             .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
 
         if let Some(ref mut t) = trace {
-            t.step("session", 0, "batch_search", "launch", None,
-                start.elapsed().as_millis() as u64, None, None, None);
+            t.step(
+                "session",
+                0,
+                "batch_search",
+                "launch",
+                None,
+                start.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+            );
         }
 
         let mut all_results: Vec<SearchResult> = Vec::new();
@@ -85,10 +94,7 @@ impl BatchProcessor {
                 .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
 
             let encoded = urlencoding::encode(q);
-            let url = format!(
-                "https://www.google.com/search?q={}&num={}",
-                encoded, count
-            );
+            let url = format!("https://www.google.com/search?q={}&num={}", encoded, count);
 
             tab.navigate(&mut conn, &url)
                 .await
@@ -135,8 +141,7 @@ impl BatchProcessor {
                 .map_err(|e| GthingsError::Cdp(format!("Eval: {e}")))?;
 
             let json_str = result["result"]["value"].as_str().unwrap_or("[]");
-            let items: Vec<serde_json::Value> =
-                serde_json::from_str(json_str).unwrap_or_default();
+            let items: Vec<serde_json::Value> = serde_json::from_str(json_str).unwrap_or_default();
 
             for item in items {
                 all_results.push(SearchResult {
@@ -195,8 +200,17 @@ impl BatchProcessor {
             .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
 
         if let Some(ref mut t) = trace {
-            t.step("session", 0, "batch_follow", "launch", None,
-                0, None, None, None);
+            t.step(
+                "session",
+                0,
+                "batch_follow",
+                "launch",
+                None,
+                0,
+                None,
+                None,
+                None,
+            );
         }
 
         let mut pages: Vec<FollowResult> = Vec::with_capacity(urls.len());
@@ -242,15 +256,14 @@ impl BatchProcessor {
                 }
             };
 
-            let (content, truncated) = if opts.offset > 0
-                || opts.max_length < extracted.content.len()
-            {
-                let start = opts.offset.min(extracted.content.len());
-                let end = (start + opts.max_length).min(extracted.content.len());
-                (extracted.content[start..end].to_string(), true)
-            } else {
-                (extracted.content, false)
-            };
+            let (content, truncated) =
+                if opts.offset > 0 || opts.max_length < extracted.content.len() {
+                    let start = opts.offset.min(extracted.content.len());
+                    let end = (start + opts.max_length).min(extracted.content.len());
+                    (extracted.content[start..end].to_string(), true)
+                } else {
+                    (extracted.content, false)
+                };
 
             let result = FollowResult {
                 success: !content.is_empty(),
@@ -294,8 +307,17 @@ impl BatchProcessor {
             .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
 
         if let Some(ref mut t) = trace {
-            t.step("session", 0, "harvest", "launch", None,
-                pipeline_start.elapsed().as_millis() as u64, None, None, None);
+            t.step(
+                "session",
+                0,
+                "harvest",
+                "launch",
+                None,
+                pipeline_start.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+            );
         }
 
         let mut all_search_results: Vec<SearchResult> = Vec::new();
@@ -306,10 +328,7 @@ impl BatchProcessor {
                 .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
 
             let encoded = urlencoding::encode(q);
-            let url = format!(
-                "https://www.google.com/search?q={}&num={}",
-                encoded, count
-            );
+            let url = format!("https://www.google.com/search?q={}&num={}", encoded, count);
 
             tab.navigate(&mut conn, &url)
                 .await
@@ -399,8 +418,17 @@ impl BatchProcessor {
                 }
             };
 
-            let selector = &self.config.deny_hosts.first().map(|_| "body").unwrap_or("article,main,[role=main]");
-            let fallback_selector = if selector.is_empty() { "body" } else { selector };
+            let selector = &self
+                .config
+                .deny_hosts
+                .first()
+                .map(|_| "body")
+                .unwrap_or("article,main,[role=main]");
+            let fallback_selector = if selector.is_empty() {
+                "body"
+            } else {
+                selector
+            };
 
             match extraction::html::HtmlExtractor::extract(&html, fallback_selector) {
                 Ok(extracted) => {

@@ -4,28 +4,28 @@ use thiserror::Error;
 pub enum CdpError {
     #[error("Browser launch failed: {0}")]
     LaunchFailed(String),
-    
+
     #[error("WebSocket error: {0}")]
     Ws(#[from] tokio_tungstenite::tungstenite::Error),
-    
+
     #[error("CDP command failed: {msg} (method: {method})")]
     CommandFailed { method: String, msg: String },
-    
+
     #[error("Timeout after {0}ms")]
     Timeout(u64),
-    
+
     #[error("Oneshot channel broken")]
     ChannelBroken,
-    
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    
+
     #[error("Chrome process exited unexpectedly with code {0}")]
     ChromeExited(i32),
-    
+
     #[error("Could not find DevTools WebSocket URL in Chrome output")]
     NoWsUrl,
 }
@@ -42,13 +42,22 @@ mod tests {
         assert_eq!(format!("{}", err), "Browser launch failed: test");
 
         let err = CdpError::NoWsUrl;
-        assert_eq!(format!("{}", err), "Could not find DevTools WebSocket URL in Chrome output");
+        assert_eq!(
+            format!("{}", err),
+            "Could not find DevTools WebSocket URL in Chrome output"
+        );
 
         let err = CdpError::Timeout(5000);
         assert_eq!(format!("{}", err), "Timeout after 5000ms");
 
-        let err = CdpError::CommandFailed { method: "Page.navigate".into(), msg: "timeout".into() };
-        assert_eq!(format!("{}", err), "CDP command failed: timeout (method: Page.navigate)");
+        let err = CdpError::CommandFailed {
+            method: "Page.navigate".into(),
+            msg: "timeout".into(),
+        };
+        assert_eq!(
+            format!("{}", err),
+            "CDP command failed: timeout (method: Page.navigate)"
+        );
     }
 
     #[test]

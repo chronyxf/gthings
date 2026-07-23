@@ -160,23 +160,25 @@ async fn main() -> Result<(), anyhow::Error> {
     );
 
     // Initialize TraceWriter if --trace is provided
-    let mut trace_writer = cli.trace.as_ref().and_then(|path| {
-        TraceWriter::new(path).ok()
-    });
+    let mut trace_writer = cli
+        .trace
+        .as_ref()
+        .and_then(|path| TraceWriter::new(path).ok());
 
     let cmd_start = std::time::Instant::now();
     let (tool_name, tool_args) = command_metadata(&cli.command);
 
     // Get a borrow to pass through to handlers
-    let mut trace = trace_writer.as_mut();
+    let trace = trace_writer.as_mut();
 
     let result = match &cli.command {
         Command::Search(args) => match &args.command {
             SearchCommand::Query { query, count } => {
-                search_commands::handle_search_query(&config, query, *count, cli.json, trace.as_deref_mut()).await
+                search_commands::handle_search_query(&config, query, *count, cli.json, trace).await
             }
             SearchCommand::Batch { queries, count } => {
-                search_commands::handle_search_batch(&config, queries, *count, cli.json, trace.as_deref_mut()).await
+                search_commands::handle_search_batch(&config, queries, *count, cli.json, trace)
+                    .await
             }
             SearchCommand::Harvest {
                 queries,
@@ -193,7 +195,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     *concurrency,
                     *follow_concurrency,
                     cli.json,
-                    trace.as_deref_mut(),
+                    trace,
                 )
                 .await
             }
@@ -205,8 +207,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 offset,
                 max,
             } => {
-                follow_commands::handle_follow_url(&config, url, selector, *offset, *max, cli.json, trace.as_deref_mut())
-                    .await
+                follow_commands::handle_follow_url(
+                    &config, url, selector, *offset, *max, cli.json, trace,
+                )
+                .await
             }
             FollowCommand::Batch {
                 urls,
@@ -215,7 +219,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 max,
             } => {
                 follow_commands::handle_follow_batch(
-                    &config, urls, selector, *offset, *max, cli.json, trace.as_deref_mut(),
+                    &config, urls, selector, *offset, *max, cli.json, trace,
                 )
                 .await
             }
@@ -312,7 +316,9 @@ async fn handle_browser_stop(json: bool) -> Result<(), anyhow::Error> {
 
     // Kill the process
     if pid > 0 {
-        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
     }
 
     // Remove state file

@@ -75,22 +75,21 @@ pub fn assert_json(output: &std::process::Output) -> serde_json::Value {
 pub fn parse_json(output: &std::process::Output) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let json_start = stdout
-        .lines()
-        .position(|line| {
-            let trimmed = line.trim();
-            trimmed.starts_with('{') || trimmed.starts_with('[')
-        });
+    let json_start = stdout.lines().position(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with('{') || trimmed.starts_with('[')
+    });
 
     match json_start {
         Some(line_idx) => {
-            let json_str: String = stdout
-                .lines()
-                .skip(line_idx)
-                .collect::<Vec<_>>()
-                .join("\n");
-            serde_json::from_str(&json_str)
-                .unwrap_or_else(|e| panic!("Invalid JSON: {}\nFirst 500 chars: {}", e, &json_str[..std::cmp::min(500, json_str.len())]))
+            let json_str: String = stdout.lines().skip(line_idx).collect::<Vec<_>>().join("\n");
+            serde_json::from_str(&json_str).unwrap_or_else(|e| {
+                panic!(
+                    "Invalid JSON: {}\nFirst 500 chars: {}",
+                    e,
+                    &json_str[..std::cmp::min(500, json_str.len())]
+                )
+            })
         }
         None => panic!(
             "No JSON found in output:\nstdout: {}\nstderr: {}",
@@ -110,8 +109,8 @@ pub fn run_gthings(args: &[&str]) -> (serde_json::Value, std::process::Output) {
     (json, output)
 }
 
-use std::time::Duration;
 use std::net::TcpStream;
+use std::time::Duration;
 
 /// Wait for port 9222 to become available (not in TIME_WAIT)
 pub fn wait_for_port(timeout_secs: u64) -> bool {

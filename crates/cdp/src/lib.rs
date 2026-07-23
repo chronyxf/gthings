@@ -1,9 +1,9 @@
 pub mod browser;
 pub mod connection;
-pub mod tab;
 pub mod error;
+pub mod tab;
 
 pub use browser::Browser;
 pub use connection::Connection;
-pub use tab::Tab;
 pub use error::{CdpError, Result};
+pub use tab::Tab;

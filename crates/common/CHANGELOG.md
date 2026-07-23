@@ -1,36 +1,28 @@
 # Changelog — common
 
-## 0.1.0 — 2026-07-23
+## 0.3.0 — 2026-07-23
 
-## 0.1.1 — 2026-07-23
+## 0.3.1 — 2026-07-23
+
+### Changed
+
+- - Remove SKIP_CHECKS bypass from pre-commit hook
+- - Run e2e tests serially (--test-threads=1) to avoid port conflicts
+- - Run fmt, clippy, build, unit, integration, e2e checks on every code commit
+
+
+### Features
+
+- TraceWriter: step-level JSONL tracing with timestamps, durations, URLs, errors
+- CdpError variant added to GthingsError for CDP transport errors
+
+### Changed
+
+- Removed framing.rs (UDS length-prefix framing — daemon no longer exists)
+- Removed rate_limit.rs (per-host token bucket — daemon no longer exists)
+- Removed dead_code allowances from cached types
+- Cleaned up TypeScript-origin comments from cache module
 
 ### Fixes
 
-- - Fix clippy warnings in extraction crate (collapsible_if, from_str_radix, map_or)
-
-### Changed
-
-- - Replace 23 unwrap() calls with expect() or proper error handling
-- - Rename gthings-cdp crate to cdp for consistency
-- - Remove decorative comment separators (═══, ───) across all files
-- - Clean up outdated TypeScript references in comments
-
-
-## 0.1.1 — 2026-07-23
-
-### Features
-
-- - Add new cdp crate: Browser launch, CDP connection, tab lifecycle
-- - Add TraceWriter for step-level JSONL logging
-
-### Changed
-
-- - Remove legacy protocol/, cdp-core/, browser-daemon/ crates
-- - Clean workspace Cargo.toml, .gitignore, .githooks
-
-
-### Features
-- Sha256DiskCache with persistent disk storage
-- GthingsConfig with env var mapping
-- TraceWriter for step-level JSONL tracing (timestamps, durations, URLs, errors)
-- GthingsError type with Cdp variant
+- Collapsible if in cache eviction logic

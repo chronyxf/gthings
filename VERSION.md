@@ -1,13 +1,17 @@
 # Versioning Workflow
 
-Each crate has its own CHANGELOG.md. Changes are tracked per-crate via changeset files.
-A single commit can affect multiple crates with different bump levels.
+Each crate in this monorepo is versioned independently. When code changes in a crate,
+the changeset defines the bump level, and the consume script updates BOTH:
+- The crate's Cargo.toml `version` field
+- The crate's CHANGELOG.md with a new entry
+
+Different crates can have different versions at the same time.
 
 ## Pre-commit
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets --all-features
+cargo clippy --workspace
 cargo build --workspace
 cargo test --workspace
 ```
@@ -22,19 +26,24 @@ For every code change:
    ```bash
    bash scripts/create-changeset.sh
    ```
-   This prompts for description and affected crates with bump types.
+   This prompts for description and which crates changed with their bump types.
 
-2. Consume changesets (updates per-crate CHANGELOG.md files):
+2. Consume the changeset:
    ```bash
    bash scripts/consume-changesets.sh
    ```
+   This does the following for each affected crate:
+   - Reads the current version from Cargo.toml
+   - Bumps it according to the changeset (patch/minor/major)
+   - Writes the new version to Cargo.toml
+   - Prepends a new section to the crate's CHANGELOG.md
+   - Deletes the changeset file
 
 3. Stage and commit:
    ```bash
    git add -A
    git commit -m "type(scope): short description"
    ```
-   Commit messages are single-line. Full descriptions live in changesets and changelogs.
 
 ## Changeset File Format
 
@@ -54,14 +63,18 @@ The changeset defines:
 
 ## Bump Types
 
-| Bump    | When                                     |
-| ------- | ---------------------------------------- |
-| `patch` | Bug fixes, refactoring, internal cleanup |
-| `minor` | New features, public API additions       |
-| `major` | Breaking changes                         |
+| Bump    | When                                     | Version Change |
+| ------- | ---------------------------------------- | -------------- |
+| `patch` | Bug fixes, refactoring, internal cleanup | 0.1.0 → 0.1.1 |
+| `minor` | New features, public API additions       | 0.1.0 → 0.2.0 |
+| `major` | Breaking changes                         | 0.1.0 → 1.0.0 |
 
-## Version Source of Truth
+## Current Versions
 
-Each crate's version is derived from its CHANGELOG.md. The latest version entry
-in each per-crate changelog is the source of truth for that crate.
-There is no global version — crates version independently.
+| Crate | Version |
+|-------|---------|
+| cdp | 0.3.0 |
+| cli (gthings) | 0.3.0 |
+| common | 0.3.0 |
+| extraction | 0.3.0 |
+| search | 0.3.0 |

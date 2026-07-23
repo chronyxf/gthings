@@ -3,7 +3,11 @@ use common::trace::TraceWriter;
 use search::types::*;
 
 /// Format output for a single search query result.
-fn output_search_results(results: &[SearchResult], meta: &SearchMeta, json: bool) -> Result<(), anyhow::Error> {
+fn output_search_results(
+    results: &[SearchResult],
+    meta: &SearchMeta,
+    json: bool,
+) -> Result<(), anyhow::Error> {
     if json {
         let value = serde_json::json!({
             "meta": meta,
@@ -65,6 +69,7 @@ pub(crate) async fn handle_search_batch(
 }
 
 /// Handler for `search harvest <queries...> [--count N] [--max N] [--concurrency N] [--follow-concurrency N]`
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_search_harvest(
     config: &GthingsConfig,
     queries: &[String],

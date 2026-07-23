@@ -49,9 +49,18 @@ impl ContentQuality {
                     Regex::new(r"(?i)This site can't be reached").expect("valid regex"),
                     "browser_error_page",
                 ),
-                (Regex::new(r"ERR_CONNECTION").expect("valid regex"), "connection_error"),
-                (Regex::new(r"404 Not Found").expect("valid regex"), "not_found"),
-                (Regex::new(r"^\s*$").expect("valid regex"), "whitespace_only"),
+                (
+                    Regex::new(r"ERR_CONNECTION").expect("valid regex"),
+                    "connection_error",
+                ),
+                (
+                    Regex::new(r"404 Not Found").expect("valid regex"),
+                    "not_found",
+                ),
+                (
+                    Regex::new(r"^\s*$").expect("valid regex"),
+                    "whitespace_only",
+                ),
             ]
         })
     }
@@ -226,7 +235,8 @@ impl ContentQuality {
 
         // JS-required message
         static JS_RE: OnceLock<Regex> = OnceLock::new();
-        let js_re = JS_RE.get_or_init(|| Regex::new(r"(?i)please enable javascript").expect("valid regex"));
+        let js_re =
+            JS_RE.get_or_init(|| Regex::new(r"(?i)please enable javascript").expect("valid regex"));
         if js_re.is_match(text) {
             return true;
         }

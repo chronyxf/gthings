@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn test_extract_invalid_magic() {
         let result = PdfExtractor::extract(b"not a pdf");
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[test]
