@@ -1,14 +1,16 @@
 use common::config::GthingsConfig;
+use common::trace::TraceWriter;
 use search::types::*;
 
 /// Format output for a single search query result.
-fn output_search_results(results: &[SearchResult], meta: &SearchMeta, json: bool) {
+fn output_search_results(results: &[SearchResult], meta: &SearchMeta, json: bool) -> Result<(), anyhow::Error> {
     if json {
         let value = serde_json::json!({
             "meta": meta,
             "results": results,
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        let output = serde_json::to_string_pretty(&value)?;
+        println!("{}", output);
     } else {
         println!(
             "Search results ({} total, {} ms)",
@@ -23,17 +25,19 @@ fn output_search_results(results: &[SearchResult], meta: &SearchMeta, json: bool
             println!();
         }
     }
+    Ok(())
 }
 
 /// Handler for `search query <query> [--count N]`
-pub async fn handle_search_query(
+pub(crate) async fn handle_search_query(
     config: &GthingsConfig,
     query: &str,
     count: usize,
     json: bool,
+    trace: Option<&mut TraceWriter>,
 ) -> Result<(), anyhow::Error> {
     let searcher = search::GoogleSearch::new(config.clone());
-    let results = searcher.query(query, count, None).await?;
+    let results = searcher.query(query, count, None, trace).await?;
 
     let meta = SearchMeta {
         total: results.len(),
@@ -41,26 +45,27 @@ pub async fn handle_search_query(
         duration_ms: 0,
     };
 
-    output_search_results(&results, &meta, json);
+    output_search_results(&results, &meta, json)?;
     Ok(())
 }
 
 /// Handler for `search batch <queries...> [--count N]`
-pub async fn handle_search_batch(
+pub(crate) async fn handle_search_batch(
     config: &GthingsConfig,
     queries: &[String],
     count: usize,
     json: bool,
+    trace: Option<&mut TraceWriter>,
 ) -> Result<(), anyhow::Error> {
     let processor = search::BatchProcessor::new(config.clone());
-    let result = processor.search(queries, count).await?;
+    let result = processor.search(queries, count, trace).await?;
 
-    output_search_results(&result.results, &result.meta, json);
+    output_search_results(&result.results, &result.meta, json)?;
     Ok(())
 }
 
 /// Handler for `search harvest <queries...> [--count N] [--max N] [--concurrency N] [--follow-concurrency N]`
-pub async fn handle_search_harvest(
+pub(crate) async fn handle_search_harvest(
     config: &GthingsConfig,
     queries: &[String],
     count: usize,
@@ -68,6 +73,7 @@ pub async fn handle_search_harvest(
     concurrency: Option<usize>,
     follow_concurrency: Option<usize>,
     json: bool,
+    trace: Option<&mut TraceWriter>,
 ) -> Result<(), anyhow::Error> {
     let max_pages = max.unwrap_or(count);
 
@@ -81,10 +87,11 @@ pub async fn handle_search_harvest(
     }
 
     let processor = search::BatchProcessor::new(config);
-    let result = processor.harvest(queries, count, max_pages).await?;
+    let result = processor.harvest(queries, count, max_pages, trace).await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        let output = serde_json::to_string_pretty(&result)?;
+        println!("{}", output);
     } else {
         println!(
             "Harvest complete — {} queries, {} search results, {} pages followed ({} ms)",

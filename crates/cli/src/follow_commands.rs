@@ -1,10 +1,12 @@
 use common::config::GthingsConfig;
+use common::trace::TraceWriter;
 use search::types::FollowOpts;
 
 /// Format and print a single [`search::types::FollowResult`].
-fn output_follow_result(result: &search::types::FollowResult, json: bool) {
+fn output_follow_result(result: &search::types::FollowResult, json: bool) -> Result<(), anyhow::Error> {
     if json {
-        println!("{}", serde_json::to_string_pretty(result).unwrap());
+        let output = serde_json::to_string_pretty(result)?;
+        println!("{}", output);
     } else {
         let status = if result.success { "OK" } else { "FAIL" };
         println!("[{}] {}", status, result.url);
@@ -31,16 +33,18 @@ fn output_follow_result(result: &search::types::FollowResult, json: bool) {
         }
         println!();
     }
+    Ok(())
 }
 
 /// Handler for `follow url <url> [--selector S] [--offset N] [--max N]`
-pub async fn handle_follow_url(
+pub(crate) async fn handle_follow_url(
     config: &GthingsConfig,
     url: &str,
     selector: &str,
     offset: usize,
     max: usize,
     json: bool,
+    trace: Option<&mut TraceWriter>,
 ) -> Result<(), anyhow::Error> {
     let follower = search::PageFollower::new(config.clone());
     let opts = FollowOpts {
@@ -49,19 +53,20 @@ pub async fn handle_follow_url(
         max_length: max,
         ..FollowOpts::default()
     };
-    let result = follower.follow(url, opts).await?;
-    output_follow_result(&result, json);
+    let result = follower.follow(url, opts, trace).await?;
+    output_follow_result(&result, json)?;
     Ok(())
 }
 
 /// Handler for `follow batch <urls...> [--selector S] [--offset N] [--max N]`
-pub async fn handle_follow_batch(
+pub(crate) async fn handle_follow_batch(
     config: &GthingsConfig,
     urls: &[String],
     selector: &str,
     offset: usize,
     max: usize,
     json: bool,
+    trace: Option<&mut TraceWriter>,
 ) -> Result<(), anyhow::Error> {
     let follower = search::PageFollower::new(config.clone());
     let opts = FollowOpts {
@@ -70,13 +75,14 @@ pub async fn handle_follow_batch(
         max_length: max,
         ..FollowOpts::default()
     };
-    let results = follower.batch(urls, opts).await?;
+    let results = follower.batch(urls, opts, trace).await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&results).unwrap());
+        let output = serde_json::to_string_pretty(&results)?;
+        println!("{}", output);
     } else {
         for result in &results {
-            output_follow_result(result, json);
+            output_follow_result(result, json)?;
         }
     }
     Ok(())

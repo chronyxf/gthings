@@ -1,13 +1,10 @@
-mod browser_commands;
 mod follow_commands;
 mod pdf_commands;
 mod search_commands;
 
 use clap::Parser;
-use std::io::Write;
+use common::trace::TraceWriter;
 use std::time::SystemTime;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 #[derive(clap::Parser)]
 #[command(
@@ -40,33 +37,25 @@ enum Command {
     Follow(FollowArgs),
     /// PDF text extraction
     Pdf(PdfArgs),
-    /// Take a screenshot of a web page (requires daemon)
-    Screenshot {
-        /// URL to capture
-        url: String,
-        /// Output file path
-        #[arg(short, long, default_value = "screenshot.png")]
-        output: std::path::PathBuf,
-        /// Output as JSON instead of writing file
-        #[arg(long)]
-        json: bool,
-    },
-    /// Scrape content from a web page using CSS selectors (requires daemon)
-    Scrape {
-        /// URL to scrape
-        url: String,
-        /// CSS selector
-        #[arg(short, long, default_value = "body")]
-        selector: String,
-        /// Attribute to extract (default: innerText)
-        #[arg(short, long)]
-        attribute: Option<String>,
-        /// Output as JSON Lines
-        #[arg(long)]
-        json: bool,
-    },
-    /// Browser automation (CDP) — requires daemon
+    /// Browser lifecycle management
+    #[command(name = "browser", hide = true)]
     Browser(BrowserArgs),
+}
+
+#[derive(clap::Args)]
+struct BrowserArgs {
+    #[command(subcommand)]
+    command: BrowserCommand,
+}
+
+#[derive(clap::Subcommand)]
+enum BrowserCommand {
+    /// Start the persistent browser (auto-started on first use)
+    Start,
+    /// Stop the persistent browser
+    Stop,
+    /// Show browser status
+    Status,
 }
 
 #[derive(clap::Args)]
@@ -149,74 +138,6 @@ enum PdfCommand {
     File { path: std::path::PathBuf },
 }
 
-#[derive(clap::Args)]
-struct BrowserArgs {
-    #[command(subcommand)]
-    command: BrowserCommand,
-}
-
-#[derive(clap::Subcommand)]
-enum BrowserCommand {
-    Status,
-    Start {
-        port: Option<u16>,
-    },
-    Stop,
-    Logs {
-        follow: bool,
-    },
-    Call {
-        method: String,
-        params: String,
-    },
-    Eval {
-        expression: String,
-    },
-    Navigate {
-        url: String,
-    },
-    Wait {
-        method: String,
-        session: String,
-        #[arg(long, default_value = "30000")]
-        timeout: u64,
-    },
-}
-
-/// Fetch the daemon context from the UDS socket for trace enrichment.
-///
-/// Returns `None` if the daemon is not reachable (commands that need the
-/// daemon will fail separately; this is best-effort enrichment).
-async fn fetch_daemon_context() -> Option<serde_json::Value> {
-    let socket_path = std::env::var("GTHINGS_DAEMON_SOCKET")
-        .unwrap_or_else(|_| "/tmp/gthings-daemon.sock".to_string());
-
-    let stream = match UnixStream::connect(&socket_path).await {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
-
-    let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({"id": 1, "method": "get_context", "params": null});
-    let mut buf = serde_json::to_vec(&request).ok()?;
-    buf.push(b'\n');
-    writer.write_all(&buf).await.ok()?;
-    writer.shutdown().await.ok()?;
-
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    reader.read_line(&mut line).await.ok()?;
-
-    let response: serde_json::Value = serde_json::from_str(&line).ok()?;
-    if response["ok"].as_bool().unwrap_or(false) {
-        response["result"]
-            .as_object()
-            .map(|_| response["result"].clone())
-    } else {
-        None
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
@@ -237,20 +158,25 @@ async fn main() -> Result<(), anyhow::Error> {
             .unwrap_or_default()
             .as_nanos()
     );
-    let trace_path = cli.trace.clone();
-    // Fetch daemon context for trace enrichment (best-effort)
-    let daemon_context = fetch_daemon_context().await;
+
+    // Initialize TraceWriter if --trace is provided
+    let mut trace_writer = cli.trace.as_ref().and_then(|path| {
+        TraceWriter::new(path).ok()
+    });
 
     let cmd_start = std::time::Instant::now();
     let (tool_name, tool_args) = command_metadata(&cli.command);
 
+    // Get a borrow to pass through to handlers
+    let mut trace = trace_writer.as_mut();
+
     let result = match &cli.command {
         Command::Search(args) => match &args.command {
             SearchCommand::Query { query, count } => {
-                search_commands::handle_search_query(&config, query, *count, cli.json).await
+                search_commands::handle_search_query(&config, query, *count, cli.json, trace.as_deref_mut()).await
             }
             SearchCommand::Batch { queries, count } => {
-                search_commands::handle_search_batch(&config, queries, *count, cli.json).await
+                search_commands::handle_search_batch(&config, queries, *count, cli.json, trace.as_deref_mut()).await
             }
             SearchCommand::Harvest {
                 queries,
@@ -267,6 +193,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     *concurrency,
                     *follow_concurrency,
                     cli.json,
+                    trace.as_deref_mut(),
                 )
                 .await
             }
@@ -278,7 +205,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 offset,
                 max,
             } => {
-                follow_commands::handle_follow_url(&config, url, selector, *offset, *max, cli.json)
+                follow_commands::handle_follow_url(&config, url, selector, *offset, *max, cli.json, trace.as_deref_mut())
                     .await
             }
             FollowCommand::Batch {
@@ -288,7 +215,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 max,
             } => {
                 follow_commands::handle_follow_batch(
-                    &config, urls, selector, *offset, *max, cli.json,
+                    &config, urls, selector, *offset, *max, cli.json, trace.as_deref_mut(),
                 )
                 .await
             }
@@ -299,98 +226,132 @@ async fn main() -> Result<(), anyhow::Error> {
                 pdf_commands::handle_pdf_file(&config, path, cli.json).await
             }
         },
-        Command::Screenshot { url, output, json } => {
-            let config = common::config::GthingsConfig::default();
-            browser_commands::handle_screenshot(&config, url, output, *json).await?;
-            Ok(())
-        }
-        Command::Scrape {
-            url,
-            selector,
-            attribute,
-            json,
-        } => {
-            let config = common::config::GthingsConfig::default();
-            browser_commands::handle_scrape(&config, url, selector, attribute.as_deref(), *json)
-                .await?;
-            Ok(())
-        }
-        Command::Browser(args) => {
-            let config = common::config::GthingsConfig::default();
-            match &args.command {
-                BrowserCommand::Status => browser_commands::handle_browser_status(&config).await?,
-                BrowserCommand::Start { port } => {
-                    browser_commands::handle_browser_start(&config, *port).await?
-                }
-                BrowserCommand::Stop => browser_commands::handle_browser_stop(&config).await?,
-                BrowserCommand::Logs { follow } => {
-                    browser_commands::handle_browser_logs(&config, *follow).await?
-                }
-                BrowserCommand::Call { method, params } => {
-                    browser_commands::handle_browser_call(&config, method, params).await?
-                }
-                BrowserCommand::Eval { expression } => {
-                    browser_commands::handle_browser_eval(&config, expression).await?
-                }
-                BrowserCommand::Navigate { url } => {
-                    browser_commands::handle_browser_navigate(&config, url).await?
-                }
-                BrowserCommand::Wait {
-                    method,
-                    session,
-                    timeout,
-                } => {
-                    browser_commands::handle_browser_wait(&config, method, session, *timeout)
-                        .await?
-                }
-            };
-            Ok(())
-        }
+        Command::Browser(args) => match &args.command {
+            BrowserCommand::Start => handle_browser_start(cli.json).await,
+            BrowserCommand::Stop => handle_browser_stop(cli.json).await,
+            BrowserCommand::Status => handle_browser_status(cli.json).await,
+        },
     };
 
-    // Telemetry capture
+    // Telemetry capture via TraceWriter
     let cmd_duration_ms = cmd_start.elapsed().as_millis() as u64;
     let exit_code = if result.is_ok() { 0 } else { 1 };
 
-    if let Some(ref path) = trace_path {
-        let record = serde_json::json!({
-            "ts": trace_timestamp(),
-            "session": session_id,
-            "tool": tool_name,
-            "args": tool_args,
-            "duration_ms": cmd_duration_ms,
-            "exit": exit_code,
-        });
-        write_trace(path, &record, &daemon_context);
+    let error_msg = if exit_code != 0 {
+        result.as_ref().err().map(|e| e.to_string())
+    } else {
+        None
+    };
+    if let Some(ref mut t) = trace_writer {
+        t.step(
+            &session_id,
+            0,
+            tool_name,
+            "command",
+            None,
+            cmd_duration_ms,
+            Some(tool_args),
+            Some(serde_json::json!({"exit": exit_code})),
+            error_msg.as_deref(),
+        );
     }
 
     result
 }
 
-/// Write a trace record to the trace file (if configured).
-/// Format: JSONL — one JSON object per line.
-fn write_trace(trace_path: &str, record: &serde_json::Value, context: &Option<serde_json::Value>) {
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(trace_path)
-    {
-        let mut record = record.clone();
-        if let Some(ctx) = context {
-            record["context"] = ctx.clone();
-        }
-        let mut line = serde_json::to_string(&record).unwrap_or_default();
-        line.push('\n');
-        let _ = file.write_all(line.as_bytes());
-    }
+// Browser lifecycle handlers
+
+/// Path to the browser state file.
+fn browser_state_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    home.join(".gthings").join("browser.json")
 }
 
-/// Return a Unix timestamp with nanosecond precision for telemetry.
-fn trace_timestamp() -> String {
-    let dur = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}.{:09}", dur.as_secs(), dur.subsec_nanos())
+/// Start the persistent browser.
+async fn handle_browser_start(json: bool) -> Result<(), anyhow::Error> {
+    let browser = cdp::Browser::launch()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start browser: {e}"))?;
+    let _conn = browser
+        .connect()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect: {e}"))?;
+    let pid = browser.pid().unwrap_or(0);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "started",
+                "pid": pid,
+                "ws_url": browser.ws_url(),
+            })
+        );
+    } else {
+        println!("Browser started (pid={})", pid);
+        println!("WebSocket URL: {}", browser.ws_url());
+    }
+    Ok(())
+}
+
+/// Stop the persistent browser: kill process and remove state file.
+async fn handle_browser_stop(json: bool) -> Result<(), anyhow::Error> {
+    let state_path = browser_state_path();
+    if !state_path.exists() {
+        if json {
+            println!("{}", serde_json::json!({"status": "not_running"}));
+        } else {
+            println!("No browser state found — browser is not running");
+        }
+        return Ok(());
+    }
+    let state_str = std::fs::read_to_string(&state_path)?;
+    let state: serde_json::Value = serde_json::from_str(&state_str)?;
+    let pid = state["pid"].as_u64().unwrap_or(0);
+
+    // Kill the process
+    if pid > 0 {
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+    }
+
+    // Remove state file
+    std::fs::remove_file(&state_path)?;
+
+    if json {
+        println!("{}", serde_json::json!({"status": "stopped", "pid": pid}));
+    } else {
+        println!("Browser stopped (pid={})", pid);
+    }
+    Ok(())
+}
+
+/// Show browser status (running or stopped).
+async fn handle_browser_status(json: bool) -> Result<(), anyhow::Error> {
+    let existing = cdp::Browser::find_existing().await;
+    if let Some(browser) = existing {
+        let pid = browser.pid().unwrap_or(0);
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "running",
+                    "pid": pid,
+                    "ws_url": browser.ws_url(),
+                })
+            );
+        } else {
+            println!("Browser is RUNNING (pid={})", pid);
+            println!("WebSocket URL: {}", browser.ws_url());
+        }
+    } else {
+        if json {
+            println!("{}", serde_json::json!({"status": "stopped"}));
+        } else {
+            println!("Browser is NOT running");
+        }
+    }
+    Ok(())
 }
 
 /// Extract command name and key arguments from the Command enum for telemetry.
@@ -449,45 +410,10 @@ fn command_metadata(cmd: &Command) -> (&'static str, serde_json::Value) {
                 serde_json::json!({"path": format!("{}", path.display())}),
             ),
         },
-        Command::Screenshot {
-            url,
-            output: _,
-            json,
-        } => ("screenshot", serde_json::json!({"url": url, "json": json})),
-        Command::Scrape {
-            url,
-            selector,
-            attribute: _,
-            json: _,
-        } => (
-            "scrape",
-            serde_json::json!({"url": url, "selector": selector}),
-        ),
         Command::Browser(args) => match &args.command {
-            BrowserCommand::Status => ("browser_status", serde_json::json!({})),
-            BrowserCommand::Start { port } => ("browser_start", serde_json::json!({"port": port})),
+            BrowserCommand::Start => ("browser_start", serde_json::json!({})),
             BrowserCommand::Stop => ("browser_stop", serde_json::json!({})),
-            BrowserCommand::Logs { follow } => {
-                ("browser_logs", serde_json::json!({"follow": follow}))
-            }
-            BrowserCommand::Call { method, params: _ } => {
-                ("browser_call", serde_json::json!({"method": method}))
-            }
-            BrowserCommand::Eval { expression } => (
-                "browser_eval",
-                serde_json::json!({"expression": expression}),
-            ),
-            BrowserCommand::Navigate { url } => {
-                ("browser_navigate", serde_json::json!({"url": url}))
-            }
-            BrowserCommand::Wait {
-                method,
-                session: _,
-                timeout,
-            } => (
-                "browser_wait",
-                serde_json::json!({"method": method, "timeout": timeout}),
-            ),
+            BrowserCommand::Status => ("browser_status", serde_json::json!({})),
         },
     }
 }

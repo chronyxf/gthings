@@ -3,7 +3,7 @@ use std::path::Path;
 use common::config::GthingsConfig;
 
 /// Shared output helper for PDF extraction results.
-fn output_pdf_result(text: &str, source: &str, pages: Option<usize>, json: bool) {
+fn output_pdf_result(text: &str, source: &str, pages: Option<usize>, json: bool) -> Result<(), anyhow::Error> {
     if json {
         let value = serde_json::json!({
             "source": source,
@@ -11,7 +11,8 @@ fn output_pdf_result(text: &str, source: &str, pages: Option<usize>, json: bool)
             "length": text.len(),
             "pages": pages,
         });
-        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        let output = serde_json::to_string_pretty(&value)?;
+        println!("{}", output);
     } else {
         println!("PDF: {}", source);
         if let Some(p) = pages {
@@ -30,10 +31,11 @@ fn output_pdf_result(text: &str, source: &str, pages: Option<usize>, json: bool)
             println!("  │ … ({} more lines)", text.lines().count() - 10);
         }
     }
+    Ok(())
 }
 
 /// Handler for `pdf url <url>`
-pub async fn handle_pdf_url(
+pub(crate) async fn handle_pdf_url(
     config: &GthingsConfig,
     url: &str,
     json: bool,
@@ -87,12 +89,12 @@ pub async fn handle_pdf_url(
         .map_err(|e| anyhow::anyhow!("Failed to extract text from PDF at '{}': {}", url, e))?;
     let pages = extraction::PdfExtractor::count_pages(&bytes).ok();
 
-    output_pdf_result(&text, url, pages, json);
+    output_pdf_result(&text, url, pages, json)?;
     Ok(())
 }
 
 /// Handler for `pdf file <path>`
-pub async fn handle_pdf_file(
+pub(crate) async fn handle_pdf_file(
     _config: &GthingsConfig,
     path: &Path,
     json: bool,
@@ -103,6 +105,6 @@ pub async fn handle_pdf_file(
     let pages = extraction::PdfExtractor::count_pages(&bytes).ok();
 
     let source = path.to_string_lossy();
-    output_pdf_result(&text, &source, pages, json);
+    output_pdf_result(&text, &source, pages, json)?;
     Ok(())
 }
