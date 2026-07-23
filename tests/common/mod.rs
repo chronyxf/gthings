@@ -1,3 +1,6 @@
+// Allow dead code — these helpers are used by ignored e2e tests
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -22,11 +25,6 @@ pub fn gthings_bin() -> PathBuf {
 /// Create a gthings Command.
 pub fn gthings() -> Command {
     Command::new(gthings_bin())
-}
-
-/// Check if browser daemon tests should run.
-pub fn daemon_available() -> bool {
-    std::env::var("GTHINGS_TEST_DAEMON").is_ok()
 }
 
 /// Create a minimal valid PDF for testing.
@@ -70,4 +68,84 @@ pub fn assert_json(output: &std::process::Output) -> serde_json::Value {
     assert_ok(output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).expect("Output should be valid JSON")
+}
+
+/// Parse JSON output from a CLI command.
+/// Finds the first line that starts with `{` or `[` (skips ANSI-colored log lines).
+pub fn parse_json(output: &std::process::Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let json_start = stdout
+        .lines()
+        .position(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with('{') || trimmed.starts_with('[')
+        });
+
+    match json_start {
+        Some(line_idx) => {
+            let json_str: String = stdout
+                .lines()
+                .skip(line_idx)
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_json::from_str(&json_str)
+                .unwrap_or_else(|e| panic!("Invalid JSON: {}\nFirst 500 chars: {}", e, &json_str[..std::cmp::min(500, json_str.len())]))
+        }
+        None => panic!(
+            "No JSON found in output:\nstdout: {}\nstderr: {}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
+}
+
+/// Run gthings with given args, return parsed JSON and raw output.
+pub fn run_gthings(args: &[&str]) -> (serde_json::Value, std::process::Output) {
+    let output = gthings()
+        .args(args)
+        .output()
+        .expect("gthings execution failed");
+    let json = parse_json(&output);
+    (json, output)
+}
+
+use std::time::Duration;
+use std::net::TcpStream;
+
+/// Wait for port 9222 to become available (not in TIME_WAIT)
+pub fn wait_for_port(timeout_secs: u64) -> bool {
+    let start = std::time::Instant::now();
+    // First try harder to kill whatever is on the port
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "remote-debugging-port=9222"])
+        .output();
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "Dia.*9222"])
+        .output();
+
+    while start.elapsed().as_secs() < timeout_secs {
+        match TcpStream::connect_timeout(
+            &"127.0.0.1:9222".parse().unwrap(),
+            Duration::from_millis(200),
+        ) {
+            Err(_) => return true, // Port is free
+            Ok(_) => {
+                // Port in use — try to kill the holder
+                let _ = std::process::Command::new("pkill")
+                    .args(["-f", "remote-debugging-port=9222"])
+                    .output();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// Kill any existing browser on port 9222
+pub fn stop_existing_browser(bin: &std::path::Path) {
+    let _ = std::process::Command::new(bin)
+        .args(["browser", "stop"])
+        .output();
+    std::thread::sleep(Duration::from_millis(500));
 }
