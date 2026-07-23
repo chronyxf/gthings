@@ -1,24 +1,22 @@
 [package]
-name = "cdp-core"
+name = "cdp"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-cdp-protocol = { path = "../../protocol" }
-common = { path = "../common" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time", "net", "rt", "macros"] }
-tracing = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "sync", "time", "net", "rt", "macros"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
-dashmap = "6"
+tracing = { workspace = true }
+thiserror = { workspace = true }
 url = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+anyhow = { workspace = true }
+bytes = "1"
 
 [lints]
 workspace = true

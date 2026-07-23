@@ -9,10 +9,8 @@ use crate::error::GthingsError;
 /// A SHA-256-keyed disk cache with TTL-based expiry.
 ///
 /// Keys are deterministically derived from a (URL, offset, max) triple using
-/// the same SHA-256 hex scheme as the TypeScript original: the hash of
-/// `"{url}|{offset}|{max}"`. Entries are stored as raw content strings on
-/// disk (not JSON-wrapped), also matching TypeScript. Expiry uses file mtime,
-/// matching TypeScript's `statSync().mtimeMs` check.
+/// SHA-256 of `"{url}|{offset}|{max}"`. Entries are stored as raw content
+/// strings on disk (not JSON-wrapped). Expiry uses file mtime.
 ///
 /// # Concurrency
 ///
@@ -138,10 +136,8 @@ impl Sha256DiskCache {
                 continue;
             }
 
-            if is_expired(&path, self.ttl) {
-                if fs::remove_file(&path).is_ok() {
-                    evicted += 1;
-                }
+            if is_expired(&path, self.ttl) && fs::remove_file(&path).is_ok() {
+                evicted += 1;
             }
         }
 
@@ -149,9 +145,7 @@ impl Sha256DiskCache {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Internal helpers
-// ---------------------------------------------------------------------------
 
 /// Encode a byte slice as a lowercase hex string (no external crate dependency).
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
@@ -167,7 +161,6 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
 
 /// Check whether a cache file is older than the TTL using the file's mtime.
 ///
-/// This matches the TypeScript original, which uses `statSync().mtimeMs`.
 /// Missing files are treated as expired. Files with inaccessible metadata
 /// are conservatively treated as not expired (we do not delete what we
 /// cannot verify).

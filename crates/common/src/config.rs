@@ -23,6 +23,10 @@ pub struct GthingsConfig {
     pub max_chars: usize,
     /// Hostnames to exclude from SERP results (e.g. Google chrome pages).
     pub deny_hosts: Vec<String>,
+    /// Steady-state requests per second per host for rate limiting (default 2).
+    pub per_host_rate_per_sec: u32,
+    /// Maximum burst size for per-host rate limiting (default 5).
+    pub per_host_burst_size: u32,
 }
 
 impl Default for GthingsConfig {
@@ -43,6 +47,8 @@ impl Default for GthingsConfig {
                 "support.google.com".to_string(),
                 "policies.google.com".to_string(),
             ],
+            per_host_rate_per_sec: 2,
+            per_host_burst_size: 5,
         }
     }
 }
@@ -54,7 +60,6 @@ impl GthingsConfig {
     /// values not set will fall back to [`GthingsConfig::default()`].
     ///
     /// | Variable                  | Field              |
-    /// |---------------------------|--------------------|
     /// | `GTHINGS_CDP_PORT`        | `cdp_port`         |
     /// | `GTHINGS_BROWSER_PATH`    | `browser_path`     |
     /// | `GTHINGS_PROFILE_DIR`     | `profile_dir`      |
@@ -66,6 +71,8 @@ impl GthingsConfig {
     /// | `GTHINGS_FOLLOW_CONCURRENCY` | `follow_concurrency` |
     /// | `GTHINGS_MAX_CHARS`       | `max_chars`        |
     /// | `GTHINGS_DENY_HOSTS`      | `deny_hosts`       |
+    /// | `GTHINGS_PER_HOST_RATE`   | `per_host_rate_per_sec` |
+    /// | `GTHINGS_PER_HOST_BURST`  | `per_host_burst_size` |
     pub fn from_env() -> Self {
         let defaults = Self::default();
 
@@ -116,6 +123,14 @@ impl GthingsConfig {
                         .collect()
                 })
                 .unwrap_or(defaults.deny_hosts),
+            per_host_rate_per_sec: std::env::var("GTHINGS_PER_HOST_RATE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.per_host_rate_per_sec),
+            per_host_burst_size: std::env::var("GTHINGS_PER_HOST_BURST")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.per_host_burst_size),
         }
     }
 }

@@ -16,6 +16,10 @@ pub enum GthingsError {
         message: String,
     },
 
+    /// An error from the CDP transport layer (launch, connect, eval, etc.).
+    #[error("CDP: {0}")]
+    Cdp(String),
+
     /// An HTTP-level failure (e.g. connection refused, TLS error).
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),

@@ -14,7 +14,7 @@ CHANGESETS_DIR=".changesets"
 STAGED_FILES=$(git diff --cached --name-only)
 
 # Files that trigger changeset requirement
-CODE_PATTERNS=('\.rs$' 'Cargo\.toml' 'Cargo\.lock' '^crates/' '^protocol/')
+CODE_PATTERNS=('\.rs$' 'Cargo\.toml' 'Cargo\.lock' '^crates/')
 needs_changeset=0
 for file in $STAGED_FILES; do
     for pattern in "${CODE_PATTERNS[@]}"; do
