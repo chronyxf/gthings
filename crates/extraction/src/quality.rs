@@ -39,19 +39,19 @@ pub struct SecondaryResult {
 pub struct ContentQuality;
 
 impl ContentQuality {
-    // ─── Error Page Patterns (shared with detect methods) ────────────────
+    // Error page patterns (shared with detect methods)
 
     fn error_page_reasons() -> &'static [(Regex, &'static str)] {
         static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         PATTERNS.get_or_init(|| {
             vec![
                 (
-                    Regex::new(r"(?i)This site can't be reached").unwrap(),
+                    Regex::new(r"(?i)This site can't be reached").expect("valid regex"),
                     "browser_error_page",
                 ),
-                (Regex::new(r"ERR_CONNECTION").unwrap(), "connection_error"),
-                (Regex::new(r"404 Not Found").unwrap(), "not_found"),
-                (Regex::new(r"^\s*$").unwrap(), "whitespace_only"),
+                (Regex::new(r"ERR_CONNECTION").expect("valid regex"), "connection_error"),
+                (Regex::new(r"404 Not Found").expect("valid regex"), "not_found"),
+                (Regex::new(r"^\s*$").expect("valid regex"), "whitespace_only"),
             ]
         })
     }
@@ -176,7 +176,7 @@ impl ContentQuality {
                  are you a human|browser integrity check|challenge-platform|\
                  datadome|just a moment\\.\\.\\.|checking the browser|cloudflare)",
             )
-            .unwrap()
+            .expect("valid regex")
         });
         re.is_match(text)
     }
@@ -188,7 +188,7 @@ impl ContentQuality {
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| {
             Regex::new("(?i)(captcha|recaptcha|g-recaptcha|h-captcha|turnstile|cf-turnstile)")
-                .unwrap()
+                .expect("valid regex")
         });
         re.is_match(text)
     }
@@ -209,7 +209,7 @@ impl ContentQuality {
                  continue reading.*subscribe|unlimited (access|digital) access|\
                  paid (article|content)|this article is (behind a|exclusively for))",
             )
-            .unwrap()
+            .expect("valid regex")
         });
         re.is_match(text)
     }
@@ -226,7 +226,7 @@ impl ContentQuality {
 
         // JS-required message
         static JS_RE: OnceLock<Regex> = OnceLock::new();
-        let js_re = JS_RE.get_or_init(|| Regex::new(r"(?i)please enable javascript").unwrap());
+        let js_re = JS_RE.get_or_init(|| Regex::new(r"(?i)please enable javascript").expect("valid regex"));
         if js_re.is_match(text) {
             return true;
         }
@@ -292,7 +292,7 @@ impl ContentQuality {
         // Truncation detection: ends mid-sentence (last char is not sentence-ending)
         let trimmed = text.trim();
         if trimmed.len() > 100 {
-            let last_char = trimmed.chars().last().unwrap();
+            let last_char = trimmed.chars().last().unwrap_or(' ');
             let second_last = trimmed.chars().rev().nth(1).unwrap_or(' ');
             if last_char.is_ascii_alphanumeric()
                 && !(second_last == '.'
@@ -315,7 +315,7 @@ impl ContentQuality {
                      please continue|click to continue|continue to next|\
                      loading|please wait)",
                 )
-                .unwrap()
+                .expect("valid regex")
             });
             if sus_re.is_match(text) {
                 suspicious_short = true;
@@ -330,7 +330,7 @@ impl ContentQuality {
 
         // Check for repetitive content (same sentence appearing many times)
         let sentences: Vec<&str> = text
-            .split(|c: char| c == '.' || c == '!' || c == '?')
+            .split(['.', '!', '?'])
             .filter(|s| s.trim().len() > 20)
             .collect();
 
@@ -353,26 +353,26 @@ impl ContentQuality {
     }
 }
 
-// ─── Private helpers ───────────────────────────────────────────────────────
+// Private helpers
 
 /// Check if text contains sentence-ending punctuation.
 fn regex_has_punctuation(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"[.!?]").unwrap());
+    let re = RE.get_or_init(|| Regex::new(r"[.!?]").expect("valid regex"));
     re.is_match(text)
 }
 
 /// Check if text contains words with 4+ characters.
 fn regex_has_long_words(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\w{4,}").unwrap());
+    let re = RE.get_or_init(|| Regex::new(r"\w{4,}").expect("valid regex"));
     re.is_match(text)
 }
 
 /// Check if text contains paragraph breaks (double newline).
 fn regex_has_paragraphs(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\n\n").unwrap());
+    let re = RE.get_or_init(|| Regex::new(r"\n\n").expect("valid regex"));
     re.is_match(text)
 }
 

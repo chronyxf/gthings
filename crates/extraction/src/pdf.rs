@@ -1,6 +1,5 @@
 /// PDF text extraction — pure Rust implementation.
 ///
-/// Ported from `skills/gsearch/scripts/pdf-extract.ts`.
 ///
 /// Pipeline:
 /// 1. Validate PDF magic number (`%PDF-`)
@@ -147,7 +146,7 @@ impl PdfExtractor {
     }
 }
 
-// ─── Stream Extraction ─────────────────────────────────────────────────────
+// Stream extraction
 
 /// Extract all stream objects from raw PDF bytes.
 ///
@@ -218,11 +217,7 @@ fn is_pdf_whitespace(b: u8) -> bool {
 /// returns the header text. Returns an empty string if no `obj` is found.
 fn get_obj_header(bytes: &[u8], stream_pos: usize) -> String {
     // Scan backward from stream_pos to find "obj"
-    let search_start = if stream_pos > 500 {
-        stream_pos - 500
-    } else {
-        0
-    };
+    let search_start = stream_pos.saturating_sub(500);
     let before = &bytes[search_start..stream_pos];
 
     if let Some(obj_pos) = before.windows(3).rposition(|w| w == b"obj") {
@@ -233,7 +228,7 @@ fn get_obj_header(bytes: &[u8], stream_pos: usize) -> String {
     }
 }
 
-// ─── Decompression ─────────────────────────────────────────────────────────
+// Decompression
 
 /// Decompress a FlateDecode (zlib) stream.
 fn decompress_flate(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -248,9 +243,7 @@ fn decompress_flate(data: &[u8]) -> Result<Vec<u8>, String> {
             format!("Corrupted FlateDecode stream: {msg}")
         } else if msg.contains("unexpected end of data") {
             "Corrupted FlateDecode stream: unexpected end of data (stream may be truncated)".into()
-        } else if msg.contains("invalid block type") {
-            format!("Corrupted FlateDecode stream: {msg}")
-        } else if msg.contains("unknown compression method") {
+        } else if msg.contains("invalid block type") || msg.contains("unknown compression method") {
             format!("Corrupted FlateDecode stream: {msg}")
         } else {
             format!("FlateDecode decompression error: {msg}")
@@ -259,7 +252,7 @@ fn decompress_flate(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-// ─── Text Extraction from Content Streams ─────────────────────────────────
+// Text extraction from content streams
 
 /// Extract text from a decompressed PDF content stream.
 ///
@@ -331,23 +324,23 @@ fn extract_text_from_stream(data: &[u8]) -> String {
 /// - Literal newlines: `\n` → newline
 fn unescape_pdf_string(s: &str) -> String {
     static OCTAL_RE: OnceLock<Regex> = OnceLock::new();
-    let octal_re = OCTAL_RE.get_or_init(|| Regex::new(r"\\([0-7]{3})").unwrap());
+    let octal_re = OCTAL_RE.get_or_init(|| Regex::new(r"\\([0-7]{3})").expect("valid regex"));
 
     // Step 1: replace octal escapes
     let s = octal_re.replace_all(s, |caps: &regex::Captures| {
-        let oct = caps.get(1).unwrap().as_str();
+        let oct = caps.get(1).map_or("", |m| m.as_str());
         let code = u32::from_str_radix(oct, 8).unwrap_or(0);
         char::from_u32(code).map_or_else(|| '\u{FFFD}'.to_string(), |c| c.to_string())
     });
 
     // Step 2: replace `\n` with actual newline
     static NL_RE: OnceLock<Regex> = OnceLock::new();
-    let nl_re = NL_RE.get_or_init(|| Regex::new(r"\\n").unwrap());
+    let nl_re = NL_RE.get_or_init(|| Regex::new(r"\\n").expect("valid regex"));
     let s = nl_re.replace_all(&s, "\n");
 
     // Step 3: remove remaining backslash escapes (\, \(, \), etc.)
     static ESC_RE: OnceLock<Regex> = OnceLock::new();
-    let esc_re = ESC_RE.get_or_init(|| Regex::new(r"\\(.)").unwrap());
+    let esc_re = ESC_RE.get_or_init(|| Regex::new(r"\\(.)").expect("valid regex"));
     let s = esc_re.replace_all(&s, "$1");
 
     s.trim().to_string()

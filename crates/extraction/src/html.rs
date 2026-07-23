@@ -1,6 +1,5 @@
 /// HTML content extraction utilities.
 ///
-/// Ported from `skills/cdp/scripts/templates.ts` (extractionCode).
 /// Provides CSS-selector-based content extraction, heading-based section
 /// detection, and HTML tag stripping.
 use regex::Regex;
@@ -65,7 +64,7 @@ impl HtmlExtractor {
 
         let root = doc.select(&sel).next().unwrap_or_else(|| {
             // Fall back to body
-            let body_sel = scraper::Selector::parse("body").unwrap();
+            let body_sel = scraper::Selector::parse("body").expect("valid selector: body");
             doc.select(&body_sel).next().unwrap_or(doc.root_element())
         });
 
@@ -157,12 +156,12 @@ impl HtmlExtractor {
     /// ```
     pub fn strip_tags(html: &str) -> String {
         static TAG_RE: OnceLock<Regex> = OnceLock::new();
-        let tag_re = TAG_RE.get_or_init(|| Regex::new(r"<[^>]+>").unwrap());
+        let tag_re = TAG_RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("valid regex"));
         let result = tag_re.replace_all(html, " ");
 
         static ENTITY_RE: OnceLock<Regex> = OnceLock::new();
         let entity_re = ENTITY_RE
-            .get_or_init(|| Regex::new(r"&(amp|lt|gt|quot|nbsp|apos|#x?[0-9a-fA-F]+);").unwrap());
+            .get_or_init(|| Regex::new(r"&(amp|lt|gt|quot|nbsp|apos|#x?[0-9a-fA-F]+);").expect("valid regex"));
         let result = entity_re.replace_all(&result, |caps: &regex::Captures| -> String {
             match &caps[1] {
                 "amp" => "&".to_string(),
@@ -175,7 +174,7 @@ impl HtmlExtractor {
                     let code = if other.starts_with("#x") || other.starts_with("#X") {
                         u32::from_str_radix(&other[2..], 16)
                     } else {
-                        u32::from_str_radix(&other[1..], 10)
+                        other[1..].parse::<u32>()
                     };
                     code.ok()
                         .and_then(char::from_u32)
@@ -188,13 +187,13 @@ impl HtmlExtractor {
 
         // Collapse whitespace
         static WS_RE: OnceLock<Regex> = OnceLock::new();
-        let ws_re = WS_RE.get_or_init(|| Regex::new(r"\s+").unwrap());
+        let ws_re = WS_RE.get_or_init(|| Regex::new(r"\s+").expect("valid regex"));
         let result = ws_re.replace_all(&result, " ");
 
         result.trim().to_string()
     }
 
-    // ─── Private: section detection from parsed HTML ────────────────────
+    // Section detection from parsed HTML
 
     /// Detect sections from a scraper HTML element tree.
     fn detect_sections_html(root: &scraper::ElementRef, full_text: &str) -> Vec<Section> {
@@ -250,7 +249,7 @@ impl HtmlExtractor {
     }
 }
 
-// ─── Private Helpers ─────────────────────────────────────────────────────
+// Helpers
 
 /// Check if a text line looks like a section heading.
 fn is_heading_line(line: &str) -> bool {
@@ -276,7 +275,7 @@ fn is_heading_line(line: &str) -> bool {
 
     // Numbered lines like "1. Title" or "1) Title"
     static NUM_RE: OnceLock<Regex> = OnceLock::new();
-    let num_re = NUM_RE.get_or_init(|| Regex::new(r"^\d+[.)]\s").unwrap());
+    let num_re = NUM_RE.get_or_init(|| Regex::new(r"^\d+[.)]\s").expect("valid regex"));
     if num_re.is_match(line) {
         return true;
     }
@@ -288,7 +287,7 @@ fn is_heading_line(line: &str) -> bool {
         if words.len() >= 2 {
             let capitalized_count = words
                 .iter()
-                .filter(|w| w.chars().next().map_or(false, |c| c.is_ascii_uppercase()))
+                .filter(|w| w.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
                 .count();
             if capitalized_count as f64 / words.len() as f64 > 0.5 {
                 return true;
