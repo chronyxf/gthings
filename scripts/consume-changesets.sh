@@ -1,228 +1,149 @@
 #!/bin/bash
-# Consume changeset files and update CHANGELOG.md
+# Consume changeset files and update per-crate CHANGELOG.md files
 # Usage: ./scripts/consume-changesets.sh
-#
-# Changeset file format (Markdown with YAML frontmatter):
-#
-#   ---
-#   "crate-name": patch|minor|major
-#   ---
-#
-#   - Bullet point description
-#   - Another bullet point
-#
-
 set -euo pipefail
 
 CHANGESETS_DIR=".changesets"
-CHANGELOG="CHANGELOG.md"
 
 if [ ! -d "$CHANGESETS_DIR" ]; then
     echo "No .changesets/ directory found"
     exit 0
 fi
 
-# Collect all changeset files
 files=("$CHANGESETS_DIR"/*.md)
 if [ ${#files[@]} -eq 0 ] || [ ! -f "${files[0]}" ]; then
-    echo "No changeset files found in $CHANGESETS_DIR/"
+    echo "No changeset files found"
     exit 0
 fi
 
 echo "Consuming ${#files[@]} changeset(s)..."
 
-declare -a minor_entries=()
-declare -a patch_entries=()
-declare -a major_entries=()
-
 for f in "${files[@]}"; do
     basename=$(basename "$f" .md)
     
-    # Parse frontmatter: read lines between --- delimiters
+    # Parse frontmatter
     in_frontmatter=0
-    crates=()
-    bumps=()
+    declare -a crates=()
+    declare -a bumps=()
+    declare -a descriptions=()
+    
     while IFS= read -r line; do
         if [[ "$line" == "---" ]]; then
-            if [ $in_frontmatter -eq 0 ]; then
-                in_frontmatter=1
-            else
-                break  # end of frontmatter
-            fi
+            in_frontmatter=$((in_frontmatter + 1))
             continue
         fi
         if [ $in_frontmatter -eq 1 ]; then
-            # Match lines like: "crate-name": patch
             if [[ "$line" =~ ^\"([^\"]+)\":[[:space:]]*(patch|minor|major)$ ]]; then
                 crates+=("${BASH_REMATCH[1]}")
                 bumps+=("${BASH_REMATCH[2]}")
             fi
-        fi
-    done < "$f"
-    
-    # Read description lines (after frontmatter, excluding blank lines)
-    desc_lines=()
-    in_desc=0
-    while IFS= read -r line; do
-        if [[ "$line" == "---" ]]; then
-            if [ $in_desc -eq 0 ]; then
-                in_desc=1
-                continue
-            else
-                in_desc=2
-                continue
-            fi
-        fi
-        if [ $in_desc -ge 2 ]; then
-            # Collect non-empty, non-heading lines
+        elif [ $in_frontmatter -ge 2 ]; then
             trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            if [ -n "$trimmed" ] && [[ ! "$trimmed" == \#* ]]; then
-                desc_lines+=("$trimmed")
+            if [ -n "$trimmed" ]; then
+                descriptions+=("$trimmed")
             fi
         fi
     done < "$f"
     
-    # Determine the highest bump across all crates in this file
-    highest_bump="patch"
-    for bump in "${bumps[@]}"; do
-        case "$bump" in
-            major) highest_bump="major" ;;
-            minor) if [ "$highest_bump" != "major" ]; then highest_bump="minor"; fi ;;
+    # For each crate, update its CHANGELOG.md
+    for i in "${!crates[@]}"; do
+        crate="${crates[$i]}"
+        bump="${bumps[$i]}"
+        
+        # Determine changelog path
+        changelog=""
+        case "$crate" in
+            cdp|cli|common|extraction|search)
+                changelog="crates/$crate/CHANGELOG.md"
+                ;;
+            *)
+                echo "  Warning: Unknown crate '$crate', skipping"
+                continue
+                ;;
         esac
-    done
-
-    # Collect description bullets (each `- ` line is a separate entry)
-    bullets=()
-    for line in "${desc_lines[@]}"; do
-        if [[ "$line" == "- "* ]]; then
-            bullets+=("$line")
+        
+        echo "  Updating $changelog ($bump)"
+        
+        # Extract last version
+        last_version="0.0.0"
+        if [ -f "$changelog" ]; then
+            last_version=$(grep -m 1 '^## \[*[0-9]' "$changelog" | sed 's/^## \[*\([0-9]*\.[0-9]*\.[0-9]*\)\]*.*/\1/' || echo "0.0.0")
         fi
-    done
-
-    # If no bullets found, use the raw description lines as fallback
-    if [ ${#bullets[@]} -eq 0 ]; then
-        for line in "${desc_lines[@]}"; do
-            if [ -n "$line" ]; then
-                bullets+=("- $line")
+        
+        # Parse and bump
+        IFS='.' read -r major minor patch <<< "$last_version"
+        case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+        esac
+        new_version="${major}.${minor}.${patch}"
+        date=$(date +%Y-%m-%d)
+        
+        # Build new section
+        new_section=$(mktemp)
+        echo "## ${new_version} — ${date}" > "$new_section"
+        
+        # Categorize descriptions
+        has_feat=0; has_fix=0; has_change=0
+        feat_lines=(); fix_lines=(); change_lines=()
+        for desc in "${descriptions[@]}"; do
+            lower=$(echo "$desc" | tr '[:upper:]' '[:lower:]')
+            if echo "$lower" | grep -q "fix\|bug\|repair\|patch"; then
+                has_fix=1; fix_lines+=("$desc")
+            elif echo "$lower" | grep -q "feat\|add\|new\|feature\|implement"; then
+                has_feat=1; feat_lines+=("$desc")
+            else
+                has_change=1; change_lines+=("$desc")
             fi
         done
-    fi
-
-    # Assign bullets to the highest bump group
-    case "$highest_bump" in
-        major) major_entries=("${bullets[@]}") ;;
-        minor) minor_entries=("${bullets[@]}") ;;
-        patch) patch_entries=("${bullets[@]}") ;;
-    esac
-done
-
-# If no entries were parsed, fall back to using file basename
-if [ ${#minor_entries[@]} -eq 0 ] && [ ${#patch_entries[@]} -eq 0 ] && [ ${#major_entries[@]} -eq 0 ]; then
-    echo "Warning: No entries parsed from changesets. Using filenames as fallback."
-    for f in "${files[@]}"; do
-        basename=$(basename "$f" .md)
-        patch_entries+=("- $basename")
+        
+        # Write categorized entries
+        {
+            echo ""
+            if [ ${#feat_lines[@]} -gt 0 ]; then
+                echo "### Features"
+                echo ""
+                for line in "${feat_lines[@]}"; do echo "- $line"; done
+                echo ""
+            fi
+            if [ ${#fix_lines[@]} -gt 0 ]; then
+                echo "### Fixes"
+                echo ""
+                for line in "${fix_lines[@]}"; do echo "- $line"; done
+                echo ""
+            fi
+            if [ ${#change_lines[@]} -gt 0 ]; then
+                echo "### Changed"
+                echo ""
+                for line in "${change_lines[@]}"; do echo "- $line"; done
+                echo ""
+            fi
+        } >> "$new_section"
+        
+        # Prepend to changelog
+        if [ -f "$changelog" ]; then
+            temp=$(mktemp)
+            header_lines=3
+            head -n $header_lines "$changelog" > "$temp"
+            echo "" >> "$temp"
+            cat "$new_section" >> "$temp"
+            tail -n +$((header_lines + 1)) "$changelog" 2>/dev/null >> "$temp" || true
+            mv "$temp" "$changelog"
+        else
+            {
+                echo "# Changelog — ${crate}"
+                echo ""
+                cat "$new_section"
+            } > "$changelog"
+        fi
+        
+        rm "$new_section"
     done
-fi
-
-# Determine the overall highest bump across all changesets
-overall_bump="patch"
-if [ ${#major_entries[@]} -gt 0 ]; then
-    overall_bump="major"
-elif [ ${#minor_entries[@]} -gt 0 ]; then
-    overall_bump="minor"
-fi
-
-# Extract last version from CHANGELOG.md
-LAST_VERSION="0.0.0"
-if [ -f "$CHANGELOG" ]; then
-    LAST_VERSION=$(grep -m 1 '^## \[*[0-9]' "$CHANGELOG" | sed 's/^## \[*\([0-9]*\.[0-9]*\.[0-9]*\)\]*.*/\1/' || echo "0.0.0")
-fi
-
-# Parse semver
-MAJOR=$(echo "$LAST_VERSION" | cut -d. -f1)
-MINOR=$(echo "$LAST_VERSION" | cut -d. -f2)
-PATCH=$(echo "$LAST_VERSION" | cut -d. -f3)
-
-# Bump according to overall highest bump
-case "$overall_bump" in
-    major)
-        MAJOR=$((MAJOR + 1))
-        MINOR=0
-        PATCH=0
-        ;;
-    minor)
-        MINOR=$((MINOR + 1))
-        PATCH=0
-        ;;
-    patch)
-        PATCH=$((PATCH + 1))
-        ;;
-esac
-
-VERSION="${MAJOR}.${MINOR}.${PATCH}"
-DATE=$(date +%Y-%m-%d)
-
-# Build the new changelog section
-new_section=$(mktemp)
-echo "## ${VERSION} — ${DATE}" >> "$new_section"
-echo "" >> "$new_section"
-
-if [ ${#major_entries[@]} -gt 0 ]; then
-    echo "### Major Changes" >> "$new_section"
-    echo "" >> "$new_section"
-    for entry in "${major_entries[@]}"; do
-        echo "$entry" >> "$new_section"
-    done
-    echo "" >> "$new_section"
-fi
-
-if [ ${#minor_entries[@]} -gt 0 ]; then
-    echo "### Minor Changes" >> "$new_section"
-    echo "" >> "$new_section"
-    for entry in "${minor_entries[@]}"; do
-        echo "$entry" >> "$new_section"
-    done
-    echo "" >> "$new_section"
-fi
-
-if [ ${#patch_entries[@]} -gt 0 ]; then
-    echo "### Patch Changes" >> "$new_section"
-    echo "" >> "$new_section"
-    for entry in "${patch_entries[@]}"; do
-        echo "$entry" >> "$new_section"
-    done
-    echo "" >> "$new_section"
-fi
-
-# Prepend to CHANGELOG.md
-if [ -f "$CHANGELOG" ]; then
-    # Insert after the header (first 3 lines typically)
-    temp=$(mktemp)
-    header_lines=3
-    head -n $header_lines "$CHANGELOG" > "$temp"
-    echo "" >> "$temp"
-    cat "$new_section" >> "$temp"
-    # Append the rest (skip the original header and any empty line after)
-    tail -n +$((header_lines + 1)) "$CHANGELOG" 2>/dev/null | sed '/^$/d' >> "$temp" || true
-    mv "$temp" "$CHANGELOG"
-else
-    # Scaffold new CHANGELOG
-    {
-        echo "# Changelog"
-        echo ""
-        echo "All notable changes to this project will be documented in this file."
-        echo ""
-        cat "$new_section"
-    } > "$CHANGELOG"
-fi
-
-rm "$new_section"
-
-# Remove consumed files
-for f in "${files[@]}"; do
+    
+    # Remove consumed file
     rm "$f"
     echo "  Removed: $f"
 done
 
-echo "Done. CHANGELOG.md updated."
+echo "Done. Per-crate CHANGELOG.md files updated."

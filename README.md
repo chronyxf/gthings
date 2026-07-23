@@ -2,97 +2,78 @@
 
 Browser automation and web research toolkit. Single Rust binary, zero runtime dependencies.
 
+## Architecture
+
+```
+AI Agent → gthings CLI
+               │
+               ├── Persistent Dia/Chrome (port 9222)
+               ├── Tab create → navigate → extract → tab close
+               └── --json output, --trace logging
+```
+
 ## Install
 
 ```bash
-git clone https://github.com/chronyxf/gthings.git
+git clone <repo>
 cd gthings
 cargo build --release
-# Binary at target/release/gthings
-# Daemon at target/release/browser-daemon
+./target/release/gthings --help
 ```
 
-Requires Rust 1.85+. Chrome or any Chromium browser.
+Requires Rust 1.85+ and Dia/Chrome/Chromium installed.
 
 ## Quick Start
 
 ```bash
-# Start daemon
-target/release/browser-daemon start --port 9222
+# Browser auto-launches on first command, persists across calls
 
-# Search + read in one command
-target/release/gthings --json search harvest "topic" --count 5 --max 3
+# Search
+./target/release/gthings --json search query "Rust async" --count 5
+
+# Read a page
+./target/release/gthings --json follow url "https://www.rust-lang.org" --max 20000
+
+# Batch read
+./target/release/gthings --json follow batch "url1" "url2" --max 20000
+
+# Browse PDF
+./target/release/gthings --json pdf url "https://arxiv.org/pdf/xxxx.xxxxx"
+
+# Explicit browser lifecycle
+./target/release/gthings --json browser status
+./target/release/gthings browser stop
 ```
+
+Add `--trace /tmp/trace.jsonl` to every command for step-level debugging.
 
 ## For AI Agents
 
-After building, sync the skill to your global agent directory:
+Install the gthings skill so AI agents know how to use the tool:
 
 ```bash
-# Install skills globally (copies skills/gthings/ → ~/.agents/skills/gthings/)
 bash scripts/install-skills.sh
-
-# Or with a custom prefix
-bash scripts/install-skills.sh --prefix ~/.config/opencode
 ```
 
-Once installed, AI agents can load the skill from any project:
-
-```
-skill gthings
-```
-
-The skill includes:
-
-| File | Use |
-|------|-----|
-| `SKILL.md` | Full playbook, traps, decision tree |
-| `reference/commands.md` | Every command with JSON return types |
-| `reference/agent-prompt.md` | Ready-to-use prompt for spawning agents |
-| `reference/agent-trace.md` | --trace telemetry analysis |
-| `reference/daemon.md` | Daemon lifecycle |
-| `reference/quality.md` | Quality gate + section extraction |
-| `reference/errors.md` | Troubleshooting |
-
-## Troubleshooting
-
-**Rust version too old** — This project requires Rust 1.85+ (edition 2024).
-
-```bash
-rustc --version        # Check version
-rustup update stable   # Update to latest
-rustup default stable  # Set stable as default
-```
-
-**Build fails** — Check your toolchain:
-
-```bash
-rustup toolchain list                   # Verify installed toolchains
-cargo check 2>&1 | head -20             # See specific errors
-rustup component add clippy rustfmt     # Install required components
-```
-
-**Daemon won't start** — Port conflict or browser not found:
-
-```bash
-lsof -i :9222                           # Check port usage
-which chrome || which chromium || true  # Check browser path
-gthings browser start --port 9223       # Try alternate port
-```
+Then agents load it via `skill gthings`. The skill provides:
+- Command reference with flags and JSON return types
+- Quality gate documentation (how content is scored)
+- Agent prompt template with workflow patterns
+- Error code reference for troubleshooting
+- Trace telemetry format for analyzing agent behavior
 
 ## Commands
 
-All support `--json` (structured output) and `--trace <file>` (telemetry).
+| Command | Description | JSON Output |
+|---------|-------------|-------------|
+| `search query <q> --count N` | Google search | `[{title, url, snippet}]` |
+| `search batch <q1> <q2> --count N` | Multi-query search | `[{results[], meta}]` |
+| `search harvest <q1> <q2> --count N --follow M` | Search + follow pipeline | `{search_results[], read_pages[], meta}` |
+| `follow url <url> --max N` | Extract page content | `{url, content, sections[], quality, truncated}` |
+| `follow batch <url1> <url2> --max N` | Multi-page extraction | `[{url, content, quality}...]` |
+| `pdf url <url>` | Extract PDF text | `{content, pages, meta}` |
+| `pdf file <path>` | Extract local PDF | `{content, pages, meta}` |
+| `browser status` | Check browser state | `{status, pid, ws_url}` |
+| `browser stop` | Kill browser | `{pid, status}` |
 
-```
-search query    Single Google search
-search batch    Multi-query search
-search harvest  Two-phase search + follow
-follow url      Read a page (sections + quality gate)
-follow batch    Read multiple pages
-pdf url         Extract text from PDF URL
-pdf file        Extract text from local PDF
-screenshot      Capture PNG (or --json base64)
-scrape          Extract elements by CSS selector
-browser         Daemon management (start/stop/status/logs/call/eval)
-```
+All commands support `--json` (structured output) and `--trace <file>` (step-level JSONL logging).

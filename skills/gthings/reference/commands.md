@@ -2,76 +2,7 @@
 
 Every command supports `--json` (global, structured JSON output) and `--trace <file>` (telemetry).
 
-## Browser Management
-
-### `gthings browser start --port <port>`
-
-Start the daemon. Must be running before any browser operations.
-
-```
---port     | Browser debugging port (default: 9222)
-```
-
-```json
-{"ok":true,"pid":47313,"port":9222}
-```
-
-### `gthings browser status`
-
-Check if daemon is running and connected.
-
-```json
-{"ok":true,"pid":47313,"port":9222,"connected":true,"uptime_secs":120}
-```
-
-### `gthings browser stop`
-
-Gracefully stop the daemon.
-
-```json
-{"ok":true,"stopped":true}
-```
-
-### `gthings browser call <method> <params>`
-
-Raw CDP method call. `params` is JSON string.
-
-```
-gthings --json browser call "Browser.getVersion" "{}"
-→ {"product":"Chrome/150.0.7871.129","protocol":"1.3",...}
-```
-
-### `gthings browser eval <expression>`
-
-Evaluate JavaScript in the browser context.
-
-```
-gthings --json browser eval "1+1"
-→ {"value":2}
-```
-
-### `gthings browser navigate <url>`
-
-Navigate the current tab.
-
-```
-gthings --json browser navigate "https://example.com"
-→ {"ok":true}
-```
-
-### `gthings browser logs [--follow]`
-
-View daemon logs.
-
-```
-gthings browser logs
-```
-
-### `gthings browser wait <method> <session> [--timeout 30000]`
-
-Wait for a CDP event. Primarily for debugging.
-
----
+Chrome is auto-launched on first use and stays alive (persistent on port 9222). No manual browser management needed — but use `browser start`, `browser stop`, `browser status` to control it explicitly.
 
 ## Search
 
@@ -135,9 +66,7 @@ Multi-query search. Results deduplicated by URL.
 }
 ```
 
-**This is the most efficient tool for multi-topic research.** One command replaces 12+ individual calls.
-
----
+**Most efficient tool for multi-topic research.** One command replaces 12+ individual calls.
 
 ## Follow (Page Reading)
 
@@ -188,58 +117,11 @@ Batch page reading. Each URL gets its own tab. Use for 3+ independent URLs.
 ]
 ```
 
----
-
-## Screenshot
-
-### `gthings screenshot "<url>" --output FILE`
-
-Capture a PNG screenshot.
-
-```
---output | Output file path (default: screenshot.png)
-```
-
-Returns: Writes PNG to file. Or with `--json`:
-
-### `gthings --json screenshot "<url>" --json`
-
-```json
-{"data": "<base64-encoded-png>", "format": "png", "size": 49859}
-```
-
-Use `--json` for vision-capable AI agents that consume base64 images.
-
----
-
-## Scrape
-
-### `gthings --json scrape "<url>" --selector S --attribute A`
-
-Extract specific elements by CSS selector.
-
-```
---selector  | CSS selector (default: "body")
---attribute | Attribute to extract (default: innerText)
-```
-
-```json
-["Example Domain", "Learn more"]
-```
-
-Returns array of strings. Each element is the innerText (or attribute) of matched nodes.
-
----
-
 ## PDF Extraction
 
 ### `gthings --json pdf url "<url>"`
 
 Extract text from a PDF at a URL.
-
-```
-Expected URL: A direct PDF file URL (should end in .pdf, or be an arXiv abs page)
-```
 
 ```json
 {"source": "https://arxiv.org/pdf/2405.10119", "text": "...", "length": 45230, "pages": 6}
@@ -260,35 +142,39 @@ Extract text from a local PDF file.
 
 PDF extraction is pure Rust — no external dependencies. Works offline.
 
----
+## Browser Lifecycle
 
-## Daemon Management (alternative to CLI)
+### `gthings browser start`
 
-```bash
-# Start
-gthings browser start --port 9222
+Start the persistent Chrome browser on port 9222. Auto-started on first use, but explicit start lets you verify.
 
-# Check
-gthings --json browser status
-
-# Raw CDP
-gthings --json browser call "Target.createTarget" '{"url":"about:blank"}'
-gthings --json browser eval "document.title"
-
-# Navigate
-gthings --json browser navigate "https://example.com"
-
-# Wait for event (debugging)
-gthings --json browser wait "Page.loadEventFired" "session-id" --timeout 10000
-
-# View logs
-gthings browser logs
-
-# Stop
-gthings browser stop
+```json
+{"status": "started", "pid": 12345, "ws_url": "ws://127.0.0.1:9222/..."}
 ```
 
----
+### `gthings browser stop`
+
+Stop the persistent browser. Kills the Chrome process and removes the state file.
+
+```json
+{"status": "stopped", "pid": 12345}
+```
+
+Returns `{"status": "not_running"}` if no browser state found.
+
+### `gthings browser status`
+
+Check if the persistent browser is running.
+
+```json
+{"status": "running", "pid": 12345, "ws_url": "ws://127.0.0.1:9222/..."}
+```
+
+or:
+
+```json
+{"status": "stopped"}
+```
 
 ## Telemetry (--trace)
 
@@ -304,14 +190,12 @@ Fields: `ts` (unix.nanos), `session` (per-process UUID), `tool`, `args`, `durati
 
 Multiple invocations append to the same file. No overhead when `--trace` is absent.
 
----
-
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Operational error (daemon down, bad URL, empty results, PDF parse failure) |
+| 1 | Operational error (bad URL, empty results, PDF parse failure, Chrome launch failure) |
 | 101+ | Panic (report as bug) |
 
 All errors produce messages on stderr with the failing URL/query included.

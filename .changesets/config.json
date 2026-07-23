@@ -1,5 +1,5 @@
 {
-  "changelog": ["changesets", {"repo": "chronyxf/gthings"}],
+  "changelog": false,
   "commit": false,
   "linked": [],
   "access": "public",

@@ -5,27 +5,9 @@
 | Code | Meaning | Common causes |
 |------|---------|---------------|
 | 0 | Success | — |
-| 1 | Operational error | Daemon not running, bad URL, empty results, PDF parse failure |
+| 1 | Operational error | Bad URL, empty results, PDF parse failure, Chrome launch failure |
 
 ## Error Messages
-
-### "daemon not connected"
-
-The daemon isn't running or the UDS socket is missing.
-
-```
-→ gthings browser start --port 9222
-→ gthings browser status    # verify
-```
-
-### "Cannot connect to daemon: Connection refused"
-
-The daemon socket exists but no process is listening (stale socket).
-
-```
-→ rm /tmp/gthings-daemon.sock
-→ gthings browser start --port 9222
-```
 
 ### "PDF URL '...' returned HTTP 404 Not Found"
 
@@ -52,37 +34,17 @@ The PDF is valid but extraction failed (unsupported features).
 
 ```
 → Common cause: PDF uses unsupported compression (LZW, ASCIIHexDecode, etc.)
-→ The old system's pdf-extract.ts had the same limitation
 → Use gthings --json follow url "<url>" for the abstract/HTML version
 ```
 
-## Daemon Issues
-
-### Daemon starts but reports "not connected"
-
-The browser on port 9222 isn't responding to CDP.
+### Browser not working
 
 ```
-→ Check if browser is running: ps aux | grep chrome
-→ Try a different port: gthings browser start --port 9223
-→ Kill and restart: gthings browser stop; gthings browser start
-```
-
-### Daemon crashes on startup
-
-```
-→ Check logs: gthings browser logs
+→ Check if browser is running: gthings browser status
+→ Start it: gthings browser start
+→ Stop and restart: gthings browser stop; gthings browser start
+→ Check port usage: lsof -i :9222
 → Common: no Chrome/Dia installed, or another process is using port 9222
-→ Run: lsof -i :9222 to check port usage
-```
-
-### "Screenshot saved to: ..." but no JSON with --json
-
-The `--json` flag causes screenshot to output base64 JSON instead of writing a file.
-
-```
-→ Use without --json to write file: gthings screenshot <url> --output file.png
-→ Use with --json to get base64: gthings --json screenshot <url> --json
 ```
 
 ## Search Issues
@@ -92,7 +54,7 @@ The `--json` flag causes screenshot to output base64 JSON instead of writing a f
 Google returned no results for the query.
 
 ```
-→ The daemon auto-retries with trailing-space query
+→ The command auto-retries with trailing-space query
 → Try different wording
 → Check if browser is connected to the internet
 → Google may be showing a sign-in wall (common with automated browsers)

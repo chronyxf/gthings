@@ -33,8 +33,6 @@ Content passes when `score >= 0.5`. Score starts at 1.0 and gets deductions:
 
 ### Fail Criteria (`is_ok: false`)
 
-Common failure reasons and what they mean:
-
 | `reasons` | Meaning | What to do |
 |-----------|---------|------------|
 | `["too_short"]` | Page had < 80 chars of text | Try `--selector "body" --max 30000` |
@@ -44,8 +42,6 @@ Common failure reasons and what they mean:
 | `["empty_content"]` | No text extracted | Page is JS-rendered, needs different approach |
 
 ### Bot/Captcha/Paywall Detection
-
-Separate detection functions available:
 
 | Function | Detects | Patterns |
 |----------|---------|----------|
@@ -83,16 +79,9 @@ Sections are extracted from h1/h2/h3 elements on the page:
 
 ### Empty Sections
 
-`sections: []` means no h1/h2/h3 were found. Common causes:
-- Page uses `<div>` with CSS classes instead of semantic headings
-- Page is a PDF rendered in Chrome's viewer
-- Page is a single-paragraph article without structure
-
-The `content` field still has the full extracted text. Sections are an enhancement, not a guarantee.
+`sections: []` means no h1/h2/h3 were found. The `content` field still has the full extracted text. Sections are an enhancement, not a guarantee.
 
 ### Secondary Quality Check
-
-After the primary quality gate, a secondary check runs on already-cleaned content:
 
 | Check | Detects | Threshold |
 |-------|---------|-----------|

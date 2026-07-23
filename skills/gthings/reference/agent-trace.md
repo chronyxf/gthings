@@ -23,7 +23,7 @@ One JSON object per line, newline-delimited (JSONL):
 |-------|------|-------------|
 | `ts` | string | Unix timestamp with nanosecond precision (`.276456000`) |
 | `session` | string | Per-process identifier (nanotimestamp hex). One per CLI invocation. |
-| `tool` | string | Command name: `search`, `search_harvest`, `search_batch`, `follow`, `follow_batch`, `screenshot`, `scrape`, `pdf_url`, `pdf_file`, `browser_status`, `browser_start`, `browser_stop`, `browser_call`, `browser_eval`, `browser_navigate`, `browser_logs`, `browser_wait` |
+| `tool` | string | Command name |
 | `args` | object | Key arguments (query, url, count, max, etc.) |
 | `duration_ms` | integer | Wall-clock execution time in milliseconds |
 | `exit` | integer | 0 = success, 1 = error |
@@ -37,7 +37,7 @@ gthings --trace /tmp/research.jsonl --json search harvest "topic1" "topic2" --co
 gthings --trace /tmp/research.jsonl --json follow url "https://..." --max 20000
 ```
 
-Multiple invocations append to the same file. All commands from a research session in one trace file.
+Multiple invocations append to the same file.
 
 ### Analyze trace data
 
@@ -84,26 +84,7 @@ for r in records:
 "
 ```
 
-## Real Trace Example (from 3-agent finance research)
-
-50 commands across 3 agents researching Fed rates, quantum finance, and ESG investing:
-
-```
-browser_status       exit=0      0ms  {}
-search_harvest       exit=0   7183ms  {"count":5,"max":3,"queries_count":3}
-follow               exit=0   3919ms  {"url":"https://www.reuters.com/..."}
-follow               exit=0   4983ms  {"url":"https://www.cnbc.com/..."}
-follow               exit=0   3947ms  {"url":"https://www.oecd.org/..."}
-...
-pdf_url              exit=1     98ms  {"url":"https://www.imf.org/...pdf"}
-pdf_url              exit=1    125ms  {"url":"https://www.imf.org/...pdf"}
-pdf_url              exit=0   1010ms  {"url":"https://www.federalreserve.gov/...pdf"}
-scrape               exit=0   1387ms  {"selector":"table","url":"https://www.imf.org/..."}
-```
-
-## Performance Baseline
-
-From the 50-command trace:
+## Performance Baseline (from 50-command finance research trace)
 
 | Metric | Value |
 |--------|-------|
