@@ -104,19 +104,19 @@ for f in "${files[@]}"; do
             if [ ${#feat_lines[@]} -gt 0 ]; then
                 echo "### Features"
                 echo ""
-                for line in "${feat_lines[@]}"; do echo "- $line"; done
+                for line in "${feat_lines[@]}"; do clean="${line#- }"; echo "- $clean"; done
                 echo ""
             fi
             if [ ${#fix_lines[@]} -gt 0 ]; then
                 echo "### Fixes"
                 echo ""
-                for line in "${fix_lines[@]}"; do echo "- $line"; done
+                for line in "${fix_lines[@]}"; do clean="${line#- }"; echo "- $clean"; done
                 echo ""
             fi
             if [ ${#change_lines[@]} -gt 0 ]; then
                 echo "### Changed"
                 echo ""
-                for line in "${change_lines[@]}"; do echo "- $line"; done
+                for line in "${change_lines[@]}"; do clean="${line#- }"; echo "- $clean"; done
                 echo ""
             fi
         } >> "$new_section"
