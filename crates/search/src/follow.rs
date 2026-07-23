@@ -1,69 +1,22 @@
 //! Page following and content extraction.
 //!
-//! Provides [`PageFollower`] which fetches a URL via the browser daemon
-//! (UDS → daemon → cdp-core → Chrome CDP), extracts content using CSS
-//! selectors, validates quality, and caches results locally.
-//!
-//! The daemon call replaces the previous Phase‑1 subprocess approach
-//! (`bun skills/cdp/scripts/browser-automation.ts`).
+//! Provides [`PageFollower`] which fetches a URL via Chrome DevTools Protocol (CDP),
+//! extracts content using CSS selectors, validates quality, and caches results locally.
 
 use std::time::Instant;
 
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use cdp::{Browser, Tab};
 
 use common::GthingsError;
 use common::cache::Sha256DiskCache;
 use common::config::GthingsConfig;
+use common::trace::TraceWriter;
 use extraction::html::HtmlExtractor;
 use extraction::quality::ContentQuality;
 
 use crate::types::{FollowOpts, FollowResult};
 
-/// Default daemon socket path.
-const DAEMON_SOCKET: &str = "/tmp/gthings-daemon.sock";
-static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Send a JSON-RPC-style request to the browser daemon over UDS.
-async fn send_request(method: &str, params: Option<Value>) -> Result<Value, GthingsError> {
-    let socket_path =
-        std::env::var("GTHINGS_DAEMON_SOCKET").unwrap_or_else(|_| DAEMON_SOCKET.to_string());
-    let stream = UnixStream::connect(&socket_path)
-        .await
-        .map_err(|e| GthingsError::Other(format!("Cannot connect to daemon: {}", e)))?;
-
-    let (reader, mut writer) = stream.into_split();
-    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    let request = serde_json::json!({"id": id, "method": method, "params": params});
-    let mut buf = serde_json::to_vec(&request).map_err(|e| GthingsError::Parse(e.to_string()))?;
-    buf.push(b'\n');
-    writer.write_all(&buf).await.map_err(GthingsError::Io)?;
-    writer.shutdown().await.map_err(GthingsError::Io)?;
-
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .map_err(GthingsError::Io)?;
-
-    let response: Value =
-        serde_json::from_str(&line).map_err(|e| GthingsError::Parse(e.to_string()))?;
-    if response["ok"].as_bool().unwrap_or(false) {
-        Ok(response["result"].clone())
-    } else {
-        Err(GthingsError::Other(
-            response["error"]
-                .as_str()
-                .unwrap_or("unknown daemon error")
-                .to_string(),
-        ))
-    }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────
+// Helpers
 
 /// Normalise arXiv PDF URLs to their abstract-page equivalents.
 ///
@@ -89,32 +42,22 @@ fn normalise_arxiv_url(url: &str) -> String {
     url
 }
 
-// ── PageFollower ──────────────────────────────────────────────────────────
+// PageFollower
 
 /// Page follower with caching and quality validation.
 ///
-/// Fetches web pages through the browser daemon over UDS, extracts structured
-/// content, checks quality, and persists results in a disk cache.
+/// Fetches web pages via an ephemeral Chrome CDP instance, extracts structured
+/// content using CSS selectors via [`HtmlExtractor`], checks quality, and
+/// persists results in a disk cache.
 pub struct PageFollower {
-    #[allow(dead_code)]
-    config: GthingsConfig,
     cache: Sha256DiskCache,
-    #[allow(dead_code)]
-    quality: ContentQuality,
-    #[allow(dead_code)]
-    html_extractor: HtmlExtractor,
 }
 
 impl PageFollower {
     /// Create a new [`PageFollower`].
     pub fn new(config: GthingsConfig) -> Self {
         let cache = Sha256DiskCache::new(&config.cache_dir, config.cache_ttl_secs);
-        Self {
-            config,
-            cache,
-            quality: ContentQuality,
-            html_extractor: HtmlExtractor,
-        }
+        Self { cache }
     }
 
     /// Follow a single URL and extract page content.
@@ -131,9 +74,9 @@ impl PageFollower {
     ///
     /// # Errors
     ///
-    /// Returns [`GthingsError::Other`] if the daemon cannot be reached,
-    /// or [`GthingsError::Parse`] if the response is malformed.
-    pub async fn follow(&self, url: &str, opts: FollowOpts) -> Result<FollowResult, GthingsError> {
+    /// Returns [`GthingsError::Cdp`] if Chrome cannot be launched or the
+    /// CDP call fails, or [`GthingsError::Parse`] if content extraction fails.
+    pub async fn follow(&self, url: &str, opts: FollowOpts, trace: Option<&mut TraceWriter>) -> Result<FollowResult, GthingsError> {
         let start = Instant::now();
 
         // 1. Normalise arXiv URLs
@@ -150,8 +93,8 @@ impl PageFollower {
             return Ok(result);
         }
 
-        // 3. Fetch via daemon (with retry on low quality)
-        let result = self.follow_inner(&normalised, &opts).await?;
+        // 3. Fetch page content (with retry on low quality)
+        let result = self.follow_inner(&normalised, &opts, trace).await?;
 
         // 4. Cache the result
         if result.content.is_some() {
@@ -177,36 +120,84 @@ impl PageFollower {
         &self,
         url: &str,
         opts: &FollowOpts,
+        mut trace: Option<&mut TraceWriter>,
     ) -> Result<FollowResult, GthingsError> {
-        // 3a. Fetch content from the daemon
-        let daemon_result = send_request(
-            "follow",
-            Some(serde_json::json!({
-                "url": url,
-                "selector": opts.selector,
-                "offset": opts.offset,
-                "max_length": opts.max_length,
-            })),
-        )
-        .await?;
+        // Step 1: Browser launch / reuse
+        let browser_start = Instant::now();
+        let browser = Browser::launch()
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
+        if let Some(ref mut t) = trace {
+            t.step("session", 1, "follow", "browser_reuse", None,
+                browser_start.elapsed().as_millis() as u64, None, None, None);
+        }
 
-        // 3b. Build FollowResult from daemon response
-        let content = daemon_result["content"].as_str().unwrap_or("").to_string();
-        let total_length = daemon_result["total_length"].as_u64().unwrap_or(0) as usize;
-        let truncated = daemon_result["truncated"].as_bool().unwrap_or(false);
+        let mut conn = browser
+            .connect()
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
 
-        // Parse sections from daemon response
-        let sections: Vec<extraction::html::Section> = daemon_result["sections"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| extraction::html::Section {
-                        heading: v["heading"].as_str().unwrap_or("").to_string(),
-                        content: v["content"].as_str().unwrap_or("").to_string(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Step 2: Create tab and navigate
+        let tab_start = Instant::now();
+        let tab = Tab::create(&mut conn, browser.ws_url(), "about:blank")
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
+        if let Some(ref mut t) = trace {
+            t.step("session", 2, "follow", "tab_create", None,
+                tab_start.elapsed().as_millis() as u64, None, None, None);
+        }
+
+        // Step 3: Navigate
+        let nav_start = Instant::now();
+        tab.navigate(&mut conn, url)
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
+        if let Some(ref mut t) = trace {
+            t.step("session", 3, "follow", "navigate", Some(url),
+                nav_start.elapsed().as_millis() as u64,
+                Some(serde_json::json!({"url": url})), None, None);
+        }
+
+        // Wait for JS rendering
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // 3c. Extract title
+        let _title = tab
+            .extract_title(&mut conn)
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Title: {e}")))?;
+
+        // 3d. Extract HTML and use HtmlExtractor for content + sections
+        let html = tab
+            .extract_html(&mut conn)
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Html: {e}")))?;
+
+        let selector = if opts.selector.is_empty() {
+            "body"
+        } else {
+            &opts.selector
+        };
+
+        let extracted =
+            HtmlExtractor::extract(&html, selector)
+                .map_err(|e| GthingsError::Parse(format!("Extraction failed: {e}")))?;
+
+        let full_text = extracted.content;
+        let total_length = extracted.total_length;
+        let sections = extracted.sections;
+
+        // 3e. Apply offset and max_length truncation
+        let (content, truncated) = if opts.offset > 0
+            || opts.max_length < full_text.len()
+        {
+            let start = opts.offset.min(full_text.len());
+            let end = (start + opts.max_length).min(full_text.len());
+            let is_truncated = end < total_length || opts.offset > 0;
+            (full_text[start..end].to_string(), is_truncated)
+        } else {
+            (full_text, false)
+        };
 
         let mut result = FollowResult {
             success: !content.is_empty(),
@@ -215,62 +206,72 @@ impl PageFollower {
             total_length,
             offset: opts.offset,
             truncated,
-            sections, // parsed from daemon response
+            sections,
             error: None,
             quality: None,
         };
 
-        // 3c. Quality gate
+        // 3f. Quality gate
         let quality = ContentQuality::validate(&content);
         result.quality = Some(quality.clone());
 
-        if !quality.is_ok && opts.retry_on_low_quality && ContentQuality::needs_recrawl(&quality) {
+        // Trace: extraction result
+        if let Some(ref mut t) = trace {
+            t.step("session", 4, "follow", "extract", Some(url),
+                0, // duration accounted per-step
+                None,
+                Some(serde_json::json!({
+                    "content_length": total_length,
+                    "truncated": truncated,
+                    "quality": {"is_ok": quality.is_ok, "score": quality.score}
+                })),
+                None);
+        }
+
+        // 3g. Retry on low quality with body selector fallback
+        if !quality.is_ok
+            && opts.retry_on_low_quality
+            && ContentQuality::needs_recrawl(&quality)
+        {
             tracing::debug!(
                 url = %url,
                 score = quality.score,
                 reasons = ?quality.reasons,
-                "follow: low quality, retrying with fallback selector"
+                "follow: low quality, retrying with body selector"
             );
-            let retry_opts = FollowOpts {
-                selector: "body".into(),
-                timeout_ms: opts.timeout_ms.max(30000),
-                ..opts.clone()
-            };
-            if let Ok(retry) = send_request(
-                "follow",
-                Some(serde_json::json!({
-                    "url": url,
-                    "selector": retry_opts.selector,
-                    "offset": retry_opts.offset,
-                    "max_length": retry_opts.max_length,
-                })),
-            )
-            .await
+
+            // Re-extract with body selector (tab still on the page)
+            let retry_html = tab
+                .extract_html(&mut conn)
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Html retry: {e}")))?;
+
+            if let Ok(retry_extracted) =
+                HtmlExtractor::extract(&retry_html, "body")
             {
-                let retry_content = retry["content"].as_str().unwrap_or("").to_string();
-                let retry_total_length = retry["total_length"].as_u64().unwrap_or(0) as usize;
-                let retry_truncated = retry["truncated"].as_bool().unwrap_or(false);
+                let retry_full_text = retry_extracted.content;
+                let retry_total_length = retry_extracted.total_length;
+                let retry_sections = retry_extracted.sections;
+
+                let (retry_content, retry_truncated) = if opts.offset > 0
+                    || opts.max_length < retry_full_text.len()
+                {
+                    let start = opts.offset.min(retry_full_text.len());
+                    let end = (start + opts.max_length).min(retry_full_text.len());
+                    (retry_full_text[start..end].to_string(), true)
+                } else {
+                    (retry_full_text, false)
+                };
+
                 let retry_quality = ContentQuality::validate(&retry_content);
                 if retry_quality.is_ok {
-                    // Parse sections from retry response
-                    let retry_sections: Vec<extraction::html::Section> = retry["sections"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|v| extraction::html::Section {
-                                    heading: v["heading"].as_str().unwrap_or("").to_string(),
-                                    content: v["content"].as_str().unwrap_or("").to_string(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
+                    let _ = tab.close(&mut conn).await;
                     return Ok(FollowResult {
                         success: true,
                         url: url.to_string(),
                         content: Some(retry_content),
                         total_length: retry_total_length,
-                        offset: retry_opts.offset,
+                        offset: opts.offset,
                         truncated: retry_truncated,
                         sections: retry_sections,
                         error: None,
@@ -280,12 +281,20 @@ impl PageFollower {
             }
         }
 
+        // Close the tab
+        let close_start = Instant::now();
+        let _ = tab.close(&mut conn).await;
+        if let Some(ref mut t) = trace {
+            t.step("session", 5, "follow", "tab_close", None,
+                close_start.elapsed().as_millis() as u64, None, None, None);
+        }
+
         Ok(result)
     }
 
     /// Batch follow multiple URLs sequentially.
     ///
-    /// Each URL goes through the same cache/daemon/quality pipeline as
+    /// Each URL goes through the same cache/CDP/quality pipeline as
     /// [`follow`](PageFollower::follow).
     ///
     /// # Errors
@@ -295,6 +304,7 @@ impl PageFollower {
         &self,
         urls: &[String],
         opts: FollowOpts,
+        mut trace: Option<&mut TraceWriter>,
     ) -> Result<Vec<FollowResult>, GthingsError> {
         if urls.is_empty() {
             return Ok(Vec::new());
@@ -304,7 +314,7 @@ impl PageFollower {
         let mut results = Vec::with_capacity(urls.len());
 
         for url in urls {
-            let result = self.follow(url, opts.clone()).await?;
+            let result = self.follow(url, opts.clone(), trace.as_deref_mut()).await?;
             results.push(result);
         }
 
@@ -318,7 +328,7 @@ impl PageFollower {
         Ok(results)
     }
 
-    // ── Private helpers ──────────────────────────────────────────────────
+    // Private helpers
 
     /// Check the disk cache for a previously stored result.
     fn check_cache(&self, key: &str) -> Option<String> {

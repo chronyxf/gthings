@@ -1,76 +1,34 @@
 //! Batch operations — search, follow, and the two-phase harvest pipeline.
 //!
 //! Provides [`BatchProcessor`] which orchestrates multi-query searches,
-//! multi-URL page following, and a two-phase harvest pipeline that first
-//! searches all queries (dedup + rank) and then follows the top M results.
+//! multi-URL page following, and a two-phase harvest pipeline.
 //!
-//! All heavy lifting is offloaded to the gthings daemon via UDS JSON-RPC.
+//! Each operation launches a single Chrome instance and reuses it across
+//! all queries/URLs in the batch.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cmp::Reverse;
+use std::time::Instant;
+
+use cdp::{Browser, Tab};
 
 use common::GthingsError;
 use common::config::GthingsConfig;
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use common::trace::TraceWriter;
+use extraction::quality::ContentQuality;
 
 use crate::types::{
     BatchSearchResult, FollowOpts, FollowResult, HarvestMeta, HarvestResult, SearchMeta,
     SearchResult,
 };
 
-/// Monotonic request ID for JSON-RPC calls to the daemon.
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Send a JSON-RPC-style request to the browser daemon over UDS.
-/// Returns the raw response Value (not just the result field).
-/// Used by the batch RPC methods.
-async fn send_request_value(method: &str, params: Option<Value>) -> Result<Value, GthingsError> {
-    let socket_path = std::env::var("GTHINGS_DAEMON_SOCKET")
-        .unwrap_or_else(|_| "/tmp/gthings-daemon.sock".to_string());
-    let stream = UnixStream::connect(&socket_path)
-        .await
-        .map_err(|e| GthingsError::Other(format!("Cannot connect to daemon: {}", e)))?;
-
-    let (reader, mut writer) = stream.into_split();
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-
-    let request = serde_json::json!({"id": id, "method": method, "params": params});
-    let mut buf = serde_json::to_vec(&request).map_err(|e| GthingsError::Parse(e.to_string()))?;
-    buf.push(b'\n');
-    writer.write_all(&buf).await.map_err(GthingsError::Io)?;
-    writer.shutdown().await.map_err(GthingsError::Io)?;
-
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .map_err(GthingsError::Io)?;
-
-    let response: Value =
-        serde_json::from_str(&line).map_err(|e| GthingsError::Parse(e.to_string()))?;
-
-    if response["ok"].as_bool().unwrap_or(false) {
-        Ok(response["result"].clone())
-    } else {
-        Err(GthingsError::Other(
-            response["error"]
-                .as_str()
-                .unwrap_or("unknown daemon error")
-                .to_string(),
-        ))
-    }
-}
-
 /// Batch processor for multi-step search pipelines.
 ///
-/// Sends all work to the gthings daemon over UDS, which manages
-/// parallel browser tabs server-side.
+/// Each operation launches a single Chrome instance and reuses it across
+/// all queries/URLs in the batch.
 ///
-/// - **`search`** — multi-query search via daemon `search.batch`.
-/// - **`follow`** — multi-URL page extraction via daemon `follow.batch`.
-/// - **`harvest`** — two-phase pipeline (search + follow) in one daemon call.
+/// - **`search`** — multi-query search with dedup and ranking.
+/// - **`follow`** — multi-URL page extraction with caching.
+/// - **`harvest`** — two-phase pipeline (search then follow).
 pub struct BatchProcessor {
     config: GthingsConfig,
 }
@@ -81,189 +39,425 @@ impl BatchProcessor {
         Self { config }
     }
 
-    /// Batch search: run multiple queries, deduplicate by URL, rank by
-    /// snippet length descending.
-    ///
-    /// Delegates to the daemon's `search.batch` RPC.
+    /// Batch search: run multiple queries using one shared Chrome instance,
+    /// deduplicate by URL, rank by snippet length descending.
     ///
     /// # Errors
     ///
-    /// Returns [`GthingsError`] if the daemon call fails.
+    /// Returns [`GthingsError::Cdp`] if Chrome cannot be launched.
     pub async fn search(
         &self,
         queries: &[String],
         count: usize,
+        mut trace: Option<&mut TraceWriter>,
     ) -> Result<BatchSearchResult, GthingsError> {
-        let params = serde_json::json!({
-            "queries": queries,
-            "count": count,
-            "concurrency": self.config.search_concurrency,
-            "deny_hosts": self.config.deny_hosts,
-        });
+        if queries.is_empty() {
+            return Ok(BatchSearchResult {
+                results: Vec::new(),
+                meta: SearchMeta {
+                    total: 0,
+                    query: String::new(),
+                    duration_ms: 0,
+                },
+            });
+        }
 
-        let result = send_request_value("search.batch", Some(params)).await?;
+        let start = Instant::now();
 
-        let results: Vec<SearchResult> = result["results"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| SearchResult {
-                        title: v["title"].as_str().unwrap_or("").to_string(),
-                        url: v["url"].as_str().unwrap_or("").to_string(),
-                        snippet: v["snippet"].as_str().unwrap_or("").to_string(),
-                        query: v["query"].as_str().map(|s| s.to_string()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let browser = Browser::launch()
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
+        let mut conn = browser
+            .connect()
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
 
-        let total = results.len();
+        if let Some(ref mut t) = trace {
+            t.step("session", 0, "batch_search", "launch", None,
+                start.elapsed().as_millis() as u64, None, None, None);
+        }
+
+        let mut all_results: Vec<SearchResult> = Vec::new();
+
+        for q in queries {
+            let tab = Tab::create(&mut conn, browser.ws_url(), "about:blank")
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
+
+            let encoded = urlencoding::encode(q);
+            let url = format!(
+                "https://www.google.com/search?q={}&num={}",
+                encoded, count
+            );
+
+            tab.navigate(&mut conn, &url)
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Extract via JS (same script as search.rs)
+            let js = format!(
+                r#"
+(() => {{
+    const results = [];
+    const selectors = [
+        'div.g', 'div[data-hveid]', 'div.yuRUbf',
+    ];
+    const seen = new Set();
+    for (const sel of selectors) {{
+        const items = document.querySelectorAll(sel);
+        for (const item of items) {{
+            const titleEl = item.querySelector('h3');
+            const linkEl = item.querySelector('a[href^="http"]');
+            const snippetEl = item.querySelector('.VwiC3b, .st, [data-sncf], .lEBKkf span');
+            if (titleEl && linkEl) {{
+                const url = linkEl.href || '';
+                if (seen.has(url)) continue;
+                seen.add(url);
+                results.push({{
+                    title: (titleEl.innerText || titleEl.textContent || '').trim(),
+                    url: url,
+                    snippet: (snippetEl?.innerText || snippetEl?.textContent || '').trim(),
+                }});
+            }}
+        }}
+    }}
+    return JSON.stringify(results.slice(0, {}));
+}})()
+"#,
+                count
+            );
+
+            let result = tab
+                .evaluate(&mut conn, &js)
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Eval: {e}")))?;
+
+            let json_str = result["result"]["value"].as_str().unwrap_or("[]");
+            let items: Vec<serde_json::Value> =
+                serde_json::from_str(json_str).unwrap_or_default();
+
+            for item in items {
+                all_results.push(SearchResult {
+                    title: item["title"].as_str().unwrap_or("").to_string(),
+                    url: item["url"].as_str().unwrap_or("").to_string(),
+                    snippet: item["snippet"].as_str().unwrap_or("").to_string(),
+                    query: Some(q.to_string()),
+                });
+            }
+
+            // Close the tab
+            let _ = tab.close(&mut conn).await;
+        }
+
+        // Dedup by URL
+        let mut seen = std::collections::HashSet::new();
+        all_results.retain(|r| seen.insert(r.url.clone()));
+
+        // Sort by snippet length descending
+        all_results.sort_by_key(|k| Reverse(k.snippet.len()));
+
+        let elapsed = start.elapsed().as_millis() as u64;
+        let total = all_results.len();
 
         Ok(BatchSearchResult {
-            results,
+            results: all_results,
             meta: SearchMeta {
                 total,
                 query: format!("{} queries", queries.len()),
-                duration_ms: result["duration_ms"].as_u64().unwrap_or(0),
+                duration_ms: elapsed,
             },
         })
     }
 
-    /// Batch follow: follow multiple URLs in parallel browser tabs.
-    ///
-    /// Delegates to the daemon's `follow.batch` RPC.
+    /// Batch follow: follow multiple URLs using one shared Chrome instance.
     ///
     /// # Errors
     ///
-    /// Returns [`GthingsError`] if the daemon call fails.
+    /// Returns [`GthingsError::Cdp`] if Chrome cannot be launched.
     pub async fn follow(
         &self,
         urls: &[String],
         opts: FollowOpts,
+        mut trace: Option<&mut TraceWriter>,
     ) -> Result<Vec<FollowResult>, GthingsError> {
-        let params = serde_json::json!({
-            "urls": urls,
-            "selector": opts.selector,
-            "max_chars": opts.max_length,
-            "concurrency": opts.concurrency,
-        });
+        if urls.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let result = send_request_value("follow.batch", Some(params)).await?;
+        let browser = Browser::launch()
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
+        let mut conn = browser
+            .connect()
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
 
-        let pages: Vec<FollowResult> = result["pages"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| FollowResult {
-                        success: v["success"].as_bool().unwrap_or(false),
-                        url: v["url"].as_str().unwrap_or("").to_string(),
-                        content: v["content"].as_str().map(|s| s.to_string()),
-                        total_length: v["total_length"].as_u64().unwrap_or(0) as usize,
-                        offset: v["offset"].as_u64().unwrap_or(0) as usize,
-                        truncated: v["truncated"].as_bool().unwrap_or(false),
-                        sections: v["sections"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|s| extraction::html::Section {
-                                        heading: s["heading"].as_str().unwrap_or("").to_string(),
-                                        content: s["content"].as_str().unwrap_or("").to_string(),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        error: v["error"].as_str().map(|s| s.to_string()),
+        if let Some(ref mut t) = trace {
+            t.step("session", 0, "batch_follow", "launch", None,
+                0, None, None, None);
+        }
+
+        let mut pages: Vec<FollowResult> = Vec::with_capacity(urls.len());
+
+        for url in urls {
+            let tab = Tab::create(&mut conn, browser.ws_url(), "about:blank")
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
+
+            tab.navigate(&mut conn, url)
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
+
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            let html = tab
+                .extract_html(&mut conn)
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Html: {e}")))?;
+
+            let selector = if opts.selector.is_empty() {
+                "body"
+            } else {
+                &opts.selector
+            };
+
+            let extracted = match extraction::html::HtmlExtractor::extract(&html, selector) {
+                Ok(ex) => ex,
+                Err(e) => {
+                    let _ = tab.close(&mut conn).await;
+                    pages.push(FollowResult {
+                        success: false,
+                        url: url.clone(),
+                        content: None,
+                        total_length: 0,
+                        offset: opts.offset,
+                        truncated: false,
+                        sections: Vec::new(),
+                        error: Some(format!("Extract: {e}")),
                         quality: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+                    });
+                    continue;
+                }
+            };
+
+            let (content, truncated) = if opts.offset > 0
+                || opts.max_length < extracted.content.len()
+            {
+                let start = opts.offset.min(extracted.content.len());
+                let end = (start + opts.max_length).min(extracted.content.len());
+                (extracted.content[start..end].to_string(), true)
+            } else {
+                (extracted.content, false)
+            };
+
+            let result = FollowResult {
+                success: !content.is_empty(),
+                url: url.clone(),
+                content: Some(content),
+                total_length: extracted.total_length,
+                offset: opts.offset,
+                truncated,
+                sections: extracted.sections,
+                error: None,
+                quality: Some(ContentQuality::validate("")), // placeholder, caller re-checks
+            };
+
+            let _ = tab.close(&mut conn).await;
+            pages.push(result);
+        }
 
         Ok(pages)
     }
 
-    /// Two-phase harvest pipeline — ONE daemon RPC.
+    /// Two-phase harvest pipeline using a single shared Chrome instance.
     ///
-    /// Sends all queries + config in a single UDS request. The daemon
-    /// handles Phase 1 (parallel search) and Phase 2 (parallel follow)
-    /// using its SessionPool.
+    /// Phase 1: search all queries. Phase 2: follow the top `max_pages`
+    /// unique URLs from the aggregated search results.
     pub async fn harvest(
         &self,
         queries: &[String],
         count: usize,
         max_pages: usize,
+        mut trace: Option<&mut TraceWriter>,
     ) -> Result<HarvestResult, GthingsError> {
-        let params = serde_json::json!({
-            "queries": queries,
-            "count": count,
-            "follow_top_k": max_pages,
-            "search_concurrency": self.config.search_concurrency,
-            "follow_concurrency": self.config.follow_concurrency,
-            "max_chars": self.config.max_chars,
-            "deny_hosts": self.config.deny_hosts,
-        });
+        let pipeline_start = Instant::now();
 
-        let result = send_request_value("harvest", Some(params)).await?;
+        // Phase 1: Search all queries
+        let browser = Browser::launch()
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
+        let mut conn = browser
+            .connect()
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
 
-        // Parse search_results from daemon response
-        let search_results: Vec<SearchResult> = result["search_results"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| SearchResult {
-                        title: v["title"].as_str().unwrap_or("").to_string(),
-                        url: v["url"].as_str().unwrap_or("").to_string(),
-                        snippet: v["snippet"].as_str().unwrap_or("").to_string(),
-                        query: v["query"].as_str().map(|s| s.to_string()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        if let Some(ref mut t) = trace {
+            t.step("session", 0, "harvest", "launch", None,
+                pipeline_start.elapsed().as_millis() as u64, None, None, None);
+        }
 
-        // Parse read_pages from daemon response
-        let read_pages: Vec<FollowResult> = result["read_pages"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| FollowResult {
-                        success: v["success"].as_bool().unwrap_or(false),
-                        url: v["url"].as_str().unwrap_or("").to_string(),
-                        content: v["content"].as_str().map(|s| s.to_string()),
-                        total_length: v["total_length"].as_u64().unwrap_or(0) as usize,
-                        offset: v["offset"].as_u64().unwrap_or(0) as usize,
-                        truncated: v["truncated"].as_bool().unwrap_or(false),
-                        sections: v["sections"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|s| extraction::html::Section {
-                                        heading: s["heading"].as_str().unwrap_or("").to_string(),
-                                        content: s["content"].as_str().unwrap_or("").to_string(),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        error: v["error"].as_str().map(|s| s.to_string()),
+        let mut all_search_results: Vec<SearchResult> = Vec::new();
+
+        for q in queries {
+            let tab = Tab::create(&mut conn, browser.ws_url(), "about:blank")
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
+
+            let encoded = urlencoding::encode(q);
+            let url = format!(
+                "https://www.google.com/search?q={}&num={}",
+                encoded, count
+            );
+
+            tab.navigate(&mut conn, &url)
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            let js = format!(
+                r#"
+(() => {{
+    const results = [];
+    const selectors = ['div.g', 'div[data-hveid]', 'div.yuRUbf'];
+    const seen = new Set();
+    for (const sel of selectors) {{
+        const items = document.querySelectorAll(sel);
+        for (const item of items) {{
+            const titleEl = item.querySelector('h3');
+            const linkEl = item.querySelector('a[href^="http"]');
+            const snippetEl = item.querySelector('.VwiC3b, .st, [data-sncf], .lEBKkf span');
+            if (titleEl && linkEl) {{
+                const url = linkEl.href || '';
+                if (seen.has(url)) continue;
+                seen.add(url);
+                results.push({{ title: (titleEl.innerText || '').trim(), url, snippet: (snippetEl?.innerText || '').trim() }});
+            }}
+        }}
+    }}
+    return JSON.stringify(results.slice(0, {}));
+}})()
+"#,
+                count
+            );
+
+            if let Ok(result) = tab.evaluate(&mut conn, &js).await {
+                let json_str = result["result"]["value"].as_str().unwrap_or("[]");
+                let items: Vec<serde_json::Value> =
+                    serde_json::from_str(json_str).unwrap_or_default();
+                for item in items {
+                    all_search_results.push(SearchResult {
+                        title: item["title"].as_str().unwrap_or("").to_string(),
+                        url: item["url"].as_str().unwrap_or("").to_string(),
+                        snippet: item["snippet"].as_str().unwrap_or("").to_string(),
+                        query: Some(q.to_string()),
+                    });
+                }
+            }
+
+            // Close the tab
+            let _ = tab.close(&mut conn).await;
+        }
+
+        // Dedup and rank search results
+        let mut seen = std::collections::HashSet::new();
+        all_search_results.retain(|r| seen.insert(r.url.clone()));
+        all_search_results.sort_by_key(|k| Reverse(k.snippet.len()));
+
+        let unique_urls = all_search_results.len();
+
+        // Phase 2: Follow top K URLs
+        let top_urls: Vec<&SearchResult> = all_search_results.iter().take(max_pages).collect();
+        let mut read_pages: Vec<FollowResult> = Vec::with_capacity(top_urls.len());
+        let mut pages_skipped = 0usize;
+
+        for sr in &top_urls {
+            let tab = match Tab::create(&mut conn, browser.ws_url(), "about:blank").await {
+                Ok(t) => t,
+                Err(_) => {
+                    pages_skipped += 1;
+                    continue;
+                }
+            };
+
+            if tab.navigate(&mut conn, &sr.url).await.is_err() {
+                let _ = tab.close(&mut conn).await;
+                pages_skipped += 1;
+                continue;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            let html = match tab.extract_html(&mut conn).await {
+                Ok(h) => h,
+                Err(_) => {
+                    let _ = tab.close(&mut conn).await;
+                    pages_skipped += 1;
+                    continue;
+                }
+            };
+
+            let selector = &self.config.deny_hosts.first().map(|_| "body").unwrap_or("article,main,[role=main]");
+            let fallback_selector = if selector.is_empty() { "body" } else { selector };
+
+            match extraction::html::HtmlExtractor::extract(&html, fallback_selector) {
+                Ok(extracted) => {
+                    let (content, truncated) = if self.config.max_chars < extracted.content.len() {
+                        let end = self.config.max_chars.min(extracted.content.len());
+                        (extracted.content[..end].to_string(), true)
+                    } else {
+                        (extracted.content, false)
+                    };
+
+                    let quality = ContentQuality::validate(&content);
+                    let _ = tab.close(&mut conn).await;
+                    read_pages.push(FollowResult {
+                        success: true,
+                        url: sr.url.clone(),
+                        content: Some(content),
+                        total_length: extracted.total_length,
+                        offset: 0,
+                        truncated,
+                        sections: extracted.sections,
+                        error: None,
+                        quality: Some(quality),
+                    });
+                }
+                Err(e) => {
+                    let _ = tab.close(&mut conn).await;
+                    pages_skipped += 1;
+                    read_pages.push(FollowResult {
+                        success: false,
+                        url: sr.url.clone(),
+                        content: None,
+                        total_length: 0,
+                        offset: 0,
+                        truncated: false,
+                        sections: Vec::new(),
+                        error: Some(format!("Extract: {e}")),
                         quality: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+                    });
+                }
+            }
+        }
 
-        let meta = HarvestMeta {
-            queries: queries.to_vec(),
-            total_search_results: result["meta"]["total_search_results"].as_u64().unwrap_or(0)
-                as usize,
-            unique_urls: result["meta"]["unique_urls"].as_u64().unwrap_or(0) as usize,
-            pages_followed: result["meta"]["pages_followed"].as_u64().unwrap_or(0) as usize,
-            pages_skipped: result["meta"]["pages_skipped"].as_u64().unwrap_or(0) as usize,
-            duration_ms: result["meta"]["duration_ms"].as_u64().unwrap_or(0),
-        };
+        let pages_followed = read_pages.iter().filter(|p| p.success).count();
+        let total_search_results = all_search_results.len();
+        let elapsed = pipeline_start.elapsed().as_millis() as u64;
 
         Ok(HarvestResult {
-            search_results,
+            search_results: all_search_results,
             read_pages,
-            meta,
+            meta: HarvestMeta {
+                queries: queries.to_vec(),
+                total_search_results,
+                unique_urls,
+                pages_followed,
+                pages_skipped,
+                duration_ms: elapsed,
+            },
         })
     }
 }
