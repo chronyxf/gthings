@@ -13,11 +13,17 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+> **Note:** The pre-commit hook at `.git/hooks/pre-commit` enforces this workflow
+> automatically. It rejects commits with code changes that lack a changeset,
+> and runs `cargo fmt`, `clippy`, `build`, and `test` before every commit.
+> Set `SKIP_CHECKS=1` to bypass.
+
 ## Commit Flow (versioning = committing)
 
 For every code change:
 
-1. Create `.changesets/<name>.md` with the bump for each affected crate
+1. Run `bash scripts/create-changeset.sh` (interactive — scaffolds the file)
+   OR manually create `.changesets/<name>.md` with the bump for each crate
 2. Run `bash scripts/consume-changesets.sh` (updates CHANGELOG.md, deletes changeset)
 3. `git add -A`
 4. `git commit -m "type(scope): short message"`
@@ -26,7 +32,7 @@ For every code change:
 
 ```markdown
 ---
-"crate-name": patch|minor|major - {{date}}
+"crate-name": patch|minor|major
 ---
 
 - Short description of change
@@ -59,9 +65,9 @@ crates can be bumped at different levels in a single changeset:
 
 | Bump    | When                                     | Example Version |
 | ------- | ---------------------------------------- | --------------- |
-| `patch` | Bug fixes, refactoring, internal cleanup | 0.0.0 → 0.0.1  (YYYY-MM-DD) |
-| `minor` | New features, public API additions       | 0.0.1 → 0.1.0  (YYYY-MM-DD) |
-| `major` | Breaking changes                         | 0.1.0 → 1.0.0  (YYYY-MM-DD) |
+| `patch` | Bug fixes, refactoring, internal cleanup | 0.0.0 → 0.0.1 |
+| `minor` | New features, public API additions       | 0.0.1 → 0.1.0 |
+| `major` | Breaking changes                         | 0.1.0 → 1.0.0 |
 
 ## Version Strategy
 
@@ -72,3 +78,7 @@ The `consume-changesets.sh` script groups entries by the highest bump
 across all crates in a changeset and generates the CHANGELOG section
 accordingly. No crate version numbers are written to files — the changeset
 metadata serves as the source of truth for release tooling.
+
+> **Note:** `cargo fmt` (rustfmt) only formats `.rs` files. It will never
+> touch CHANGELOG.md — the file is naturally excluded. If you use external
+> markdown formatters (Prettier, etc.), add `CHANGELOG.md` to their ignore list.

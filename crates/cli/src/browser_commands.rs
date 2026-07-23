@@ -1,6 +1,8 @@
 use anyhow::Result;
 use common::config::GthingsConfig;
 use std::io::Write;
+use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -66,20 +68,46 @@ pub async fn handle_browser_start(config: &GthingsConfig, port: Option<u16>) -> 
     let actual_port = port.unwrap_or(config.cdp_port);
 
     // Spawn: browser-daemon start --port {port}
+    // Use Stdio::null() to detach from terminal, and process_group(0) for
+    // process-group isolation so terminal-originated signals don't reach it.
     let child = tokio::process::Command::new(&daemon_binary)
         .arg("start")
         .arg("--port")
         .arg(actual_port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to start daemon: {}", e))?;
 
-    // Wait briefly for it to be ready
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let pid = child.id().unwrap_or(0);
+
+    // Determine socket path
+    let socket_path = std::env::var("GTHINGS_DAEMON_SOCKET")
+        .unwrap_or_else(|_| DAEMON_SOCKET_PATH.to_string());
+
+    // Poll for socket readiness (up to 10 seconds)
+    let max_wait = Duration::from_secs(10);
+    let poll_interval = Duration::from_millis(100);
+    let start = std::time::Instant::now();
+
+    loop {
+        if std::path::Path::new(&socket_path).exists() {
+            break;
+        }
+        if start.elapsed() >= max_wait {
+            anyhow::bail!(
+                "Daemon started (PID {}) but failed to become ready within 10s",
+                pid
+            );
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
 
     println!(
         "{{\"ok\":true,\"port\":{},\"pid\":{}}}",
-        actual_port,
-        child.id().unwrap_or(0)
+        actual_port, pid
     );
     Ok(())
 }

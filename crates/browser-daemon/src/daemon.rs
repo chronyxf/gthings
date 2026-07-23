@@ -580,12 +580,7 @@ impl CdpDaemon {
 
         // If we created the tab, close it
         if let Some(target_id) = created_target_id {
-            let _ = conn
-                .call(
-                    "Target.closeTarget",
-                    Some(serde_json::json!({"targetId": target_id})),
-                )
-                .await;
+            close_tab(&conn, &session_id, &target_id).await;
         }
 
         match result {
@@ -928,6 +923,27 @@ impl CdpDaemon {
             }
         };
 
+        // Dia quirk: try window.close() first (need to attach to get session)
+        if let Ok(attach) = conn
+            .call(
+                "Target.attachToTarget",
+                Some(serde_json::json!({"targetId": target_id, "flatten": true})),
+            )
+            .await
+        {
+            if let Some(sid) = attach["sessionId"].as_str() {
+                let _ = conn
+                    .call_with_session(
+                        sid,
+                        "Runtime.evaluate",
+                        Some(serde_json::json!({"expression": "window.close()"})),
+                    )
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        // Then close via CDP regardless
         match conn
             .call(
                 "Target.closeTarget",
@@ -1524,6 +1540,9 @@ impl CdpDaemon {
 
         let elapsed = start.elapsed().as_millis() as u64;
 
+        // Close idle pool sessions after batch completes
+        pool.drain().await;
+
         success_response(
             id,
             serde_json::json!({
@@ -1579,6 +1598,9 @@ impl CdpDaemon {
             .collect();
 
         let elapsed = start.elapsed().as_millis() as u64;
+
+        // Close idle pool sessions after batch completes
+        pool.drain().await;
 
         success_response(
             id,
@@ -1702,6 +1724,9 @@ impl CdpDaemon {
             .filter(|p| p["success"].as_bool().unwrap_or(false) == false)
             .count();
         let elapsed = start.elapsed().as_millis() as u64;
+
+        // Close idle pool sessions after batch completes
+        pool.drain().await;
 
         success_response(
             id,

@@ -125,8 +125,42 @@ if [ ${#minor_entries[@]} -eq 0 ] && [ ${#patch_entries[@]} -eq 0 ] && [ ${#majo
     done
 fi
 
-# Generate version and date
-VERSION="0.1.0"
+# Determine the overall highest bump across all changesets
+overall_bump="patch"
+if [ ${#major_entries[@]} -gt 0 ]; then
+    overall_bump="major"
+elif [ ${#minor_entries[@]} -gt 0 ]; then
+    overall_bump="minor"
+fi
+
+# Extract last version from CHANGELOG.md
+LAST_VERSION="0.0.0"
+if [ -f "$CHANGELOG" ]; then
+    LAST_VERSION=$(grep -m 1 '^## \[*[0-9]' "$CHANGELOG" | sed 's/^## \[*\([0-9]*\.[0-9]*\.[0-9]*\)\]*.*/\1/' || echo "0.0.0")
+fi
+
+# Parse semver
+MAJOR=$(echo "$LAST_VERSION" | cut -d. -f1)
+MINOR=$(echo "$LAST_VERSION" | cut -d. -f2)
+PATCH=$(echo "$LAST_VERSION" | cut -d. -f3)
+
+# Bump according to overall highest bump
+case "$overall_bump" in
+    major)
+        MAJOR=$((MAJOR + 1))
+        MINOR=0
+        PATCH=0
+        ;;
+    minor)
+        MINOR=$((MINOR + 1))
+        PATCH=0
+        ;;
+    patch)
+        PATCH=$((PATCH + 1))
+        ;;
+esac
+
+VERSION="${MAJOR}.${MINOR}.${PATCH}"
 DATE=$(date +%Y-%m-%d)
 
 # Build the new changelog section

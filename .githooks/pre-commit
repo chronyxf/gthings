@@ -1,0 +1,82 @@
+#!/bin/bash
+# Pre-commit hook enforcing VERSION.md workflow
+set -euo pipefail
+
+# Allow bypass
+if [ "${SKIP_CHECKS:-0}" = "1" ]; then
+    echo "[SKIP] SKIP_CHECKS=1 — skipping pre-commit checks"
+    exit 0
+fi
+
+CHANGESETS_DIR=".changesets"
+
+# Detect changes that require a changeset
+STAGED_FILES=$(git diff --cached --name-only)
+
+# Files that trigger changeset requirement
+CODE_PATTERNS=('\.rs$' 'Cargo\.toml' 'Cargo\.lock' '^crates/' '^protocol/')
+needs_changeset=0
+for file in $STAGED_FILES; do
+    for pattern in "${CODE_PATTERNS[@]}"; do
+        if [[ "$file" =~ $pattern ]]; then
+            needs_changeset=1
+            break
+        fi
+    done
+    if [ "$needs_changeset" = "1" ]; then
+        break
+    fi
+done
+
+# Check for changesets
+if [ "$needs_changeset" = "1" ]; then
+    has_changeset=0
+    if ls "$CHANGESETS_DIR"/*.md >/dev/null 2>&1; then
+        has_changeset=1
+    fi
+
+    if [ "$has_changeset" = "0" ]; then
+        echo ""
+        echo "[FAIL] Commit contains code changes but no changeset found in .changesets/"
+        echo ""
+        echo "Follow the VERSION.md workflow:"
+        echo ""
+        echo "  1. Create a changeset:"
+        echo "     bash scripts/create-changeset.sh"
+        echo "     OR manually create .changesets/<name>.md"
+        echo ""
+        echo "  2. Run consume script:"
+        echo "     bash scripts/consume-changesets.sh"
+        echo ""
+        echo "  3. Stage and commit:"
+        echo "     git add -A"
+        echo "     git commit ..."
+        echo ""
+        echo "  To bypass: SKIP_CHECKS=1 git commit ..."
+        echo ""
+        exit 1
+    fi
+fi
+
+# Run pre-commit checks (only if code files changed)
+if [ "$needs_changeset" = "1" ]; then
+    echo "[CHECK] Running pre-commit checks..."
+    echo ""
+
+    echo "  cargo fmt --check"
+    cargo fmt --all -- --check 2>/dev/null || { echo "[FAIL] Formatting check failed. Run: cargo fmt --all"; exit 1; }
+
+    echo "  cargo clippy"
+    cargo clippy --workspace --all-targets --all-features -- -D warnings 2>/dev/null || { echo "[FAIL] Clippy failed"; exit 1; }
+
+    echo "  cargo build"
+    cargo build --workspace 2>/dev/null || { echo "[FAIL] Build failed"; exit 1; }
+
+    echo "  cargo test"
+    cargo test --workspace 2>/dev/null || { echo "[FAIL] Tests failed"; exit 1; }
+
+    echo ""
+    echo "[PASS] All pre-commit checks passed"
+fi
+
+exit 0

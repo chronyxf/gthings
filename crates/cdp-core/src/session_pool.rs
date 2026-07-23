@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ pub struct SessionPool {
     idle: Mutex<VecDeque<Session>>,
     /// Maps target_id → session_id for sessions currently checked out.
     live: Mutex<HashMap<String, String>>,
+    pending_checkins: AtomicUsize,
 }
 
 /// A checked-out session that automatically returns to the pool when dropped.
@@ -42,6 +44,7 @@ impl SessionPool {
             max_open,
             idle: Mutex::new(VecDeque::new()),
             live: Mutex::new(HashMap::new()),
+            pending_checkins: AtomicUsize::new(0),
         }
     }
 
@@ -125,6 +128,36 @@ impl SessionPool {
         }
     }
 
+    /// Close all idle sessions in the pool (drain the idle queue).
+    /// Each session gets the Dia quirk: window.close() → 100ms → Target.closeTarget.
+    pub async fn drain(&self) {
+        // Wait for all pending checkins to complete before draining
+        while self.pending_checkins.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut idle = self.idle.lock().await;
+        while let Some(session) = idle.pop_front() {
+            let target_id = session.target_id().to_string();
+            // Dia quirk: ask the page to close itself first
+            let _ = session
+                .call(
+                    "Runtime.evaluate",
+                    Some(serde_json::json!({"expression": "window.close()"})),
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Force-close via CDP
+            let _ = self
+                .conn
+                .call(
+                    "Target.closeTarget",
+                    Some(serde_json::json!({"targetId": target_id})),
+                )
+                .await;
+        }
+    }
+
     /// Create a brand-new CDP session.
     ///
     /// 1. `Target.createTarget` with `url: "about:blank"`
@@ -163,9 +196,10 @@ impl Drop for PooledSession {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
             let pool = self.pool.clone();
-            // Spawn checkin in background – cannot block in Drop
+            pool.pending_checkins.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 pool.checkin(session).await;
+                pool.pending_checkins.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }
