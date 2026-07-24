@@ -20,30 +20,26 @@ The pre-commit hook enforces this automatically. Set `SKIP_CHECKS=1` to bypass.
 
 ## Commit Flow
 
-For every code change:
+Commit one crate at a time. For each crate with changes:
 
-1. Create a changeset:
+1. Create a single-crate changeset:
    ```bash
    bash scripts/create-changeset.sh
    ```
-   This prompts for description and which crates changed with their bump types.
+   This prompts for description and which crate changed with its bump type.
 
-2. Consume the changeset:
+2. Consume the changeset to bump version and update CHANGELOG.md:
    ```bash
    bash scripts/consume-changesets.sh
    ```
-   This does the following for each affected crate:
-   - Reads the current version from Cargo.toml
-   - Bumps it according to the changeset (patch/minor/major)
-   - Writes the new version to Cargo.toml
-   - Prepends a new section to the crate's CHANGELOG.md
-   - Deletes the changeset file
 
-3. Stage and commit:
+3. Stage and commit that crate separately:
    ```bash
-   git add -A
-   git commit -m "type(scope): short description"
+   git add crates/<crate>/ tests/
+   git commit -m "type(crate): short description"
    ```
+
+Repeat for the next changed crate. Do NOT batch all crates into one commit.
 
 ## Changeset File Format
 
@@ -69,12 +65,3 @@ The changeset defines:
 | `minor` | New features, public API additions       | 0.1.0 → 0.2.0 |
 | `major` | Breaking changes                         | 0.1.0 → 1.0.0 |
 
-## Current Versions
-
-| Crate | Version |
-|-------|---------|
-| cdp | 0.3.2 |
-| cli (gthings) | 0.3.2 |
-| common | 0.3.2 |
-| extraction | 0.3.1 |
-| search | 0.3.1 |
