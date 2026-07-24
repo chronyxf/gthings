@@ -1,9 +1,7 @@
 # Versioning Workflow
 
 Each crate in this monorepo is versioned independently. When code changes in a crate,
-the changeset defines the bump level, and the consume script updates BOTH:
-- The crate's Cargo.toml `version` field
-- The crate's CHANGELOG.md with a new entry
+knope reads the changeset markdown files, bumps Cargo.toml versions, and updates CHANGELOG.md.
 
 Different crates can have different versions at the same time.
 
@@ -14,7 +12,7 @@ One crate at a time. Do not batch multiple crates into one commit.
 ```
  1. format/lint/build/test
  2. changeset
- 3. changelog
+ 3. changelog (knope)
  4. commit (1 line)
  5. publish
 ```
@@ -32,24 +30,34 @@ cargo test --workspace
 
 ### 2. Changeset
 
-```bash
-bash scripts/create-changeset.sh
+Create a changeset file in `.changesets/` with YAML frontmatter:
+
+```markdown
+---
+"gthings-common": patch
+---
+
+- Refactor: spawn_blocking for sync I/O in browser.rs
 ```
 
-Prompts for description and which crate changed with its bump type.
+All bump types: `patch`, `minor`, `major`.
 
-### 3. Changelog
+### 3. Changelog (knope)
 
 ```bash
-bash scripts/consume-changesets.sh
+knope release
 ```
 
-Bumps version in Cargo.toml and prepends new entry to CHANGELOG.md.
+- Reads changeset files from `.changesets/`
+- Bumps versions in Cargo.toml and Cargo.lock
+- Updates dependency version constraints in dependent crates
+- Prepends entries to each crate's CHANGELOG.md
+- Deletes consumed changeset files
 
 ### 4. Commit
 
 ```bash
-git add crates/<crate>/ tests/
+git add crates/<crate>/ tests/ .changesets/
 git commit -m "type(crate): short description"
 ```
 
@@ -57,27 +65,31 @@ One line, conventional commit format. Repeat steps 1-4 for each crate with chang
 
 ### 5. Publish
 
+Publish in dependency order (bottom-up):
+
 ```bash
-cargo publish -p common
-cargo publish -p cdp
-cargo publish -p extraction
-cargo publish -p search
+cargo publish -p gthings-common
+cargo publish -p gthings-cdp
+cargo publish -p gthings-extraction
+cargo publish -p gthings-search
 cargo publish -p gthings
 ```
 
-Publish in dependency order (bottom-up). Each crate must be published before its dependents resolve on crates.io.
-
 ## Changeset File Format
+
+Standard knope changeset markdown:
 
 ```markdown
 ---
-"cdp": patch
+"crate-name": patch
 ---
 
-- Refactor: spawn_blocking for sync I/O in browser.rs
+- Description of the change
+
+More details if needed.
 ```
 
-Frontmatter: crate name in quotes, bump type. Body: bullet list of changes.
+Frontmatter: crate name in quotes, bump type. Body: bullet list or paragraph.
 
 ## Bump Types
 
@@ -94,6 +106,6 @@ Frontmatter: crate name in quotes, bump type. Body: bullet list of changes.
 - [ ] Each Cargo.toml has `description`, `license`, `repository`, `homepage`
 - [ ] Internal `path` deps have matching `version` field
 - [ ] `cargo login` with valid crates.io token
-- [ ] Publish in dependency order: common → cdp → extraction → search → gthings
+- [ ] Publish in dependency order (bottom-up)
 
 Note: root package `gthings-tests` has `publish = false` — never pushed. Only 5 workspace members publish.
