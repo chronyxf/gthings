@@ -4,12 +4,13 @@ version = "0.3.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "CLI binary for gthings — browser-automated web research toolkit"
 
 [dependencies]
-common = { path = "../common" }
-search = { path = "../search" }
-extraction = { path = "../extraction" }
-cdp = { path = "../cdp" }
+common = { path = "../common", version = "0.3.2" }
+search = { path = "../search", version = "0.3.1" }
+extraction = { path = "../extraction", version = "0.3.1" }
+cdp = { path = "../cdp", version = "0.3.2" }
 clap = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }

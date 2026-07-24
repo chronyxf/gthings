@@ -14,14 +14,22 @@ AI Agent → gthings CLI
 
 ## Install
 
+### From crates.io
+
 ```bash
-git clone <repo>
+cargo install gthings
+```
+
+### From source
+
+```bash
+git clone https://github.com/chronyxf/gthings
 cd gthings
 cargo build --release
 ./target/release/gthings --help
 ```
 
-Requires Rust 1.85+ and Dia/Chrome/Chromium installed.
+Requires Rust 1.85+ and a Chromium-based browser (Dia, Chrome, Brave, Edge).
 
 ## Quick Start
 

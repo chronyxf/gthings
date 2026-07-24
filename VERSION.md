@@ -65,3 +65,42 @@ The changeset defines:
 | `minor` | New features, public API additions       | 0.1.0 → 0.2.0 |
 | `major` | Breaking changes                         | 0.1.0 → 1.0.0 |
 
+## Publish to crates.io
+
+Publish crates in dependency order (bottom-up). Each crate must be published
+before its dependents.
+
+```bash
+# 1. Publish foundation crates (no internal deps)
+cargo publish -p common
+cargo publish -p cdp
+
+# 2. Publish extraction (depends on common)
+cargo publish -p extraction
+
+# 3. Publish search (depends on common, extraction, cdp)
+cargo publish -p search
+
+# 4. Publish CLI binary last (depends on all of the above)
+cargo publish -p gthings
+```
+
+After publishing, users install with:
+
+```bash
+cargo install gthings
+```
+
+### Pre-publish checklist
+
+- [ ] Run `cargo test --workspace` — all tests pass
+- [ ] Run `cargo clippy --workspace -D warnings` — zero warnings
+- [ ] Verify each crate's Cargo.toml has `description`, `license`, `repository`, `homepage`
+- [ ] Verify internal `path` dependencies also have `version` field
+- [ ] Confirm `cargo login` with valid crates.io token
+- [ ] Check each crate for `publish = false` if it should not be published
+- [ ] Publish in dependency order (bottom-up)
+
+Note: The root package `gthings-tests` has `publish = false` — it is never pushed
+to crates.io. Only the 5 workspace member crates are published.
+

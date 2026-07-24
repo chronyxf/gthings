@@ -27,6 +27,12 @@ members = [
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+description = "Browser-automated web research toolkit — search, extract, and harvest web content via CDP"
+homepage = "https://github.com/chronyxf/gthings"
+repository = "https://github.com/chronyxf/gthings"
+readme = "README.md"
+keywords = ["web-scraping", "browser-automation", "cdp", "research", "cli"]
+categories = ["command-line-utilities", "web-programming", "development-tools"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

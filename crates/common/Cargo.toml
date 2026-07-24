@@ -4,6 +4,7 @@ version = "0.3.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Shared utilities for gthings: SHA-256 disk cache, config, tracing, agent telemetry"
 
 [dependencies]
 serde = { workspace = true }
