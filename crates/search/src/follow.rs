@@ -6,14 +6,14 @@
 use std::borrow::Cow;
 use std::time::Instant;
 
-use cdp::{Browser, Connection, Tab};
+use gthings_cdp::{Browser, Connection, Tab};
 
-use common::GthingsError;
-use common::cache::Sha256DiskCache;
-use common::config::GthingsConfig;
-use common::trace::TraceWriter;
-use extraction::html::HtmlExtractor;
-use extraction::quality::ContentQuality;
+use gthings_common::GthingsError;
+use gthings_common::cache::Sha256DiskCache;
+use gthings_common::config::GthingsConfig;
+use gthings_common::trace::TraceWriter;
+use gthings_extraction::html::HtmlExtractor;
+use gthings_extraction::quality::ContentQuality;
 
 use crate::types::{FollowOpts, FollowResult};
 
@@ -75,7 +75,7 @@ async fn wait_for_page_load(
     tab: &Tab,
     conn: &mut Connection,
     timeout: std::time::Duration,
-) -> Result<(), cdp::error::CdpError> {
+) -> Result<(), gthings_cdp::error::CdpError> {
     let start = std::time::Instant::now();
     loop {
         let result = tab.evaluate(conn, "document.readyState").await?;
@@ -155,7 +155,7 @@ impl PageFollower {
     ///
     /// Checks the disk cache before fetching. On success, writes the
     /// result to cache. Runs content quality validation on the extracted
-    /// text and attaches the [`QualityResult`](extraction::quality::QualityResult)
+    /// text and attaches the [`QualityResult`](gthings_extraction::quality::QualityResult)
     /// to the returned [`FollowResult`].
     ///
     /// # arXiv URLs

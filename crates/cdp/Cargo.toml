@@ -1,5 +1,5 @@
 [package]
-name = "cdp"
+name = "gthings-cdp"
 version = "0.3.2"
 edition.workspace = true
 rust-version.workspace = true

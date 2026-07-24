@@ -2,7 +2,7 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use common::GthingsError;
+use gthings_common::GthingsError;
 
 /// Extracted content from an HTML page.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -145,7 +145,7 @@ impl HtmlExtractor {
     /// # Examples
     ///
     /// ```
-    /// # use extraction::HtmlExtractor;
+    /// # use gthings_extraction::HtmlExtractor;
     /// let text = HtmlExtractor::strip_tags("<p>Hello <b>world</b></p>");
     /// assert_eq!(text, "Hello world");
     /// ```

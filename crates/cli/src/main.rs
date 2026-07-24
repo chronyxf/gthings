@@ -3,7 +3,7 @@ mod pdf_commands;
 mod search_commands;
 
 use clap::Parser;
-use common::trace::TraceWriter;
+use gthings_common::trace::TraceWriter;
 use std::time::SystemTime;
 
 #[derive(clap::Parser)]
@@ -146,7 +146,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let config = common::config::GthingsConfig::from_env();
+    let config = gthings_common::config::GthingsConfig::from_env();
 
     let session_id = format!(
         "ses_{:x}",
@@ -271,7 +271,7 @@ fn browser_state_path() -> std::path::PathBuf {
 
 /// Start the persistent browser.
 async fn handle_browser_start(json: bool) -> Result<(), anyhow::Error> {
-    let browser = cdp::Browser::launch()
+    let browser = gthings_cdp::Browser::launch()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start browser: {e}"))?;
     let _conn = browser
@@ -328,7 +328,7 @@ async fn handle_browser_stop(json: bool) -> Result<(), anyhow::Error> {
 
 /// Show browser status.
 async fn handle_browser_status(json: bool) -> Result<(), anyhow::Error> {
-    let existing = cdp::Browser::find_existing().await;
+    let existing = gthings_cdp::Browser::find_existing().await;
     if let Some(browser) = existing {
         let pid = browser.pid().await.unwrap_or(0);
         if json {

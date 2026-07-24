@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use common::config::GthingsConfig;
+use gthings_common::config::GthingsConfig;
 
 /// Shared output helper for PDF extraction results.
 fn output_pdf_result(
@@ -90,9 +90,9 @@ pub(crate) async fn handle_pdf_url(
         ));
     }
 
-    let text = extraction::PdfExtractor::extract(&bytes)
+    let text = gthings_extraction::PdfExtractor::extract(&bytes)
         .map_err(|e| anyhow::anyhow!("Failed to extract text from PDF at '{}': {}", url, e))?;
-    let pages = extraction::PdfExtractor::count_pages(&bytes).ok();
+    let pages = gthings_extraction::PdfExtractor::count_pages(&bytes).ok();
 
     output_pdf_result(&text, url, pages, json)?;
     Ok(())
@@ -106,8 +106,8 @@ pub(crate) async fn handle_pdf_file(
 ) -> Result<(), anyhow::Error> {
     let bytes = std::fs::read(path)?;
 
-    let text = extraction::PdfExtractor::extract(&bytes)?;
-    let pages = extraction::PdfExtractor::count_pages(&bytes).ok();
+    let text = gthings_extraction::PdfExtractor::extract(&bytes)?;
+    let pages = gthings_extraction::PdfExtractor::count_pages(&bytes).ok();
 
     let source = path.to_string_lossy();
     output_pdf_result(&text, &source, pages, json)?;

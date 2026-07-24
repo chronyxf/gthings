@@ -7,11 +7,11 @@
 use std::cmp::Reverse;
 use std::time::Instant;
 
-use cdp::{Browser, Tab};
+use gthings_cdp::{Browser, Tab};
 
-use common::GthingsError;
-use common::config::GthingsConfig;
-use common::trace::TraceWriter;
+use gthings_common::GthingsError;
+use gthings_common::config::GthingsConfig;
+use gthings_common::trace::TraceWriter;
 
 use crate::types::{BatchSearchResult, SearchMeta, SearchResult};
 

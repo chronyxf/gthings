@@ -1,6 +1,6 @@
-use common::config::GthingsConfig;
-use common::trace::TraceWriter;
-use search::types::*;
+use gthings_common::config::GthingsConfig;
+use gthings_common::trace::TraceWriter;
+use gthings_search::types::*;
 
 /// Format output for a single search query result.
 fn output_search_results(
@@ -40,7 +40,7 @@ pub(crate) async fn handle_search_query(
     json: bool,
     trace: Option<&mut TraceWriter>,
 ) -> Result<(), anyhow::Error> {
-    let searcher = search::GoogleSearch::new(config.clone());
+    let searcher = gthings_search::GoogleSearch::new(config.clone());
     let results = searcher.query(query, count, None, trace).await?;
 
     let meta = SearchMeta {
@@ -61,7 +61,7 @@ pub(crate) async fn handle_search_batch(
     json: bool,
     trace: Option<&mut TraceWriter>,
 ) -> Result<(), anyhow::Error> {
-    let processor = search::BatchProcessor::new(config.clone());
+    let processor = gthings_search::BatchProcessor::new(config.clone());
     let result = processor.search(queries, count, trace).await?;
 
     output_search_results(&result.results, &result.meta, json)?;
@@ -91,7 +91,7 @@ pub(crate) async fn handle_search_harvest(
         config.follow_concurrency = fc;
     }
 
-    let processor = search::BatchProcessor::new(config);
+    let processor = gthings_search::BatchProcessor::new(config);
     let result = processor.harvest(queries, count, max_pages, trace).await?;
 
     if json {

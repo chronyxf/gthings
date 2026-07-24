@@ -42,11 +42,11 @@ pub struct FollowResult {
     /// Character offset into the full page where extraction started.
     pub offset: usize,
     /// Detected content sections (heading + content pairs).
-    pub sections: Vec<extraction::html::Section>,
+    pub sections: Vec<gthings_extraction::html::Section>,
     /// Error message if the operation failed.
     pub error: Option<String>,
     /// Content quality assessment, if computed.
-    pub quality: Option<extraction::quality::QualityResult>,
+    pub quality: Option<gthings_extraction::quality::QualityResult>,
     /// Whether the follow operation succeeded.
     pub success: bool,
     /// Whether the content was truncated (page text exceeded offset + max_length).

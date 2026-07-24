@@ -1,10 +1,10 @@
-use common::config::GthingsConfig;
-use common::trace::TraceWriter;
-use search::types::FollowOpts;
+use gthings_common::config::GthingsConfig;
+use gthings_common::trace::TraceWriter;
+use gthings_search::types::FollowOpts;
 
-/// Format and print a single [`search::types::FollowResult`].
+/// Format and print a single [`gthings_search::types::FollowResult`].
 fn output_follow_result(
-    result: &search::types::FollowResult,
+    result: &gthings_search::types::FollowResult,
     json: bool,
 ) -> Result<(), anyhow::Error> {
     if json {
@@ -49,7 +49,7 @@ pub(crate) async fn handle_follow_url(
     json: bool,
     trace: Option<&mut TraceWriter>,
 ) -> Result<(), anyhow::Error> {
-    let follower = search::PageFollower::new(config.clone());
+    let follower = gthings_search::PageFollower::new(config.clone());
     let opts = FollowOpts {
         selector: selector.to_string(),
         offset,
@@ -71,7 +71,7 @@ pub(crate) async fn handle_follow_batch(
     json: bool,
     trace: Option<&mut TraceWriter>,
 ) -> Result<(), anyhow::Error> {
-    let follower = search::PageFollower::new(config.clone());
+    let follower = gthings_search::PageFollower::new(config.clone());
     let opts = FollowOpts {
         selector: selector.to_string(),
         offset,

@@ -9,15 +9,15 @@ use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cdp::{Browser, Connection, Tab};
+use gthings_cdp::{Browser, Connection, Tab};
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use common::GthingsError;
-use common::config::GthingsConfig;
-use common::trace::TraceWriter;
-use extraction::quality::ContentQuality;
+use gthings_common::GthingsError;
+use gthings_common::config::GthingsConfig;
+use gthings_common::trace::TraceWriter;
+use gthings_extraction::quality::ContentQuality;
 
 use crate::types::{
     BatchSearchResult, FollowOpts, FollowResult, HarvestMeta, HarvestResult, SearchMeta,
@@ -30,7 +30,7 @@ async fn wait_for_page_load(
     tab: &Tab,
     conn: &mut Connection,
     timeout: Duration,
-) -> Result<(), cdp::error::CdpError> {
+) -> Result<(), gthings_cdp::error::CdpError> {
     let start = Instant::now();
     loop {
         let result = tab.evaluate(conn, "document.readyState").await?;
@@ -308,23 +308,24 @@ impl BatchProcessor {
                     &opts.selector
                 };
 
-                let extracted = match extraction::html::HtmlExtractor::extract(&html, selector) {
-                    Ok(ex) => ex,
-                    Err(e) => {
-                        let _ = tab.close(&mut conn).await;
-                        return Ok(FollowResult {
-                            url,
-                            content: None,
-                            total_length: 0,
-                            offset: opts.offset,
-                            sections: Vec::new(),
-                            error: Some(format!("Extract: {e}")),
-                            quality: None,
-                            success: false,
-                            truncated: false,
-                        });
-                    }
-                };
+                let extracted =
+                    match gthings_extraction::html::HtmlExtractor::extract(&html, selector) {
+                        Ok(ex) => ex,
+                        Err(e) => {
+                            let _ = tab.close(&mut conn).await;
+                            return Ok(FollowResult {
+                                url,
+                                content: None,
+                                total_length: 0,
+                                offset: opts.offset,
+                                sections: Vec::new(),
+                                error: Some(format!("Extract: {e}")),
+                                quality: None,
+                                success: false,
+                                truncated: false,
+                            });
+                        }
+                    };
 
                 let (content, truncated) =
                     if opts.offset > 0 || opts.max_length < extracted.content.len() {
@@ -588,7 +589,7 @@ impl BatchProcessor {
 
                 let fallback_selector = "article,main,[role=main]";
 
-                match extraction::html::HtmlExtractor::extract(&html, fallback_selector) {
+                match gthings_extraction::html::HtmlExtractor::extract(&html, fallback_selector) {
                     Ok(extracted) => {
                         let (content, truncated) = if max_chars < extracted.content.len() {
                             let end = max_chars.min(extracted.content.len());

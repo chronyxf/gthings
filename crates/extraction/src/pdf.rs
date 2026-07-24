@@ -8,7 +8,7 @@ use regex::Regex;
 use std::io::Read;
 use std::sync::OnceLock;
 
-use common::GthingsError;
+use gthings_common::GthingsError;
 
 /// Raw PDF stream data extracted from a PDF object.
 struct PdfStream {
@@ -118,7 +118,7 @@ impl PdfExtractor {
     /// # Examples
     ///
     /// ```
-    /// # use extraction::PdfExtractor;
+    /// # use gthings_extraction::PdfExtractor;
     /// assert!(!PdfExtractor::is_pdf(b"not a pdf"));
     /// ```
     pub fn is_pdf(bytes: &[u8]) -> bool {

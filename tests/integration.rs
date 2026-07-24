@@ -2,9 +2,9 @@
 
 mod common;
 
-use ::common::cache::Sha256DiskCache;
-use extraction::html::HtmlExtractor;
-use extraction::quality::{ContentQuality, QualityReason, QualityResult};
+use ::gthings_common::cache::Sha256DiskCache;
+use gthings_extraction::html::HtmlExtractor;
+use gthings_extraction::quality::{ContentQuality, QualityReason, QualityResult};
 
 // Cache tests
 
@@ -267,17 +267,17 @@ fn test_quality_secondary_check() {
 
 #[test]
 fn test_follow_result_serialization() {
-    let result = search::types::FollowResult {
+    let result = gthings_search::types::FollowResult {
         url: "https://example.com".into(),
         content: Some("test content".into()),
         total_length: 12,
         offset: 0,
-        sections: vec![extraction::html::Section {
+        sections: vec![gthings_extraction::html::Section {
             heading: "Title".into(),
             content: "Body text".into(),
         }],
         error: None,
-        quality: Some(extraction::quality::QualityResult {
+        quality: Some(gthings_extraction::quality::QualityResult {
             score: 1.0,
             is_ok: true,
             reasons: vec![],
@@ -299,7 +299,7 @@ fn test_follow_result_serialization() {
     );
 
     // Round-trip
-    let parsed: search::types::FollowResult = serde_json::from_str(&json).unwrap();
+    let parsed: gthings_search::types::FollowResult = serde_json::from_str(&json).unwrap();
     assert!(parsed.success);
     assert_eq!(parsed.url, "https://example.com");
     assert_eq!(parsed.sections.len(), 1);
@@ -307,7 +307,7 @@ fn test_follow_result_serialization() {
 
 #[test]
 fn test_harvest_meta_serialization() {
-    let meta = search::types::HarvestMeta {
+    let meta = gthings_search::types::HarvestMeta {
         queries: vec!["fed rates".into(), "inflation".into()],
         total_search_results: 10,
         unique_urls: 7,
@@ -330,14 +330,14 @@ fn test_harvest_meta_serialization() {
         "Should include duration_ms"
     );
 
-    let parsed: search::types::HarvestMeta = serde_json::from_str(&json).unwrap();
+    let parsed: gthings_search::types::HarvestMeta = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.unique_urls, 7);
     assert_eq!(parsed.pages_skipped, 2);
 }
 
 #[test]
 fn test_search_result_with_query() {
-    let result = search::types::SearchResult {
+    let result = gthings_search::types::SearchResult {
         title: "Fed Rate 2026".into(),
         url: "https://example.com/fed".into(),
         snippet: "The Fed kept rates at 3.50-3.75%".into(),
@@ -350,7 +350,7 @@ fn test_search_result_with_query() {
 
 #[test]
 fn test_follow_opts_defaults() {
-    let opts = search::types::FollowOpts::default();
+    let opts = gthings_search::types::FollowOpts::default();
     assert_eq!(opts.selector, "article,main,[role=main]");
     assert_eq!(opts.offset, 0);
     assert_eq!(opts.max_length, 15000);
