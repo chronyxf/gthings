@@ -7,7 +7,21 @@ the changeset defines the bump level, and the consume script updates BOTH:
 
 Different crates can have different versions at the same time.
 
-## Pre-commit
+## Pipeline
+
+One crate at a time. Do not batch multiple crates into one commit.
+
+```
+ 1. format/lint/build/test
+ 2. changeset
+ 3. changelog
+ 4. commit (1 line)
+ 5. publish
+```
+
+### 1. Format → Lint → Build → Test
+
+Pre-commit hook enforces these automatically. Set `SKIP_CHECKS=1` to bypass.
 
 ```bash
 cargo fmt --all
@@ -16,46 +30,54 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-The pre-commit hook enforces this automatically. Set `SKIP_CHECKS=1` to bypass.
+### 2. Changeset
 
-## Commit Flow
+```bash
+bash scripts/create-changeset.sh
+```
 
-Commit one crate at a time. For each crate with changes:
+Prompts for description and which crate changed with its bump type.
 
-1. Create a single-crate changeset:
-   ```bash
-   bash scripts/create-changeset.sh
-   ```
-   This prompts for description and which crate changed with its bump type.
+### 3. Changelog
 
-2. Consume the changeset to bump version and update CHANGELOG.md:
-   ```bash
-   bash scripts/consume-changesets.sh
-   ```
+```bash
+bash scripts/consume-changesets.sh
+```
 
-3. Stage and commit that crate separately:
-   ```bash
-   git add crates/<crate>/ tests/
-   git commit -m "type(crate): short description"
-   ```
+Bumps version in Cargo.toml and prepends new entry to CHANGELOG.md.
 
-Repeat for the next changed crate. Do NOT batch all crates into one commit.
+### 4. Commit
+
+```bash
+git add crates/<crate>/ tests/
+git commit -m "type(crate): short description"
+```
+
+One line, conventional commit format. Repeat steps 1-4 for each crate with changes.
+
+### 5. Publish
+
+```bash
+cargo publish -p common
+cargo publish -p cdp
+cargo publish -p extraction
+cargo publish -p search
+cargo publish -p gthings
+```
+
+Publish in dependency order (bottom-up). Each crate must be published before its dependents resolve on crates.io.
 
 ## Changeset File Format
 
 ```markdown
 ---
-"cdp": minor
-"cli": patch
+"cdp": patch
 ---
 
-- Add persistent browser mode with tab lifecycle
+- Refactor: spawn_blocking for sync I/O in browser.rs
 ```
 
-The changeset defines:
-- Which crates changed
-- Bump level per crate (patch/minor/major)
-- Description of changes
+Frontmatter: crate name in quotes, bump type. Body: bullet list of changes.
 
 ## Bump Types
 
@@ -65,42 +87,13 @@ The changeset defines:
 | `minor` | New features, public API additions       | 0.1.0 → 0.2.0 |
 | `major` | Breaking changes                         | 0.1.0 → 1.0.0 |
 
-## Publish to crates.io
+## Pre-publish Checklist
 
-Publish crates in dependency order (bottom-up). Each crate must be published
-before its dependents.
+- [ ] `cargo test --workspace` — all tests pass
+- [ ] `cargo clippy --workspace -D warnings` — zero warnings
+- [ ] Each Cargo.toml has `description`, `license`, `repository`, `homepage`
+- [ ] Internal `path` deps have matching `version` field
+- [ ] `cargo login` with valid crates.io token
+- [ ] Publish in dependency order: common → cdp → extraction → search → gthings
 
-```bash
-# 1. Publish foundation crates (no internal deps)
-cargo publish -p common
-cargo publish -p cdp
-
-# 2. Publish extraction (depends on common)
-cargo publish -p extraction
-
-# 3. Publish search (depends on common, extraction, cdp)
-cargo publish -p search
-
-# 4. Publish CLI binary last (depends on all of the above)
-cargo publish -p gthings
-```
-
-After publishing, users install with:
-
-```bash
-cargo install gthings
-```
-
-### Pre-publish checklist
-
-- [ ] Run `cargo test --workspace` — all tests pass
-- [ ] Run `cargo clippy --workspace -D warnings` — zero warnings
-- [ ] Verify each crate's Cargo.toml has `description`, `license`, `repository`, `homepage`
-- [ ] Verify internal `path` dependencies also have `version` field
-- [ ] Confirm `cargo login` with valid crates.io token
-- [ ] Check each crate for `publish = false` if it should not be published
-- [ ] Publish in dependency order (bottom-up)
-
-Note: The root package `gthings-tests` has `publish = false` — it is never pushed
-to crates.io. Only the 5 workspace member crates are published.
-
+Note: root package `gthings-tests` has `publish = false` — never pushed. Only 5 workspace members publish.
