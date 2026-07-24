@@ -12,6 +12,7 @@ gthings-extraction = { path = "crates/extraction" }
 gthings-search = { path = "crates/search" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tempfile = "3"
 
 [workspace]
 resolver = "2"

@@ -357,3 +357,157 @@ fn test_follow_opts_defaults() {
     assert_eq!(opts.timeout_ms, 30000);
     assert!(opts.retry_on_low_quality);
 }
+
+#[cfg(test)]
+mod skill_commands {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn gthings_binary() -> PathBuf {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("target");
+        path.push("debug");
+        path.push("gthings");
+        if !path.exists() {
+            path.set_extension("exe");
+        }
+        path
+    }
+
+    fn temp_home() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let home = dir.path().to_path_buf();
+        (dir, home)
+    }
+
+    #[test]
+    fn test_skill_add_opencode_installs_files() {
+        let (_dir, home) = temp_home();
+        let output = Command::new(gthings_binary())
+            .env("HOME", &home)
+            .args(["skill", "add", "--opencode"])
+            .output()
+            .expect("run gthings skill add --opencode");
+
+        assert!(
+            output.status.success(),
+            "skill add --opencode should succeed"
+        );
+
+        let skill_md = home
+            .join(".config")
+            .join("opencode")
+            .join("skills")
+            .join("gthings")
+            .join("SKILL.md");
+        assert!(
+            skill_md.exists(),
+            "SKILL.md should be installed to opencode: {:?}",
+            skill_md
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Skill installation complete"),
+            "should report completion"
+        );
+    }
+
+    #[test]
+    fn test_skill_add_agents_installs_files() {
+        let (_dir, home) = temp_home();
+        let output = Command::new(gthings_binary())
+            .env("HOME", &home)
+            .args(["skill", "add", "--agents"])
+            .output()
+            .expect("run gthings skill add --agents");
+
+        assert!(output.status.success(), "skill add --agents should succeed");
+
+        let skill_md = home
+            .join(".agents")
+            .join("skills")
+            .join("gthings")
+            .join("SKILL.md");
+        assert!(
+            skill_md.exists(),
+            "SKILL.md should be installed to agents: {:?}",
+            skill_md
+        );
+
+        let reference_dir = home
+            .join(".agents")
+            .join("skills")
+            .join("gthings")
+            .join("reference");
+        assert!(
+            reference_dir.join("commands.md").exists(),
+            "commands.md should be installed"
+        );
+        assert!(
+            reference_dir.join("quality.md").exists(),
+            "quality.md should be installed"
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Skill installation complete"),
+            "should report completion"
+        );
+    }
+
+    #[test]
+    fn test_skill_add_all_installs_both() {
+        let (_dir, home) = temp_home();
+        let output = Command::new(gthings_binary())
+            .env("HOME", &home)
+            .args(["skill", "add", "--all"])
+            .output()
+            .expect("run gthings skill add --all");
+
+        assert!(output.status.success(), "skill add --all should succeed");
+
+        let opencode_skill = home
+            .join(".config")
+            .join("opencode")
+            .join("skills")
+            .join("gthings")
+            .join("SKILL.md");
+        assert!(opencode_skill.exists(), "opencode SKILL.md should exist");
+
+        let agents_skill = home
+            .join(".agents")
+            .join("skills")
+            .join("gthings")
+            .join("SKILL.md");
+        assert!(agents_skill.exists(), "agents SKILL.md should exist");
+    }
+
+    #[test]
+    fn test_skill_add_no_flag_fails() {
+        let (_dir, home) = temp_home();
+        let output = Command::new(gthings_binary())
+            .env("HOME", &home)
+            .args(["skill", "add"])
+            .output()
+            .expect("run gthings skill add (no flags)");
+
+        assert!(
+            !output.status.success(),
+            "skill add without flags should fail"
+        );
+    }
+
+    #[test]
+    fn test_update_shows_help() {
+        let output = Command::new(gthings_binary())
+            .args(["--help"])
+            .output()
+            .expect("run gthings --help");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("update"), "help should show update command");
+        assert!(stdout.contains("skill"), "help should show skill command");
+    }
+}

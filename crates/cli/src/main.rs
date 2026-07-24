@@ -4,7 +4,12 @@ mod search_commands;
 
 use clap::Parser;
 use gthings_common::trace::TraceWriter;
+use include_dir::{Dir, include_dir};
+use std::fs;
+use std::path::Path;
 use std::time::SystemTime;
+
+static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/resources/skills");
 
 #[derive(clap::Parser)]
 #[command(
@@ -40,6 +45,10 @@ enum Command {
     /// Browser lifecycle management
     #[command(name = "browser", hide = true)]
     Browser(BrowserArgs),
+    /// Update gthings to the latest version
+    Update,
+    /// Manage gthings skills (install to opencode or agents)
+    Skill(SkillArgs),
 }
 
 #[derive(clap::Args)]
@@ -138,6 +147,28 @@ enum PdfCommand {
     File { path: std::path::PathBuf },
 }
 
+#[derive(clap::Args)]
+pub struct SkillArgs {
+    #[command(subcommand)]
+    pub command: SkillCommand,
+}
+
+#[derive(clap::Subcommand)]
+pub enum SkillCommand {
+    /// Install gthings skills
+    Add {
+        /// Install skills to opencode directory (~/.config/opencode/skills/gthings-*)
+        #[arg(long)]
+        opencode: bool,
+        /// Install skills to agents directory (~/.agents/skills/gthings/)
+        #[arg(long)]
+        agents: bool,
+        /// Install to both opencode and agents
+        #[arg(long)]
+        all: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
@@ -232,6 +263,8 @@ async fn main() -> Result<(), anyhow::Error> {
             BrowserCommand::Stop => handle_browser_stop(cli.json).await,
             BrowserCommand::Status => handle_browser_status(cli.json).await,
         },
+        Command::Update => cmd_update().await,
+        Command::Skill(args) => cmd_skill(args).await,
     };
 
     let cmd_duration_ms = cmd_start.elapsed().as_millis() as u64;
@@ -354,6 +387,121 @@ async fn handle_browser_status(json: bool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+async fn cmd_update() -> anyhow::Result<()> {
+    println!("Updating gthings...");
+    let status = std::process::Command::new("cargo")
+        .args(["install", "gthings"])
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to run cargo install: {}", e))?;
+    if !status.success() {
+        anyhow::bail!(
+            "cargo install gthings failed with exit code: {:?}",
+            status.code()
+        );
+    }
+    println!("gthings updated to latest version.");
+    println!("  Run 'gthings skill add --all' to update skill files.");
+    Ok(())
+}
+
+async fn cmd_skill(args: &SkillArgs) -> anyhow::Result<()> {
+    match &args.command {
+        SkillCommand::Add {
+            opencode,
+            agents,
+            all,
+        } => {
+            let do_opencode = *opencode || *all;
+            let do_agents = *agents || *all;
+
+            if !do_opencode && !do_agents {
+                anyhow::bail!("Specify --opencode, --agents, or --all");
+            }
+
+            let home = std::env::var("HOME")
+                .map_err(|_| anyhow::anyhow!("HOME environment variable not set"))?;
+
+            if do_agents {
+                let dest = Path::new(&home)
+                    .join(".agents")
+                    .join("skills")
+                    .join("gthings");
+                if let Some(skill_dir) = SKILLS_DIR.get_dir("agents/gthings") {
+                    copy_embedded_dir(skill_dir, &dest)?;
+                    let count = count_files(skill_dir);
+                    println!(
+                        "Installed {} files to agents skill: {}",
+                        count,
+                        dest.display()
+                    );
+                } else {
+                    anyhow::bail!("Embedded agents skill directory not found");
+                }
+            }
+
+            if do_opencode {
+                let dest = Path::new(&home)
+                    .join(".config")
+                    .join("opencode")
+                    .join("skills");
+                if let Some(opencode_dir) = SKILLS_DIR.get_dir("opencode") {
+                    for skill_subdir in opencode_dir.dirs() {
+                        let skill_name = skill_subdir
+                            .path()
+                            .file_name()
+                            .ok_or_else(|| anyhow::anyhow!("Invalid skill directory name"))?;
+                        let skill_dest = dest.join(skill_name);
+                        copy_embedded_dir(skill_subdir, &skill_dest)?;
+                        let count = count_files(skill_subdir);
+                        println!(
+                            "  - Installed {} files to opencode skill: {}",
+                            count,
+                            skill_dest.display()
+                        );
+                    }
+                } else {
+                    anyhow::bail!("Embedded opencode skills directory not found");
+                }
+            }
+
+            println!("Skill installation complete.");
+            Ok(())
+        }
+    }
+}
+
+fn copy_embedded_dir(dir: &Dir, dest: &Path) -> anyhow::Result<()> {
+    for file in dir.files() {
+        let relative = file
+            .path()
+            .strip_prefix(dir.path())
+            .map_err(|_| anyhow::anyhow!("Failed to compute relative path"))?;
+        let dest_path = dest.join(relative);
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest_path, file.contents())?;
+    }
+    for subdir in dir.dirs() {
+        let relative = subdir
+            .path()
+            .strip_prefix(dir.path())
+            .map_err(|_| anyhow::anyhow!("Failed to compute relative path"))?;
+        let subdest = dest.join(relative);
+        fs::create_dir_all(&subdest)?;
+        copy_embedded_dir(subdir, &subdest)?;
+    }
+    Ok(())
+}
+
+fn count_files(dir: &Dir) -> usize {
+    let mut count = dir.files().count();
+    for subdir in dir.dirs() {
+        count += count_files(subdir);
+    }
+    count
+}
+
 /// Extract command metadata for telemetry.
 fn command_metadata(cmd: &Command) -> (&'static str, serde_json::Value) {
     match cmd {
@@ -415,5 +563,143 @@ fn command_metadata(cmd: &Command) -> (&'static str, serde_json::Value) {
             BrowserCommand::Stop => ("browser_stop", serde_json::json!({})),
             BrowserCommand::Status => ("browser_status", serde_json::json!({})),
         },
+        Command::Update => ("update", serde_json::json!({})),
+        Command::Skill(args) => match &args.command {
+            SkillCommand::Add { .. } => ("skill_add", serde_json::json!({})),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_skills_dir_has_agents_gthings() {
+        let dir = SKILLS_DIR.get_dir("agents/gthings");
+        assert!(dir.is_some(), "agents/gthings dir should exist");
+    }
+
+    #[test]
+    fn test_skills_dir_has_opencode() {
+        let dir = SKILLS_DIR.get_dir("opencode");
+        assert!(dir.is_some(), "opencode dir should exist");
+    }
+
+    #[test]
+    fn test_agents_skill_md_exists() {
+        let dir = SKILLS_DIR.get_dir("agents/gthings").unwrap();
+        let has_skill_md = dir.files().any(|f| f.path().ends_with("SKILL.md"));
+        assert!(has_skill_md, "agents/gthings should contain SKILL.md");
+    }
+
+    #[test]
+    fn test_agents_has_reference_files() {
+        let dir = SKILLS_DIR.get_dir("agents/gthings").unwrap();
+        let count = count_files(dir);
+        assert!(
+            count >= 3,
+            "agents/gthings should have at least 3 files, got {}",
+            count
+        );
+    }
+
+    #[test]
+    fn test_opencode_has_gthings() {
+        let dir = SKILLS_DIR.get_dir("opencode").unwrap();
+        let has_gthings = dir.dirs().any(|d| d.path().ends_with("gthings"));
+        assert!(has_gthings, "opencode should contain gthings dir");
+    }
+
+    #[test]
+    fn test_opencode_has_only_gthings() {
+        let dir = SKILLS_DIR.get_dir("opencode").unwrap();
+        let skill_names: Vec<_> = dir
+            .dirs()
+            .map(|d| d.path().file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            skill_names,
+            vec!["gthings"],
+            "opencode should only contain 'gthings' skill, got: {:?}",
+            skill_names
+        );
+    }
+
+    #[test]
+    fn test_copy_embedded_dir_to_temp() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("gthings_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let skill_dir = SKILLS_DIR.get_dir("agents/gthings").unwrap();
+        copy_embedded_dir(skill_dir, &tmp).unwrap();
+
+        assert!(tmp.join("SKILL.md").exists(), "SKILL.md should be copied");
+        assert!(
+            tmp.join("reference").join("commands.md").exists(),
+            "commands.md should be copied"
+        );
+        assert!(
+            tmp.join("reference").join("quality.md").exists(),
+            "quality.md should be copied"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_copy_embedded_dir_count_matches() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("gthings_test_cnt_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let skill_dir = SKILLS_DIR.get_dir("agents/gthings").unwrap();
+        let count_before = count_files(skill_dir);
+        copy_embedded_dir(skill_dir, &tmp).unwrap();
+
+        let count_after = count_dir_files(&tmp);
+        assert_eq!(
+            count_before, count_after,
+            "count_files should match actual copied files"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    fn count_dir_files(path: &std::path::Path) -> usize {
+        let mut count = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    count += count_dir_files(&entry.path());
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn test_opencode_gthings_has_yaml_frontmatter() {
+        let dir = SKILLS_DIR.get_dir("opencode/gthings").unwrap();
+        let skill_md = dir.files().find(|f| f.path().ends_with("SKILL.md"));
+        assert!(skill_md.is_some(), "opencode/gthings should have SKILL.md");
+        let content = String::from_utf8_lossy(skill_md.unwrap().contents());
+        assert!(
+            content.starts_with("---"),
+            "opencode/gthings/SKILL.md should start with YAML frontmatter"
+        );
+        assert!(
+            content.contains("name: gthings"),
+            "should have name: gthings"
+        );
+        assert!(
+            content.contains("description:"),
+            "should have description field"
+        );
     }
 }

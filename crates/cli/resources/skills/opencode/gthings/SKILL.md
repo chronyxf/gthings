@@ -1,3 +1,8 @@
+---
+name: gthings
+description: "Browser automation and web research CLI — search, follow, PDF extraction, batch harvest, quality gate, telemetry"
+---
+
 # Skill: gthings
 
 Browser automation and web research toolkit. Native Rust binary — single static binary that launches Chrome on demand.
