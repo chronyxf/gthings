@@ -2,12 +2,10 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::GthingsConfig;
 
-/// Initialise the global [`tracing`] subscriber based on the provided config.
+/// Initialise the global [`tracing`] subscriber from the provided config.
 ///
-/// The subscriber writes structured log lines to stderr using
-/// [`tracing_subscriber::fmt`]. The log level is sourced from
-/// [`GthingsConfig::log_level`]; if the value is not a recognised filter
-/// string, `info` is used as a fallback.
+/// The log level comes from [`GthingsConfig::log_level`]; unrecognised values
+/// fall back to `info`.
 ///
 /// # Panics
 ///

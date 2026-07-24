@@ -14,12 +14,8 @@ pub struct Tab {
 }
 
 impl Tab {
-    /// Create a new tab by creating a CDP target that navigates to a URL.
-    /// Uses `Target.createTarget` which returns a sessionId.
-    /// Falls back to creating a target via HTTP `/json/new` endpoint (works on Dia)
-    /// then attaching to it.
+    /// Create a new tab. Uses `Target.createTarget`; falls back to HTTP `/json/new` for Dia.
     pub async fn create(conn: &mut Connection, ws_url: &str, url: &str) -> Result<Self> {
-        // First try to create a new target (standard CDP)
         let result = conn
             .call(
                 "Target.createTarget",
@@ -30,7 +26,6 @@ impl Tab {
             )
             .await;
 
-        // If CDP succeeded and has a sessionId, use it directly
         if let Ok(result) = result {
             if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
                 let target_id = result
@@ -49,8 +44,7 @@ impl Tab {
                     target_id,
                 });
             }
-            // Got targetId but no sessionId (e.g. reusing persistent browser) —
-            // fall through to HTTP method to attach
+            // Missing sessionId, fall back to HTTP attach
             tracing::warn!(
                 "Target.createTarget returned targetId without sessionId, falling back to HTTP"
             );
@@ -58,14 +52,13 @@ impl Tab {
             tracing::warn!("Target.createTarget failed, trying HTTP /json/new");
         }
 
-        // Fallback: HTTP PUT /json/new (works on Dia, handles missing sessionId)
+        // Fallback: HTTP /json/new for Dia compatibility
         Self::create_via_http(conn, ws_url, url).await
     }
 
     /// Create a target via the HTTP `/json/new` endpoint.
-    /// This endpoint is available on all Chromium-based browsers.
     async fn create_via_http(conn: &mut Connection, ws_url: &str, url: &str) -> Result<Self> {
-        // Parse port from ws_url: ws://127.0.0.1:PORT/devtools/browser/...
+        // Parse port from ws_url
         let parsed = Url::parse(ws_url).map_err(|_| CdpError::CommandFailed {
             method: "create_via_http".into(),
             msg: "invalid ws_url".into(),
@@ -106,7 +99,6 @@ impl Tab {
 
         tracing::debug!("Created target via HTTP: target={}", target_id);
 
-        // Attach to the target
         let attach_result = conn
             .call(
                 "Target.attachToTarget",
@@ -142,13 +134,11 @@ impl Tab {
     pub async fn navigate(&self, conn: &mut Connection, url: &str) -> Result<()> {
         tracing::info!("Navigating to: {}", url);
 
-        // Use Target.attachToTarget first if we're using a fresh target
         let result = conn
             .call_with_session(&self.session_id, "Page.enable", json!({}))
             .await?;
         tracing::debug!("Page.enable: {:?}", result);
 
-        // Navigate
         let _result = conn
             .call_with_session(
                 &self.session_id,
@@ -159,12 +149,11 @@ impl Tab {
             )
             .await?;
 
-        // Wait for load event or timeout
-        // We just wait for the page's readyState
+        // Wait for page readyState
         self.wait_for_page_load(conn, 10000).await
     }
 
-    /// Wait for the page to reach `loading_done` (complete) state.
+    /// Wait for the page to reach `complete` readyState, with partial content fallback.
     async fn wait_for_page_load(&self, conn: &mut Connection, timeout_ms: u64) -> Result<()> {
         let start = std::time::Instant::now();
         let timeout = Duration::from_millis(timeout_ms);
@@ -193,7 +182,7 @@ impl Tab {
                 return Ok(());
             }
 
-            // Also check if we have at least some content
+            // Fallback: check for partial content
             let has_content = conn.call_with_session(&self.session_id, "Runtime.evaluate", json!({
                 "expression": "document.body ? document.body.innerText.length > 100 : false",
                 "returnByValue": true,
@@ -240,7 +229,7 @@ impl Tab {
         Ok(title)
     }
 
-    /// Extract HTML content
+    /// Extract HTML content.
     pub async fn extract_html(&self, conn: &mut Connection) -> Result<String> {
         let result = self
             .evaluate(conn, "document.documentElement?.outerHTML || ''")
@@ -263,10 +252,9 @@ impl Tab {
         Ok(results)
     }
 
-    /// Close this tab. Uses `window.close()` first (clean), then `Target.closeTarget` as fallback.
-    /// Errors are logged but not propagated — non-blocking fire-and-forget.
+    /// Close this tab. Uses `window.close()` first, then `Target.closeTarget` as fallback.
+    /// Errors are logged but not propagated.
     pub async fn close(self, conn: &mut Connection) {
-        // Try window.close() first (cleaner)
         let _ = conn
             .call_with_session(
                 &self.session_id,
@@ -277,10 +265,9 @@ impl Tab {
             )
             .await;
 
-        // Wait for clean shutdown (200ms gives browser more time)
+        // Short delay for clean shutdown
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Force close via CDP (ignore errors)
         let _ = conn
             .call(
                 "Target.closeTarget",

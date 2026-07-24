@@ -1,8 +1,4 @@
 // End-to-end tests for gthings agent workflows.
-// Tests use the real CLI binary and a persistent Dia/Chrome browser.
-// Browser is shared across tests 1-4, cleaned up in test 5.
-//
-// Run: cargo test --test e2e -- --test-threads=1
 
 mod common;
 
@@ -14,10 +10,9 @@ fn test_cleanup_and_launch() {
     // Kill any leftover from previous runs
     stop_existing_browser(&gthings_bin());
 
-    // Wait for port to be free
     assert!(wait_for_port(10), "Port 9222 should become free within 10s");
 
-    // Run a search — this auto-launches the browser
+    // Search auto-launches the browser
     let (json, _) = run_gthings(&["--json", "search", "query", "Rust", "--count", "1"]);
     let results = json
         .get("results")
@@ -25,7 +20,6 @@ fn test_cleanup_and_launch() {
         .and_then(|r| r.as_array());
     assert!(results.is_some(), "Search should return results: {}", json);
 
-    // Browser should now be running
     let (status_json, _) = run_gthings(&["--json", "browser", "status"]);
     assert_eq!(
         status_json["status"], "running",

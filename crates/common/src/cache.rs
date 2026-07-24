@@ -3,19 +3,14 @@ use std::io;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+use tokio::task;
 
 use crate::error::GthingsError;
 
 /// A SHA-256-keyed disk cache with TTL-based expiry.
 ///
-/// Keys are deterministically derived from a (URL, offset, max) triple using
-/// SHA-256 of `"{url}|{offset}|{max}"`. Entries are stored as raw content
-/// strings on disk (not JSON-wrapped). Expiry uses file mtime.
-///
-/// # Concurrency
-///
-/// Multiple processes may safely read and write the same cache directory.
-/// Writes use an atomic rename pattern to avoid partial-file reads.
+/// Entries are stored as raw content strings, not JSON-wrapped. Expiry uses
+/// file mtime. Multiple processes may safely share the same cache directory.
 pub struct Sha256DiskCache {
     dir: std::path::PathBuf,
     ttl: Duration,
@@ -32,12 +27,8 @@ impl Sha256DiskCache {
         }
     }
 
-    /// Generate a deterministic SHA-256 hex key matching the TypeScript original.
-    ///
-    /// The hash input is `"{url}|{offset}|{max}"` — identical to
-    /// `createHash('sha256').update(\`${url}|${offset}|${max}\`).digest('hex')`.
-    ///
-    /// This key doubles as the cache file name (with a `.json` extension).
+    /// Deterministic SHA-256 hex key from `"{url}|{offset}|{max}"`.
+    /// Also used as the cache file name (with `.json` extension).
     pub fn key(&self, url: &str, offset: usize, max: usize) -> String {
         let input = format!("{}|{}|{}", url, offset, max);
         let mut hasher = Sha256::new();
@@ -45,109 +36,114 @@ impl Sha256DiskCache {
         hex_encode(hasher.finalize())
     }
 
-    /// Return the cached content for `key`, or `None` if it does not exist or has expired.
-    ///
-    /// Expired entries are deleted before `None` is returned (lazy eviction).
-    /// TTL is checked against the file's mtime, matching the TypeScript original.
-    pub fn get(&self, key: &str) -> Result<Option<String>, GthingsError> {
+    /// Return cached content for `key`, or `None` if missing or expired.
+    /// Expired entries are deleted lazily before returning `None`.
+    pub async fn get(&self, key: &str) -> Result<Option<String>, GthingsError> {
         let path = self.dir.join(format!("{key}.json"));
+        let ttl = self.ttl;
 
-        let data = match fs::read_to_string(&path) {
-            Ok(data) => data,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(GthingsError::Io(e)),
-        };
+        task::spawn_blocking(move || {
+            let data = match fs::read_to_string(&path) {
+                Ok(data) => data,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(GthingsError::Io(e)),
+            };
 
-        // Check TTL via file mtime (matches TypeScript's statSync().mtimeMs)
-        if is_expired(&path, self.ttl) {
-            let _ = fs::remove_file(&path);
-            return Ok(None);
-        }
+            if is_expired(&path, ttl) {
+                let _ = fs::remove_file(&path);
+                return Ok(None);
+            }
 
-        Ok(Some(data))
+            Ok(Some(data))
+        })
+        .await
+        .map_err(|e| GthingsError::Io(std::io::Error::other(e)))?
     }
 
-    /// Store `data` in the cache under the given `key`.
+    /// Store `data` in the cache under `key`.
     ///
-    /// Writes raw content (no JSON wrapping), matching the TypeScript original.
-    /// This operation is best-effort: all errors are silently ignored because
-    /// the cache is a performance optimisation, not a correctness requirement.
-    ///
-    /// Uses an atomic write pattern (temp file + rename) to avoid partial-file
-    /// reads by concurrent processes.
-    pub fn set(&self, key: &str, data: &str) {
-        // Lazily create the cache directory.
-        if !self.dir.exists() {
-            if let Err(e) = fs::create_dir_all(&self.dir) {
-                tracing::debug!("cache: failed to create cache dir: {e}");
-                // Not fatal — cache is an optimisation.
-            }
-        }
-
-        // Atomic write: write to a temp file, then rename.
+    /// Errors are silently ignored — the cache is a performance optimisation,
+    /// not a correctness requirement.
+    pub async fn set(&self, key: &str, data: &str) {
         let final_path = self.dir.join(format!("{key}.json"));
         let tmp_path = self
             .dir
             .join(format!("{key}.tmp.{}.json", std::process::id()));
+        let data = data.to_string();
+        let dir = self.dir.clone();
 
-        match fs::write(&tmp_path, data) {
-            Ok(()) => {}
-            Err(e) => {
-                tracing::debug!("cache: failed to write temp file: {e}");
-                let _ = fs::remove_file(&tmp_path);
-                return;
+        task::spawn_blocking(move || {
+            if !dir.exists() {
+                if let Err(e) = fs::create_dir_all(&dir) {
+                    tracing::debug!("cache: failed to create cache dir: {e}");
+                    // Not fatal — cache is an optimisation.
+                }
             }
-        }
 
-        if let Err(e) = fs::rename(&tmp_path, &final_path) {
-            tracing::debug!("cache: failed to rename temp file: {e}");
-            let _ = fs::remove_file(&tmp_path);
-        }
+            match fs::write(&tmp_path, &data) {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::debug!("cache: failed to write temp file: {e}");
+                    let _ = fs::remove_file(&tmp_path);
+                    return;
+                }
+            }
+
+            if let Err(e) = fs::rename(&tmp_path, &final_path) {
+                tracing::debug!("cache: failed to rename temp file: {e}");
+                let _ = fs::remove_file(&tmp_path);
+            }
+        })
+        .await
+        .ok();
     }
 
-    /// Scan the cache directory and remove every entry whose age exceeds the TTL.
-    ///
-    /// Returns the number of entries that were evicted.
-    /// Uses file mtime for expiry checks, matching the TypeScript original.
-    pub fn evict_expired(&self) -> Result<usize, GthingsError> {
-        let read_dir = match fs::read_dir(&self.dir) {
-            Ok(r) => r,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(GthingsError::Io(e)),
-        };
+    /// Remove all cache entries whose age exceeds the TTL.
+    /// Returns the number of evicted entries.
+    pub async fn evict_expired(&self) -> Result<usize, GthingsError> {
+        let dir = self.dir.clone();
+        let ttl = self.ttl;
 
-        let mut evicted = 0usize;
-
-        for entry in read_dir {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
+        task::spawn_blocking(move || {
+            let read_dir = match fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+                Err(e) => return Err(GthingsError::Io(e)),
             };
 
-            let path = entry.path();
+            let mut evicted = 0usize;
 
-            // Only process .json files that match our key pattern (not .tmp files).
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if file_stem.len() != 64 {
-                // Not a SHA-256 hex key; skip.
-                continue;
+            for entry in read_dir {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                let path = entry.path();
+
+                // Only .json files matching our key pattern.
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if file_stem.len() != 64 {
+                    // Skip non-SHA-256 filenames.
+                    continue;
+                }
+
+                if is_expired(&path, ttl) && fs::remove_file(&path).is_ok() {
+                    evicted += 1;
+                }
             }
 
-            if is_expired(&path, self.ttl) && fs::remove_file(&path).is_ok() {
-                evicted += 1;
-            }
-        }
-
-        Ok(evicted)
+            Ok(evicted)
+        })
+        .await
+        .map_err(|e| GthingsError::Io(std::io::Error::other(e)))?
     }
 }
 
-// Internal helpers
-
-/// Encode a byte slice as a lowercase hex string (no external crate dependency).
+/// Encode bytes as a lowercase hex string.
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
     const HEX_CHARS: &[u8] = b"0123456789abcdef";
     let bytes = bytes.as_ref();
@@ -159,11 +155,10 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
     out
 }
 
-/// Check whether a cache file is older than the TTL using the file's mtime.
+/// Check if a cache file is older than the TTL via file mtime.
 ///
 /// Missing files are treated as expired. Files with inaccessible metadata
-/// are conservatively treated as not expired (we do not delete what we
-/// cannot verify).
+/// are conservatively not expired (do not delete what we cannot verify).
 fn is_expired(path: &std::path::Path, ttl: Duration) -> bool {
     match std::fs::metadata(path) {
         Ok(meta) => {
@@ -221,14 +216,14 @@ mod tests {
         assert_ne!(k1, k2);
     }
 
-    #[test]
-    fn set_get_raw_content() {
+    #[tokio::test]
+    async fn set_get_raw_content() {
         let dir = std::env::temp_dir().join(format!("_cache_test_{}", std::process::id()));
         let cache = Sha256DiskCache::new(&dir, 3600);
         let key = cache.key("https://set-get-test", 0, 100);
         let content = "raw content, not JSON wrapped";
-        cache.set(&key, content);
-        let retrieved = cache.get(&key).unwrap().expect("should be present");
+        cache.set(&key, content).await;
+        let retrieved = cache.get(&key).await.unwrap().expect("should be present");
         assert_eq!(retrieved, content);
         // Also verify the file on disk is exactly the raw content
         let file_path = dir.join(format!("{key}.json"));
@@ -238,14 +233,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn get_expired_by_mtime() {
+    #[tokio::test]
+    async fn get_expired_by_mtime() {
         let dir = std::env::temp_dir().join(format!("_cache_test_{}", std::process::id()));
         let cache = Sha256DiskCache::new(&dir, 0); // 0-second TTL — immediately expired
         let key = cache.key("https://expired-test", 0, 100);
-        cache.set(&key, "will expire");
+        cache.set(&key, "will expire").await;
         // The set just happened, but with TTL=0 it's already expired
-        let retrieved = cache.get(&key).unwrap();
+        let retrieved = cache.get(&key).await.unwrap();
         assert!(retrieved.is_none());
         // File should have been removed
         let file_path = dir.join(format!("{key}.json"));

@@ -73,8 +73,8 @@ The changeset defines:
 
 | Crate | Version |
 |-------|---------|
-| cdp | 0.3.0 |
-| cli (gthings) | 0.3.0 |
-| common | 0.3.0 |
-| extraction | 0.3.0 |
-| search | 0.3.0 |
+| cdp | 0.3.2 |
+| cli (gthings) | 0.3.2 |
+| common | 0.3.2 |
+| extraction | 0.3.1 |
+| search | 0.3.1 |

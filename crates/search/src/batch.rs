@@ -2,14 +2,17 @@
 //!
 //! Provides [`BatchProcessor`] which orchestrates multi-query searches,
 //! multi-URL page following, and a two-phase harvest pipeline.
-//!
 //! Each operation launches a single Chrome instance and reuses it across
 //! all queries/URLs in the batch.
 
 use std::cmp::Reverse;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use cdp::{Browser, Tab};
+use cdp::{Browser, Connection, Tab};
+
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use common::GthingsError;
 use common::config::GthingsConfig;
@@ -21,14 +24,32 @@ use crate::types::{
     SearchResult,
 };
 
+/// Wait for page load by polling `document.readyState` at 100ms intervals.
+/// Returns when `"complete"` plus a 200ms rendering buffer, or on timeout.
+async fn wait_for_page_load(
+    tab: &Tab,
+    conn: &mut Connection,
+    timeout: Duration,
+) -> Result<(), cdp::error::CdpError> {
+    let start = Instant::now();
+    loop {
+        let result = tab.evaluate(conn, "document.readyState").await?;
+        let ready = result["result"]["value"].as_str();
+        if ready == Some("complete") {
+            // Extra wait for JS rendering to settle
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            return Ok(()); // proceed anyway on timeout
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Batch processor for multi-step search pipelines.
 ///
-/// Each operation launches a single Chrome instance and reuses it across
-/// all queries/URLs in the batch.
-///
-/// - **`search`** — multi-query search with dedup and ranking.
-/// - **`follow`** — multi-URL page extraction with caching.
-/// - **`harvest`** — two-phase pipeline (search then follow).
+/// Each operation reuses a single Chrome instance across the batch.
 pub struct BatchProcessor {
     config: GthingsConfig,
 }
@@ -39,8 +60,10 @@ impl BatchProcessor {
         Self { config }
     }
 
-    /// Batch search: run multiple queries using one shared Chrome instance,
+    /// Batch search: run multiple queries with one shared Chrome instance,
     /// deduplicate by URL, rank by snippet length descending.
+    ///
+    /// Queries are processed concurrently, bounded by [`GthingsConfig::search_concurrency`].
     ///
     /// # Errors
     ///
@@ -64,13 +87,12 @@ impl BatchProcessor {
 
         let start = Instant::now();
 
-        let browser = Browser::launch()
-            .await
-            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
-        let mut conn = browser
-            .connect()
-            .await
-            .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
+        let browser = Arc::new(
+            Browser::launch()
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?,
+        );
+        let ws_url = browser.ws_url().to_string();
 
         if let Some(ref mut t) = trace {
             t.step(
@@ -86,23 +108,22 @@ impl BatchProcessor {
             );
         }
 
-        let mut all_results: Vec<SearchResult> = Vec::new();
+        let concurrency_limit = self.config.search_concurrency.max(1);
+        let semaphore = Arc::new(Semaphore::new(concurrency_limit));
+        let mut join_set: JoinSet<Result<Vec<SearchResult>, GthingsError>> = JoinSet::new();
 
         for q in queries {
-            let tab = Tab::create(&mut conn, browser.ws_url(), "about:blank")
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
                 .await
-                .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
-
-            let encoded = urlencoding::encode(q);
+                .map_err(|e| GthingsError::Cdp(format!("Semaphore: {e}")))?;
+            let browser = browser.clone();
+            let ws_url = ws_url.clone();
+            let q = q.clone();
+            let encoded = urlencoding::encode(&q);
             let url = format!("https://www.google.com/search?q={}&num={}", encoded, count);
-
-            tab.navigate(&mut conn, &url)
-                .await
-                .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
-
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-            // Extract via JS (same script as search.rs)
+            let count_val = count;
             let js = format!(
                 r#"
 (() => {{
@@ -132,35 +153,64 @@ impl BatchProcessor {
     return JSON.stringify(results.slice(0, {}));
 }})()
 "#,
-                count
+                count_val
             );
 
-            let result = tab
-                .evaluate(&mut conn, &js)
-                .await
-                .map_err(|e| GthingsError::Cdp(format!("Eval: {e}")))?;
+            join_set.spawn(async move {
+                let _permit = permit;
+                let mut conn = browser
+                    .connect()
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
+                let tab = Tab::create(&mut conn, &ws_url, "about:blank")
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
 
-            let json_str = result["result"]["value"].as_str().unwrap_or("[]");
-            let items: Vec<serde_json::Value> = serde_json::from_str(json_str).unwrap_or_default();
+                tab.navigate(&mut conn, &url)
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
 
-            for item in items {
-                all_results.push(SearchResult {
-                    title: item["title"].as_str().unwrap_or("").to_string(),
-                    url: item["url"].as_str().unwrap_or("").to_string(),
-                    snippet: item["snippet"].as_str().unwrap_or("").to_string(),
-                    query: Some(q.to_string()),
-                });
+                wait_for_page_load(&tab, &mut conn, Duration::from_secs(10))
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("WaitLoad: {e}")))?;
+
+                let result = tab
+                    .evaluate(&mut conn, &js)
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("Eval: {e}")))?;
+
+                let json_str = result["result"]["value"].as_str().unwrap_or("[]");
+                let items: Vec<serde_json::Value> =
+                    serde_json::from_str(json_str).unwrap_or_default();
+
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    let mut result: SearchResult = serde_json::from_value(item).unwrap_or_default();
+                    result.query = Some(q.clone());
+                    results.push(result);
+                }
+
+                let _ = tab.close(&mut conn).await;
+
+                Ok(results)
+            });
+        }
+
+        let mut all_results: Vec<SearchResult> = Vec::new();
+        while let Some(task_result) = join_set.join_next().await {
+            match task_result {
+                Ok(Ok(results)) => all_results.extend(results),
+                Ok(Err(e)) => return Err(e),
+                Err(join_err) => {
+                    return Err(GthingsError::Cdp(format!("Task join failed: {join_err}")));
+                }
             }
-
-            // Close the tab
-            let _ = tab.close(&mut conn).await;
         }
 
         // Dedup by URL
         let mut seen = std::collections::HashSet::new();
         all_results.retain(|r| seen.insert(r.url.clone()));
 
-        // Sort by snippet length descending
         all_results.sort_by_key(|k| Reverse(k.snippet.len()));
 
         let elapsed = start.elapsed().as_millis() as u64;
@@ -178,6 +228,8 @@ impl BatchProcessor {
 
     /// Batch follow: follow multiple URLs using one shared Chrome instance.
     ///
+    /// URLs are processed concurrently, bounded by [`GthingsConfig::follow_concurrency`].
+    ///
     /// # Errors
     ///
     /// Returns [`GthingsError::Cdp`] if Chrome cannot be launched.
@@ -191,13 +243,12 @@ impl BatchProcessor {
             return Ok(Vec::new());
         }
 
-        let browser = Browser::launch()
-            .await
-            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
-        let mut conn = browser
-            .connect()
-            .await
-            .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
+        let browser = Arc::new(
+            Browser::launch()
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?,
+        );
+        let ws_url = browser.ws_url().to_string();
 
         if let Some(ref mut t) = trace {
             t.step(
@@ -213,72 +264,104 @@ impl BatchProcessor {
             );
         }
 
-        let mut pages: Vec<FollowResult> = Vec::with_capacity(urls.len());
+        let concurrency_limit = self.config.follow_concurrency.max(1);
+        let semaphore = Arc::new(Semaphore::new(concurrency_limit));
+        let mut join_set: JoinSet<Result<FollowResult, GthingsError>> = JoinSet::new();
 
         for url in urls {
-            let tab = Tab::create(&mut conn, browser.ws_url(), "about:blank")
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
                 .await
-                .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
+                .map_err(|e| GthingsError::Cdp(format!("Semaphore: {e}")))?;
+            let browser = browser.clone();
+            let ws_url = ws_url.clone();
+            let url = url.clone();
+            let opts = opts.clone();
 
-            tab.navigate(&mut conn, url)
-                .await
-                .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
+            join_set.spawn(async move {
+                let _permit = permit;
+                let mut conn = browser
+                    .connect()
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
+                let tab = Tab::create(&mut conn, &ws_url, "about:blank")
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
 
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tab.navigate(&mut conn, &url)
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
 
-            let html = tab
-                .extract_html(&mut conn)
-                .await
-                .map_err(|e| GthingsError::Cdp(format!("Html: {e}")))?;
+                wait_for_page_load(&tab, &mut conn, Duration::from_millis(opts.timeout_ms))
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("WaitLoad: {e}")))?;
 
-            let selector = if opts.selector.is_empty() {
-                "body"
-            } else {
-                &opts.selector
-            };
+                let html = tab
+                    .extract_html(&mut conn)
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("Html: {e}")))?;
 
-            let extracted = match extraction::html::HtmlExtractor::extract(&html, selector) {
-                Ok(ex) => ex,
-                Err(e) => {
-                    let _ = tab.close(&mut conn).await;
-                    pages.push(FollowResult {
-                        success: false,
-                        url: url.clone(),
-                        content: None,
-                        total_length: 0,
-                        offset: opts.offset,
-                        truncated: false,
-                        sections: Vec::new(),
-                        error: Some(format!("Extract: {e}")),
-                        quality: None,
-                    });
-                    continue;
-                }
-            };
-
-            let (content, truncated) =
-                if opts.offset > 0 || opts.max_length < extracted.content.len() {
-                    let start = opts.offset.min(extracted.content.len());
-                    let end = (start + opts.max_length).min(extracted.content.len());
-                    (extracted.content[start..end].to_string(), true)
+                let selector = if opts.selector.is_empty() {
+                    "body"
                 } else {
-                    (extracted.content, false)
+                    &opts.selector
                 };
 
-            let result = FollowResult {
-                success: !content.is_empty(),
-                url: url.clone(),
-                content: Some(content),
-                total_length: extracted.total_length,
-                offset: opts.offset,
-                truncated,
-                sections: extracted.sections,
-                error: None,
-                quality: Some(ContentQuality::validate("")), // placeholder, caller re-checks
-            };
+                let extracted = match extraction::html::HtmlExtractor::extract(&html, selector) {
+                    Ok(ex) => ex,
+                    Err(e) => {
+                        let _ = tab.close(&mut conn).await;
+                        return Ok(FollowResult {
+                            url,
+                            content: None,
+                            total_length: 0,
+                            offset: opts.offset,
+                            sections: Vec::new(),
+                            error: Some(format!("Extract: {e}")),
+                            quality: None,
+                            success: false,
+                            truncated: false,
+                        });
+                    }
+                };
 
-            let _ = tab.close(&mut conn).await;
-            pages.push(result);
+                let (content, truncated) =
+                    if opts.offset > 0 || opts.max_length < extracted.content.len() {
+                        let start = opts.offset.min(extracted.content.len());
+                        let end = (start + opts.max_length).min(extracted.content.len());
+                        (extracted.content[start..end].to_string(), true)
+                    } else {
+                        (extracted.content, false)
+                    };
+
+                let is_success = !content.is_empty();
+                let result = FollowResult {
+                    url,
+                    content: Some(content),
+                    total_length: extracted.total_length,
+                    offset: opts.offset,
+                    sections: extracted.sections,
+                    error: None,
+                    quality: Some(ContentQuality::validate("")), // placeholder, caller re-checks
+                    success: is_success,
+                    truncated,
+                };
+
+                let _ = tab.close(&mut conn).await;
+                Ok(result)
+            });
+        }
+
+        let mut pages: Vec<FollowResult> = Vec::with_capacity(urls.len());
+        while let Some(task_result) = join_set.join_next().await {
+            match task_result {
+                Ok(Ok(result)) => pages.push(result),
+                Ok(Err(e)) => return Err(e),
+                Err(join_err) => {
+                    return Err(GthingsError::Cdp(format!("Task join failed: {join_err}")));
+                }
+            }
         }
 
         Ok(pages)
@@ -286,8 +369,8 @@ impl BatchProcessor {
 
     /// Two-phase harvest pipeline using a single shared Chrome instance.
     ///
-    /// Phase 1: search all queries. Phase 2: follow the top `max_pages`
-    /// unique URLs from the aggregated search results.
+    /// Phase 1 (search) runs with [`GthingsConfig::search_concurrency`];
+    /// Phase 2 (follow) runs with [`GthingsConfig::follow_concurrency`].
     pub async fn harvest(
         &self,
         queries: &[String],
@@ -297,14 +380,13 @@ impl BatchProcessor {
     ) -> Result<HarvestResult, GthingsError> {
         let pipeline_start = Instant::now();
 
-        // Phase 1: Search all queries
-        let browser = Browser::launch()
-            .await
-            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
-        let mut conn = browser
-            .connect()
-            .await
-            .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
+        // Phase 1: Search all queries (parallel)
+        let browser = Arc::new(
+            Browser::launch()
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?,
+        );
+        let ws_url = browser.ws_url().to_string();
 
         if let Some(ref mut t) = trace {
             t.step(
@@ -320,22 +402,22 @@ impl BatchProcessor {
             );
         }
 
-        let mut all_search_results: Vec<SearchResult> = Vec::new();
+        let search_concurrency = self.config.search_concurrency.max(1);
+        let semaphore = Arc::new(Semaphore::new(search_concurrency));
+        let mut search_set: JoinSet<Result<Vec<SearchResult>, GthingsError>> = JoinSet::new();
 
         for q in queries {
-            let tab = Tab::create(&mut conn, browser.ws_url(), "about:blank")
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
                 .await
-                .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
-
-            let encoded = urlencoding::encode(q);
+                .map_err(|e| GthingsError::Cdp(format!("Semaphore: {e}")))?;
+            let browser = browser.clone();
+            let ws_url = ws_url.clone();
+            let q = q.clone();
+            let encoded = urlencoding::encode(&q);
             let url = format!("https://www.google.com/search?q={}&num={}", encoded, count);
-
-            tab.navigate(&mut conn, &url)
-                .await
-                .map_err(|e| GthingsError::Cdp(format!("Navigate: {e}")))?;
-
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
+            let count_val = count;
             let js = format!(
                 r#"
 (() => {{
@@ -359,25 +441,55 @@ impl BatchProcessor {
     return JSON.stringify(results.slice(0, {}));
 }})()
 "#,
-                count
+                count_val
             );
 
-            if let Ok(result) = tab.evaluate(&mut conn, &js).await {
-                let json_str = result["result"]["value"].as_str().unwrap_or("[]");
-                let items: Vec<serde_json::Value> =
-                    serde_json::from_str(json_str).unwrap_or_default();
-                for item in items {
-                    all_search_results.push(SearchResult {
-                        title: item["title"].as_str().unwrap_or("").to_string(),
-                        url: item["url"].as_str().unwrap_or("").to_string(),
-                        snippet: item["snippet"].as_str().unwrap_or("").to_string(),
-                        query: Some(q.to_string()),
-                    });
+            search_set.spawn(async move {
+                let _permit = permit;
+                let mut conn = browser
+                    .connect()
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("Connect: {e}")))?;
+                let tab = Tab::create(&mut conn, &ws_url, "about:blank")
+                    .await
+                    .map_err(|e| GthingsError::Cdp(format!("CreateTab: {e}")))?;
+
+                if tab.navigate(&mut conn, &url).await.is_err() {
+                    let _ = tab.close(&mut conn).await;
+                    return Ok(Vec::new());
+                }
+
+                let _ = wait_for_page_load(&tab, &mut conn, Duration::from_secs(10)).await;
+
+                let mut results = Vec::new();
+                if let Ok(result) = tab.evaluate(&mut conn, &js).await {
+                    let json_str = result["result"]["value"].as_str().unwrap_or("[]");
+                    let items: Vec<serde_json::Value> =
+                        serde_json::from_str(json_str).unwrap_or_default();
+                    for item in items {
+                        let mut result: SearchResult =
+                            serde_json::from_value(item).unwrap_or_default();
+                        result.query = Some(q.clone());
+                        results.push(result);
+                    }
+                }
+
+                let _ = tab.close(&mut conn).await;
+                Ok(results)
+            });
+        }
+
+        let mut all_search_results: Vec<SearchResult> = Vec::new();
+        while let Some(task_result) = search_set.join_next().await {
+            match task_result {
+                Ok(Ok(results)) => all_search_results.extend(results),
+                Ok(Err(e)) => return Err(e),
+                Err(join_err) => {
+                    return Err(GthingsError::Cdp(format!(
+                        "Search task join failed: {join_err}"
+                    )));
                 }
             }
-
-            // Close the tab
-            let _ = tab.close(&mut conn).await;
         }
 
         // Dedup and rank search results
@@ -387,86 +499,152 @@ impl BatchProcessor {
 
         let unique_urls = all_search_results.len();
 
-        // Phase 2: Follow top K URLs
+        let follow_concurrency = self.config.follow_concurrency.max(1);
+        let semaphore = Arc::new(Semaphore::new(follow_concurrency));
+        let mut follow_set: JoinSet<Result<FollowResult, GthingsError>> = JoinSet::new();
+
         let top_urls: Vec<&SearchResult> = all_search_results.iter().take(max_pages).collect();
-        let mut read_pages: Vec<FollowResult> = Vec::with_capacity(top_urls.len());
-        let mut pages_skipped = 0usize;
+        let max_chars = self.config.max_chars;
 
         for sr in &top_urls {
-            let tab = match Tab::create(&mut conn, browser.ws_url(), "about:blank").await {
-                Ok(t) => t,
-                Err(_) => {
-                    pages_skipped += 1;
-                    continue;
-                }
-            };
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| GthingsError::Cdp(format!("Semaphore: {e}")))?;
+            let browser = browser.clone();
+            let ws_url = ws_url.clone();
+            let url = sr.url.clone();
+            follow_set.spawn(async move {
+                let _permit = permit;
+                let mut conn = match browser.connect().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Ok(FollowResult {
+                            url,
+                            content: None,
+                            total_length: 0,
+                            offset: 0,
+                            sections: Vec::new(),
+                            error: Some(format!("Connect: {e}")),
+                            quality: None,
+                            success: false,
+                            truncated: false,
+                        });
+                    }
+                };
 
-            if tab.navigate(&mut conn, &sr.url).await.is_err() {
-                let _ = tab.close(&mut conn).await;
-                pages_skipped += 1;
-                continue;
-            }
+                let tab = match Tab::create(&mut conn, &ws_url, "about:blank").await {
+                    Ok(t) => t,
+                    Err(_) => {
+                        return Ok(FollowResult {
+                            url,
+                            content: None,
+                            total_length: 0,
+                            offset: 0,
+                            sections: Vec::new(),
+                            error: Some("CreateTab failed".into()),
+                            quality: None,
+                            success: false,
+                            truncated: false,
+                        });
+                    }
+                };
 
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-            let html = match tab.extract_html(&mut conn).await {
-                Ok(h) => h,
-                Err(_) => {
+                if tab.navigate(&mut conn, &url).await.is_err() {
                     let _ = tab.close(&mut conn).await;
-                    pages_skipped += 1;
-                    continue;
-                }
-            };
-
-            let selector = &self
-                .config
-                .deny_hosts
-                .first()
-                .map(|_| "body")
-                .unwrap_or("article,main,[role=main]");
-            let fallback_selector = if selector.is_empty() {
-                "body"
-            } else {
-                selector
-            };
-
-            match extraction::html::HtmlExtractor::extract(&html, fallback_selector) {
-                Ok(extracted) => {
-                    let (content, truncated) = if self.config.max_chars < extracted.content.len() {
-                        let end = self.config.max_chars.min(extracted.content.len());
-                        (extracted.content[..end].to_string(), true)
-                    } else {
-                        (extracted.content, false)
-                    };
-
-                    let quality = ContentQuality::validate(&content);
-                    let _ = tab.close(&mut conn).await;
-                    read_pages.push(FollowResult {
-                        success: true,
-                        url: sr.url.clone(),
-                        content: Some(content),
-                        total_length: extracted.total_length,
-                        offset: 0,
-                        truncated,
-                        sections: extracted.sections,
-                        error: None,
-                        quality: Some(quality),
-                    });
-                }
-                Err(e) => {
-                    let _ = tab.close(&mut conn).await;
-                    pages_skipped += 1;
-                    read_pages.push(FollowResult {
-                        success: false,
-                        url: sr.url.clone(),
+                    return Ok(FollowResult {
+                        url,
                         content: None,
                         total_length: 0,
                         offset: 0,
-                        truncated: false,
                         sections: Vec::new(),
-                        error: Some(format!("Extract: {e}")),
+                        error: Some("Navigate failed".into()),
                         quality: None,
+                        success: false,
+                        truncated: false,
                     });
+                }
+
+                let _ = wait_for_page_load(&tab, &mut conn, Duration::from_secs(15)).await;
+
+                let html = match tab.extract_html(&mut conn).await {
+                    Ok(h) => h,
+                    Err(_) => {
+                        let _ = tab.close(&mut conn).await;
+                        return Ok(FollowResult {
+                            url,
+                            content: None,
+                            total_length: 0,
+                            offset: 0,
+                            sections: Vec::new(),
+                            error: Some("ExtractHtml failed".into()),
+                            quality: None,
+                            success: false,
+                            truncated: false,
+                        });
+                    }
+                };
+
+                let fallback_selector = "article,main,[role=main]";
+
+                match extraction::html::HtmlExtractor::extract(&html, fallback_selector) {
+                    Ok(extracted) => {
+                        let (content, truncated) = if max_chars < extracted.content.len() {
+                            let end = max_chars.min(extracted.content.len());
+                            (extracted.content[..end].to_string(), true)
+                        } else {
+                            (extracted.content, false)
+                        };
+
+                        let quality = ContentQuality::validate(&content);
+                        let _ = tab.close(&mut conn).await;
+                        Ok(FollowResult {
+                            url,
+                            content: Some(content),
+                            total_length: extracted.total_length,
+                            offset: 0,
+                            sections: extracted.sections,
+                            error: None,
+                            quality: Some(quality),
+                            success: true,
+                            truncated,
+                        })
+                    }
+                    Err(e) => {
+                        let _ = tab.close(&mut conn).await;
+                        Ok(FollowResult {
+                            url,
+                            content: None,
+                            total_length: 0,
+                            offset: 0,
+                            sections: Vec::new(),
+                            error: Some(format!("Extract: {e}")),
+                            quality: None,
+                            success: false,
+                            truncated: false,
+                        })
+                    }
+                }
+            });
+        }
+
+        let mut read_pages: Vec<FollowResult> = Vec::with_capacity(top_urls.len());
+        let mut pages_skipped = 0usize;
+
+        while let Some(task_result) = follow_set.join_next().await {
+            match task_result {
+                Ok(Ok(result)) => {
+                    if !result.success {
+                        pages_skipped += 1;
+                    }
+                    read_pages.push(result);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(join_err) => {
+                    return Err(GthingsError::Cdp(format!(
+                        "Follow task join failed: {join_err}"
+                    )));
                 }
             }
         }
@@ -498,7 +676,6 @@ mod tests {
     fn test_batch_processor_creation() {
         let config = GthingsConfig::default();
         let bp = BatchProcessor::new(config);
-        // Just verify it doesn't panic
         let _ = bp;
     }
 }

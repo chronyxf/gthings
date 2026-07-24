@@ -3,9 +3,10 @@
 //! Provides [`PageFollower`] which fetches a URL via Chrome DevTools Protocol (CDP),
 //! extracts content using CSS selectors, validates quality, and caches results locally.
 
+use std::borrow::Cow;
 use std::time::Instant;
 
-use cdp::{Browser, Tab};
+use cdp::{Browser, Connection, Tab};
 
 use common::GthingsError;
 use common::cache::Sha256DiskCache;
@@ -16,8 +17,6 @@ use extraction::quality::ContentQuality;
 
 use crate::types::{FollowOpts, FollowResult};
 
-// Helpers
-
 /// Normalise arXiv PDF URLs to their abstract-page equivalents.
 ///
 /// Only applies to arxiv.org (including subdomains like export.arxiv.org).
@@ -25,30 +24,77 @@ use crate::types::{FollowOpts, FollowResult};
 /// - `https://export.arxiv.org/pdf/2301.12345.pdf` → `https://arxiv.org/abs/2301.12345`
 /// - `https://arxiv.org/pdf/2301.12345.pdf` → `https://arxiv.org/abs/2301.12345`
 /// - `https://arxiv.org/pdf/2301.12345` → `https://arxiv.org/abs/2301.12345`
-fn normalise_arxiv_url(url: &str) -> String {
+fn normalise_arxiv_url<'a>(url: &'a str) -> Cow<'a, str> {
     let url = url.trim();
-    // Only apply to arxiv.org (and subdomains like export.arxiv.org)
+
+    // Fast path: non-arxiv URLs — return borrowed, zero allocation
     if !url.contains("arxiv.org") {
-        return url.to_string();
+        return Cow::Borrowed(url);
     }
-    // export.arxiv.org -> arxiv.org
-    let url = url.replace("export.arxiv.org", "arxiv.org");
-    // /pdf/ -> /abs/
-    let url = url.replace("/pdf/", "/abs/");
-    // Strip .pdf suffix
-    if let Some(stripped) = url.strip_suffix(".pdf") {
-        return stripped.to_string();
+
+    // Determine which transformations are needed on the original URL
+    let has_export = url.contains("export.arxiv.org");
+    let has_pdf_slash = url.contains("/pdf/");
+    let has_pdf_suffix = url.ends_with(".pdf");
+
+    // Already a clean arXiv abs URL — zero allocation
+    if !has_export && !has_pdf_slash && !has_pdf_suffix {
+        return Cow::Borrowed(url);
     }
-    url
+
+    // Only .pdf suffix stripping — single allocation
+    if has_pdf_suffix && !has_export && !has_pdf_slash {
+        return Cow::Owned(url.strip_suffix(".pdf").unwrap().to_string());
+    }
+
+    // Multi-transform: chain from most to least specific
+    let s = if has_export {
+        let s = url.replacen("export.arxiv.org", "arxiv.org", 1);
+        if has_pdf_slash {
+            s.replacen("/pdf/", "/abs/", 1)
+        } else {
+            s
+        }
+    } else {
+        // Only has_pdf_slash is true (has_pdf_suffix handled above)
+        url.replacen("/pdf/", "/abs/", 1)
+    };
+
+    if has_pdf_suffix {
+        if let Some(stripped) = s.strip_suffix(".pdf") {
+            return Cow::Owned(stripped.to_string());
+        }
+    }
+
+    Cow::Owned(s)
 }
 
-// PageFollower
+/// Wait for page load by polling `document.readyState` at 100ms intervals.
+/// Returns when `"complete"` plus a 200ms rendering buffer, or on timeout.
+async fn wait_for_page_load(
+    tab: &Tab,
+    conn: &mut Connection,
+    timeout: std::time::Duration,
+) -> Result<(), cdp::error::CdpError> {
+    let start = std::time::Instant::now();
+    loop {
+        let result = tab.evaluate(conn, "document.readyState").await?;
+        let ready = result["result"]["value"].as_str();
+        if ready == Some("complete") {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
 
 /// Page follower with caching and quality validation.
 ///
-/// Fetches web pages via an ephemeral Chrome CDP instance, extracts structured
-/// content using CSS selectors via [`HtmlExtractor`], checks quality, and
-/// persists results in a disk cache.
+/// Fetches pages via ephemeral Chrome CDP, extracts structured content
+/// with [`HtmlExtractor`], checks quality, and persists to disk cache.
 pub struct PageFollower {
     cache: Sha256DiskCache,
 }
@@ -58,6 +104,51 @@ impl PageFollower {
     pub fn new(config: GthingsConfig) -> Self {
         let cache = Sha256DiskCache::new(&config.cache_dir, config.cache_ttl_secs);
         Self { cache }
+    }
+
+    /// Internal helper: follow a URL with cache check + set.
+    async fn follow_impl(
+        &self,
+        url: &str,
+        opts: &FollowOpts,
+        trace: Option<&mut TraceWriter>,
+    ) -> Result<FollowResult, GthingsError> {
+        let start = Instant::now();
+
+        // 1. Normalise arXiv URLs
+        let normalised = normalise_arxiv_url(url);
+
+        // 2. Check cache
+        let cache_key = self.cache.key(&normalised, opts.offset, opts.max_length);
+        if let Some(cached_json) = self.check_cache(&cache_key).await {
+            tracing::debug!(url = %normalised, "follow: cache hit");
+            let mut result = Self::parse_follow_result_json(&cached_json)?;
+            result.quality = Some(ContentQuality::validate(
+                result.content.as_deref().unwrap_or(""),
+            ));
+            return Ok(result);
+        }
+
+        // 3. Fetch page content (with retry on low quality)
+        let result = self.follow_inner(&normalised, opts, trace).await?;
+
+        // 4. Cache the result
+        if result.content.is_some() {
+            if let Ok(json) = serde_json::to_string(&result) {
+                self.cache.set(&cache_key, &json).await;
+            }
+        }
+
+        let elapsed = start.elapsed().as_millis() as u64;
+        tracing::debug!(
+            url = %normalised,
+            success = result.success,
+            len = result.content.as_ref().map(|c| c.len()).unwrap_or(0),
+            elapsed_ms = elapsed,
+            "follow: done"
+        );
+
+        Ok(result)
     }
 
     /// Follow a single URL and extract page content.
@@ -82,42 +173,7 @@ impl PageFollower {
         opts: FollowOpts,
         trace: Option<&mut TraceWriter>,
     ) -> Result<FollowResult, GthingsError> {
-        let start = Instant::now();
-
-        // 1. Normalise arXiv URLs
-        let normalised = normalise_arxiv_url(url);
-
-        // 2. Check cache (uses FollowResult for validation)
-        let cache_key = self.cache.key(&normalised, opts.offset, opts.max_length);
-        if let Some(cached_json) = self.check_cache(&cache_key) {
-            tracing::debug!(url = %normalised, "follow: cache hit");
-            let mut result = Self::parse_follow_result_json(&cached_json)?;
-            result.quality = Some(ContentQuality::validate(
-                result.content.as_deref().unwrap_or(""),
-            ));
-            return Ok(result);
-        }
-
-        // 3. Fetch page content (with retry on low quality)
-        let result = self.follow_inner(&normalised, &opts, trace).await?;
-
-        // 4. Cache the result
-        if result.content.is_some() {
-            if let Ok(json) = serde_json::to_string(&result) {
-                self.cache.set(&cache_key, &json);
-            }
-        }
-
-        let elapsed = start.elapsed().as_millis() as u64;
-        tracing::debug!(
-            url = %normalised,
-            success = result.success,
-            len = result.content.as_ref().map(|c| c.len()).unwrap_or(0),
-            elapsed_ms = elapsed,
-            "follow: done"
-        );
-
-        Ok(result)
+        self.follow_impl(url, &opts, trace).await
     }
 
     /// Inner fetch-and-validate with optional retry.
@@ -190,15 +246,18 @@ impl PageFollower {
         }
 
         // Wait for JS rendering
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let timeout = std::time::Duration::from_millis(opts.timeout_ms);
+        wait_for_page_load(&tab, &mut conn, timeout)
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("WaitLoad: {e}")))?;
 
-        // 3c. Extract title
+        // Extract title
         let _title = tab
             .extract_title(&mut conn)
             .await
             .map_err(|e| GthingsError::Cdp(format!("Title: {e}")))?;
 
-        // 3d. Extract HTML and use HtmlExtractor for content + sections
+        // Extract HTML and parse with HtmlExtractor
         let html = tab
             .extract_html(&mut conn)
             .await
@@ -217,7 +276,7 @@ impl PageFollower {
         let total_length = extracted.total_length;
         let sections = extracted.sections;
 
-        // 3e. Apply offset and max_length truncation
+        // Apply offset and max_length truncation
         let (content, truncated) = if opts.offset > 0 || opts.max_length < full_text.len() {
             let start = opts.offset.min(full_text.len());
             let end = (start + opts.max_length).min(full_text.len());
@@ -227,23 +286,23 @@ impl PageFollower {
             (full_text, false)
         };
 
-        let mut result = FollowResult {
-            success: !content.is_empty(),
+        // Quality gate — validate BEFORE moving content
+        let quality = ContentQuality::validate(&content);
+        let is_success = !content.is_empty();
+
+        let result = FollowResult {
             url: url.to_string(),
-            content: Some(content.clone()),
+            content: Some(content),
             total_length,
             offset: opts.offset,
-            truncated,
             sections,
             error: None,
-            quality: None,
+            quality: Some(quality.clone()),
+            success: is_success,
+            truncated,
         };
 
-        // 3f. Quality gate
-        let quality = ContentQuality::validate(&content);
-        result.quality = Some(quality.clone());
-
-        // Trace: extraction result
+        // Trace extraction result
         if let Some(ref mut t) = trace {
             t.step(
                 "session",
@@ -251,7 +310,7 @@ impl PageFollower {
                 "follow",
                 "extract",
                 Some(url),
-                0, // duration accounted per-step
+                0,
                 None,
                 Some(serde_json::json!({
                     "content_length": total_length,
@@ -262,7 +321,7 @@ impl PageFollower {
             );
         }
 
-        // 3g. Retry on low quality with body selector fallback
+        // Retry on low quality with body selector fallback
         if !quality.is_ok && opts.retry_on_low_quality && ContentQuality::needs_recrawl(&quality) {
             tracing::debug!(
                 url = %url,
@@ -271,7 +330,6 @@ impl PageFollower {
                 "follow: low quality, retrying with body selector"
             );
 
-            // Re-extract with body selector (tab still on the page)
             let retry_html = tab
                 .extract_html(&mut conn)
                 .await
@@ -295,15 +353,15 @@ impl PageFollower {
                 if retry_quality.is_ok {
                     let _ = tab.close(&mut conn).await;
                     return Ok(FollowResult {
-                        success: true,
                         url: url.to_string(),
                         content: Some(retry_content),
                         total_length: retry_total_length,
                         offset: opts.offset,
-                        truncated: retry_truncated,
                         sections: retry_sections,
                         error: None,
                         quality: Some(retry_quality),
+                        success: true,
+                        truncated: retry_truncated,
                     });
                 }
             }
@@ -351,7 +409,7 @@ impl PageFollower {
         let mut results = Vec::with_capacity(urls.len());
 
         for url in urls {
-            let result = self.follow(url, opts.clone(), trace.as_deref_mut()).await?;
+            let result = self.follow_impl(url, &opts, trace.as_deref_mut()).await?;
             results.push(result);
         }
 
@@ -368,10 +426,9 @@ impl PageFollower {
     // Private helpers
 
     /// Check the disk cache for a previously stored result.
-    fn check_cache(&self, key: &str) -> Option<String> {
-        match self.cache.get(key) {
+    async fn check_cache(&self, key: &str) -> Option<String> {
+        match self.cache.get(key).await {
             Ok(Some(data)) => {
-                // Validate that the cached JSON can be parsed as a FollowResult.
                 if serde_json::from_str::<FollowResult>(&data).is_ok() {
                     return Some(data);
                 }
@@ -386,7 +443,7 @@ impl PageFollower {
         }
     }
 
-    /// Parse a cached JSON string directly into a [`FollowResult`].
+    /// Parse a cached JSON string into a [`FollowResult`].
     fn parse_follow_result_json(json: &str) -> Result<FollowResult, GthingsError> {
         serde_json::from_str::<FollowResult>(json).map_err(|e| {
             GthingsError::Parse(format!(
@@ -415,7 +472,6 @@ mod tests {
 
     #[test]
     fn test_normalise_non_arxiv_unchanged() {
-        // Non-arxiv URLs (even with .pdf) should be left alone
         let url = "https://example.com/paper.pdf";
         assert_eq!(normalise_arxiv_url(url), url);
     }

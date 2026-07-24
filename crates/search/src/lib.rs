@@ -4,7 +4,6 @@
 //! # Modules
 //!
 //! | Module | Description |
-
 //! | [`types`] | Shared data types for search, follow, and batch operations |
 //! | [`search`] | Google search via ephemeral Chrome CDP sessions |
 //! | [`follow`] | Page following and content extraction with caching & quality gates |
@@ -19,7 +18,6 @@ pub mod follow;
 pub mod search;
 pub mod types;
 
-// Re-exports for convenience
 pub use batch::BatchProcessor;
 pub use follow::PageFollower;
 pub use search::GoogleSearch;

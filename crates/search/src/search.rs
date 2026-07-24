@@ -1,8 +1,8 @@
 //! Google search implementation.
 //!
 //! Provides [`GoogleSearch`] for executing web searches via Google.
-//! Each search launches an ephemeral Chrome instance, navigates to Google's
-//! SERP, and extracts organic results via CDP JavaScript evaluation.
+//! Each search launches an ephemeral Chrome instance, navigates to the
+//! Google SERP, and extracts organic results via CDP JavaScript evaluation.
 
 use std::cmp::Reverse;
 use std::time::Instant;
@@ -14,8 +14,6 @@ use common::config::GthingsConfig;
 use common::trace::TraceWriter;
 
 use crate::types::{BatchSearchResult, SearchMeta, SearchResult};
-
-// GoogleSearch
 
 /// Google web search client.
 ///
@@ -32,8 +30,8 @@ impl GoogleSearch {
 
     /// Execute a single Google search query.
     ///
-    /// Launches an ephemeral Chrome, navigates to `google.com/search`,
-    /// and extracts organic results via CDP JavaScript evaluation.
+    /// Launches Chrome, navigates to `google.com/search`, extracts
+    /// organic results via CDP JavaScript evaluation.
     ///
     /// # Errors
     ///
@@ -210,11 +208,10 @@ impl GoogleSearch {
 
         let search_results: Vec<SearchResult> = items
             .into_iter()
-            .map(|item| SearchResult {
-                title: item["title"].as_str().unwrap_or("").to_string(),
-                url: item["url"].as_str().unwrap_or("").to_string(),
-                snippet: item["snippet"].as_str().unwrap_or("").to_string(),
-                query: Some(q.to_string()),
+            .map(|item| {
+                let mut result: SearchResult = serde_json::from_value(item).unwrap_or_default();
+                result.query = Some(q.to_string());
+                result
             })
             .collect();
 
@@ -320,7 +317,6 @@ impl GoogleSearch {
         let mut seen = std::collections::HashSet::new();
         all_results.retain(|r| seen.insert(r.url.clone()));
 
-        // Sort by snippet length descending
         all_results.sort_by_key(|k| Reverse(k.snippet.len()));
 
         let elapsed = start.elapsed().as_millis() as u64;

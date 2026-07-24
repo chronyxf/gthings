@@ -1,45 +1,37 @@
 // Integration tests for gthings library crates.
-// Tests cover internal logic: cache, extraction, quality, types.
-//
-// Run: cargo test --test integration
 
 mod common;
 
 use ::common::cache::Sha256DiskCache;
 use extraction::html::HtmlExtractor;
-use extraction::quality::{ContentQuality, QualityResult};
+use extraction::quality::{ContentQuality, QualityReason, QualityResult};
 
-// CACHE TESTS (common::Sha256DiskCache)
+// Cache tests
 
 #[test]
 fn test_cache_key_generation() {
     let cache = Sha256DiskCache::new("/tmp/gthings-test-cache", 3600);
     let key = cache.key("https://example.com", 0, 15000);
     assert!(!key.is_empty(), "Cache key should not be empty");
-    // Same inputs produce same key
     let key2 = cache.key("https://example.com", 0, 15000);
     assert_eq!(key, key2, "Same inputs should produce same key");
-    // Different inputs produce different keys
     let key3 = cache.key("https://example.com", 100, 15000);
     assert_ne!(key, key3, "Different offset should produce different key");
 }
 
-#[test]
-fn test_cache_set_and_get() {
+#[tokio::test]
+async fn test_cache_set_and_get() {
     let tmp = std::env::temp_dir().join("gthings-int-cache-test");
     let _ = std::fs::remove_dir_all(&tmp);
     let cache = Sha256DiskCache::new(&tmp, 3600);
     let key = cache.key("https://test.cache/test", 0, 100);
 
-    // Miss
-    let miss = cache.get(&key).unwrap();
+    let miss = cache.get(&key).await.unwrap();
     assert!(miss.is_none(), "New cache key should miss");
 
-    // Set
-    cache.set(&key, "test data");
+    cache.set(&key, "test data").await;
 
-    // Hit
-    let hit = cache.get(&key).unwrap();
+    let hit = cache.get(&key).await.unwrap();
     assert_eq!(
         hit,
         Some("test data".to_string()),
@@ -47,17 +39,16 @@ fn test_cache_set_and_get() {
     );
 }
 
-#[test]
-fn test_cache_ttl_expiry() {
+#[tokio::test]
+async fn test_cache_ttl_expiry() {
     let tmp = std::env::temp_dir().join("gthings-int-cache-ttl");
     let _ = std::fs::remove_dir_all(&tmp);
-    // TTL = 0 means every read expires immediately
+    // TTL=0 means immediate expiry
     let cache = Sha256DiskCache::new(&tmp, 0);
     let key = cache.key("https://test.expiry/test", 0, 100);
 
-    cache.set(&key, "expirable data");
-    // With TTL=0, the cache should see this as expired
-    let hit = cache.get(&key).unwrap();
+    cache.set(&key, "expirable data").await;
+    let hit = cache.get(&key).await.unwrap();
     assert!(
         hit.is_none(),
         "TTL=0 should expire immediately. Got: {:?}",
@@ -65,19 +56,17 @@ fn test_cache_ttl_expiry() {
     );
 }
 
-#[test]
-fn test_cache_persists_across_instances() {
+#[tokio::test]
+async fn test_cache_persists_across_instances() {
     let tmp = std::env::temp_dir().join("gthings-int-cache-persist");
     let _ = std::fs::remove_dir_all(&tmp);
 
-    // Write with one instance
     let cache1 = Sha256DiskCache::new(&tmp, 3600);
     let key = cache1.key("https://persist.test/data", 0, 50);
-    cache1.set(&key, "persistent data");
+    cache1.set(&key, "persistent data").await;
 
-    // Read with another instance
     let cache2 = Sha256DiskCache::new(&tmp, 3600);
-    let hit = cache2.get(&key).unwrap();
+    let hit = cache2.get(&key).await.unwrap();
     assert_eq!(
         hit,
         Some("persistent data".to_string()),
@@ -85,7 +74,7 @@ fn test_cache_persists_across_instances() {
     );
 }
 
-// HTML EXTRACTION TESTS (extraction::HtmlExtractor)
+// HTML extraction tests
 
 #[test]
 fn test_html_extract_sections() {
@@ -177,7 +166,7 @@ fn test_detect_sections_colon_heading() {
     assert!(!sections.is_empty(), "Should detect colon headings");
 }
 
-// QUALITY VALIDATION TESTS (extraction::ContentQuality)
+// Quality validation tests
 
 #[test]
 fn test_quality_valid_content() {
@@ -194,14 +183,14 @@ fn test_quality_empty_content() {
     let result = ContentQuality::validate("");
     assert!(!result.is_ok, "Empty should fail");
     assert_eq!(result.score, 0.0);
-    assert!(result.reasons.contains(&"empty_content".to_string()));
+    assert!(result.reasons.contains(&QualityReason::EmptyContent));
 }
 
 #[test]
 fn test_quality_too_short() {
     let result = ContentQuality::validate("Hi");
     assert!(!result.is_ok);
-    assert!(result.reasons.contains(&"too_short".to_string()));
+    assert!(result.reasons.contains(&QualityReason::TooShort));
 }
 
 #[test]
@@ -250,7 +239,7 @@ fn test_quality_needs_recrawl() {
     let low = QualityResult {
         score: 0.2,
         is_ok: false,
-        reasons: vec!["too_short".into()],
+        reasons: vec![QualityReason::TooShort],
         length: 10,
     };
     assert!(ContentQuality::needs_recrawl(&low));
@@ -274,17 +263,15 @@ fn test_quality_secondary_check() {
     assert!(r.repetitive, "Repeated content should be detected");
 }
 
-// SEARCH TYPE TESTS (search::types)
+// Search type tests
 
 #[test]
 fn test_follow_result_serialization() {
     let result = search::types::FollowResult {
-        success: true,
         url: "https://example.com".into(),
         content: Some("test content".into()),
         total_length: 12,
         offset: 0,
-        truncated: false,
         sections: vec![extraction::html::Section {
             heading: "Title".into(),
             content: "Body text".into(),
@@ -296,6 +283,8 @@ fn test_follow_result_serialization() {
             reasons: vec![],
             length: 12,
         }),
+        success: true,
+        truncated: false,
     };
 
     let json = serde_json::to_string(&result).unwrap();

@@ -1,10 +1,38 @@
 /// Content quality validation and bot/captcha/paywall detection.
 ///
-/// Ported from `skills/cdp/scripts/quality.ts`.
-/// All functions are PURE: same inputs → same outputs. No I/O, no side effects.
-/// Operates on extracted text content, not DOM.
+/// Pure functions operating on extracted text content, not DOM.
 use regex::Regex;
 use std::sync::OnceLock;
+
+/// Reason for a quality check failure.
+///
+/// Used in [`QualityResult::reasons`] to indicate why content failed
+/// the quality gate. Each variant corresponds to a single static string
+/// — no heap allocation required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityReason {
+    /// Content is completely empty.
+    EmptyContent,
+    /// Content is too short to be useful (< 80 chars).
+    TooShort,
+    /// Matched a browser error page pattern (e.g. "This site can't be reached").
+    BrowserErrorPage,
+    /// Matched a connection error pattern (e.g. ERR_CONNECTION).
+    ConnectionError,
+    /// Matched a 404 Not Found pattern.
+    NotFound,
+    /// Content is whitespace-only.
+    WhitespaceOnly,
+    /// Content is a paywall teaser (e.g. "Read More »").
+    PaywallTeaser,
+    /// Content is navigation chrome (short, no natural language).
+    NavigationChrome,
+    /// Content has too few words (< 15 words in short text).
+    TooFewWords,
+    /// Content has no punctuation (suggests machine output).
+    NoPunctuation,
+}
 
 /// Result of a content quality validation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -14,7 +42,7 @@ pub struct QualityResult {
     /// Whether the content passes the quality gate (score >= 0.5).
     pub is_ok: bool,
     /// List of reasons why content failed quality checks.
-    pub reasons: Vec<String>,
+    pub reasons: Vec<QualityReason>,
     /// Length of the input text that was validated.
     pub length: usize,
 }
@@ -32,60 +60,39 @@ pub struct SecondaryResult {
     pub suspicious_short: bool,
 }
 
-/// Content quality validation and bot/captcha/paywall detection.
-///
-/// All methods are stateless — they operate purely on input text and return
-/// deterministic results.
+/// Content quality validation — all methods are stateless.
 pub struct ContentQuality;
 
 impl ContentQuality {
     // Error page patterns (shared with detect methods)
 
-    fn error_page_reasons() -> &'static [(Regex, &'static str)] {
-        static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    fn error_page_reasons() -> &'static [(Regex, QualityReason)] {
+        static PATTERNS: OnceLock<Vec<(Regex, QualityReason)>> = OnceLock::new();
         PATTERNS.get_or_init(|| {
             vec![
                 (
                     Regex::new(r"(?i)This site can't be reached").expect("valid regex"),
-                    "browser_error_page",
+                    QualityReason::BrowserErrorPage,
                 ),
                 (
                     Regex::new(r"ERR_CONNECTION").expect("valid regex"),
-                    "connection_error",
+                    QualityReason::ConnectionError,
                 ),
                 (
                     Regex::new(r"404 Not Found").expect("valid regex"),
-                    "not_found",
+                    QualityReason::NotFound,
                 ),
                 (
                     Regex::new(r"^\s*$").expect("valid regex"),
-                    "whitespace_only",
+                    QualityReason::WhitespaceOnly,
                 ),
             ]
         })
     }
 
-    /// Validate extracted text content.
+    /// Validate extracted text content (length, error patterns, word count, punctuation).
     ///
-    /// Checks: minimum length, error page patterns, paywall teasers,
-    /// navigation chrome, word count, punctuation, and natural language
-    /// indicators (long words, paragraphs).
-    ///
-    /// Returns a [`QualityResult`] with a score from 0.0 to 1.0 and a list
-    /// of failure reasons.
-    ///
-    /// Content is considered acceptable (`is_ok == true`) when score >= 0.5.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use extraction::ContentQuality;
-    /// let text = "This is a sufficiently long piece of text with natural language. \
-    /// It has sentences, punctuation, and enough words to pass the quality gate. \
-    /// This content should be considered acceptable for AI processing.";
-    /// let result = ContentQuality::validate(text);
-    /// assert!(result.is_ok);
-    /// ```
+    /// Returns a [`QualityResult`] with a score from 0.0 to 1.0. Content passes when score >= 0.5.
     pub fn validate(text: &str) -> QualityResult {
         let length = text.len();
 
@@ -93,7 +100,7 @@ impl ContentQuality {
             return QualityResult {
                 score: 0.0,
                 is_ok: false,
-                reasons: vec!["empty_content".to_string()],
+                reasons: vec![QualityReason::EmptyContent],
                 length: 0,
             };
         }
@@ -103,45 +110,45 @@ impl ContentQuality {
         } else {
             text
         };
-        let mut reasons: Vec<String> = Vec::new();
+        let mut reasons: Vec<QualityReason> = Vec::new();
         let mut score = 1.0_f64;
 
         // Too short to be useful (< 80 chars)
         if slice.len() < 80 {
-            reasons.push("too_short".to_string());
+            reasons.push(QualityReason::TooShort);
             score -= 0.4;
         }
 
         // Browser error pages / empty shell (shared patterns)
         for (pattern, reason) in Self::error_page_reasons() {
             if pattern.is_match(slice) {
-                reasons.push((*reason).to_string());
+                reasons.push(*reason);
                 score -= 0.5;
             }
         }
 
         // Paywall teaser: "Read More »" as entire content
         if slice == "Read More \u{00bb}" {
-            reasons.push("paywall_teaser".to_string());
+            reasons.push(QualityReason::PaywallTeaser);
             score -= 0.5;
         }
 
         // Navigation chrome: short content with no natural language (no quotes)
         if slice.len() < 100 && !slice.contains('"') {
-            reasons.push("navigation_chrome".to_string());
+            reasons.push(QualityReason::NavigationChrome);
             score -= 0.3;
         }
 
         // Very few words suggests empty shell
         let word_count = slice.split_whitespace().count();
         if word_count < 15 && slice.len() < 200 {
-            reasons.push("too_few_words".to_string());
+            reasons.push(QualityReason::TooFewWords);
             score -= 0.2;
         }
 
         // No punctuation suggests machine output
         if slice.len() > 100 && !regex_has_punctuation(slice) {
-            reasons.push("no_punctuation".to_string());
+            reasons.push(QualityReason::NoPunctuation);
             score -= 0.1;
         }
 
@@ -228,7 +235,6 @@ impl ContentQuality {
     /// Returns `true` if the text appears to be an empty page shell that
     /// requires JavaScript to render actual content.
     pub fn detect_empty_shell(text: &str) -> bool {
-        // Too short to have meaningful content
         if text.len() < 80 {
             return true;
         }
@@ -250,10 +256,7 @@ impl ContentQuality {
         false
     }
 
-    /// Determine whether a URL should be recrawled with different parameters.
-    ///
-    /// Returns `true` when the quality score is low enough that a retry
-    /// with different configuration might yield better results.
+    /// Whether a URL should be recrawled with different parameters.
     pub fn needs_recrawl(result: &QualityResult) -> bool {
         // Very low quality — definitely retry
         if result.score < 0.3 {
@@ -262,12 +265,12 @@ impl ContentQuality {
 
         // Borderline — retry if the reason suggests a params issue
         if result.score < 0.5 {
-            let retryable = ["too_short", "too_few_words", "navigation_chrome"];
-            if result
-                .reasons
-                .iter()
-                .any(|r| retryable.contains(&r.as_str()))
-            {
+            let retryable = [
+                QualityReason::TooShort,
+                QualityReason::TooFewWords,
+                QualityReason::NavigationChrome,
+            ];
+            if result.reasons.iter().any(|r| retryable.contains(r)) {
                 return true;
             }
         }
@@ -275,15 +278,7 @@ impl ContentQuality {
         false
     }
 
-    /// Secondary quality check on already-cleaned content.
-    ///
-    /// More lenient than [`validate`] — intended for use after the primary
-    /// quality gate has already filtered obvious junk. Checks for:
-    ///
-    /// - **Truncation**: content ends mid-sentence.
-    /// - **Suspicious short**: very short with redirect/loading keywords.
-    /// - **Sparse content**: fewer than 20 words.
-    /// - **Repetitive content**: unique sentences < 50% of total sentences.
+    /// Secondary check on already-cleaned content (truncation, repetition, sparseness).
     pub fn secondary_check(text: &str) -> SecondaryResult {
         if text.is_empty() {
             return SecondaryResult {
@@ -299,7 +294,7 @@ impl ContentQuality {
         let mut sparse = false;
         let mut suspicious_short = false;
 
-        // Truncation detection: ends mid-sentence (last char is not sentence-ending)
+        // Ends mid-sentence
         let trimmed = text.trim();
         if trimmed.len() > 100 {
             let last_char = trimmed.chars().last().unwrap_or(' ');
@@ -316,7 +311,7 @@ impl ContentQuality {
             }
         }
 
-        // Still too short — check for suspicious patterns
+        // Suspicious short content
         if text.len() < 80 {
             static SUS_RE: OnceLock<Regex> = OnceLock::new();
             let sus_re = SUS_RE.get_or_init(|| {
@@ -332,13 +327,13 @@ impl ContentQuality {
             }
         }
 
-        // Low word density suggests sparse content
+        // Sparse content
         let words: Vec<&str> = text.split_whitespace().collect();
         if words.len() < 20 && !text.is_empty() {
             sparse = true;
         }
 
-        // Check for repetitive content (same sentence appearing many times)
+        // Repetitive content
         let sentences: Vec<&str> = text
             .split(['.', '!', '?'])
             .filter(|s| s.trim().len() > 20)
@@ -362,8 +357,6 @@ impl ContentQuality {
         }
     }
 }
-
-// Private helpers
 
 /// Check if text contains sentence-ending punctuation.
 fn regex_has_punctuation(text: &str) -> bool {
@@ -406,14 +399,14 @@ mod tests {
         let result = ContentQuality::validate("");
         assert!(!result.is_ok);
         assert_eq!(result.score, 0.0);
-        assert!(result.reasons.contains(&"empty_content".to_string()));
+        assert!(result.reasons.contains(&QualityReason::EmptyContent));
     }
 
     #[test]
     fn test_validate_too_short() {
         let result = ContentQuality::validate("Hi");
         assert!(!result.is_ok);
-        assert!(result.reasons.contains(&"too_short".to_string()));
+        assert!(result.reasons.contains(&QualityReason::TooShort));
     }
 
     #[test]
@@ -464,7 +457,7 @@ mod tests {
         let low = QualityResult {
             score: 0.2,
             is_ok: false,
-            reasons: vec!["too_short".into()],
+            reasons: vec![QualityReason::TooShort],
             length: 10,
         };
         assert!(ContentQuality::needs_recrawl(&low));
@@ -472,7 +465,7 @@ mod tests {
         let borderline = QualityResult {
             score: 0.4,
             is_ok: false,
-            reasons: vec!["too_short".into()],
+            reasons: vec![QualityReason::TooShort],
             length: 50,
         };
         assert!(ContentQuality::needs_recrawl(&borderline));
@@ -480,7 +473,7 @@ mod tests {
         let bad_reason = QualityResult {
             score: 0.4,
             is_ok: false,
-            reasons: vec!["paywall_teaser".into()],
+            reasons: vec![QualityReason::PaywallTeaser],
             length: 50,
         };
         assert!(!ContentQuality::needs_recrawl(&bad_reason));

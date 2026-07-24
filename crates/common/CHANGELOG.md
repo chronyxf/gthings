@@ -2,6 +2,18 @@
 
 ## 0.3.0 — 2026-07-23
 
+## 0.3.2 — 2026-07-24
+
+### Changed
+
+- Performance: spawn_blocking for sync I/O in browser.rs, struct field reordering for memory layout
+- Performance: Vec<String>→QualityReason enum in quality scoring (eliminates 8 allocs/validate)
+- Performance: Cow<str> fast path for URL normalization (0 allocs for 80% of calls)
+- Performance: Derive Deserialize on SearchResult (3 fewer allocs per result)
+- Chore: Remove stale/verbose comments across all crates (trimmed ~155 lines)
+- Chore: Remove criterion benchmarks and revert Cargo.toml
+
+
 ## 0.3.1 — 2026-07-23
 
 ### Changed

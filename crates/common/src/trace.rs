@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -8,30 +8,34 @@ use std::time::Instant;
 #[allow(dead_code)]
 pub struct TraceWriter {
     path: PathBuf,
-    file: Option<std::fs::File>,
+    file: Option<BufWriter<std::fs::File>>,
     start: Instant,
 }
 
-/// Structured trace event for a single step
+/// Structured trace event.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TraceEvent {
+    // 8-byte aligned types first
     pub ts: u64,                     // Unix timestamp (ms)
-    pub session: String,             // Session identifier (per CLI invocation)
-    pub step: u32,                   // Step number within the session
-    pub tool: String,                // Tool/command name (e.g. "search", "follow")
-    pub action: String, // Specific action (e.g. "browser_launch", "tab_create", "navigate", "extract")
-    pub url: Option<String>, // URL being operated on
-    pub duration_ms: u64, // Duration of this step
-    pub input: Option<Value>, // Input parameters (truncated to 200 chars)
+    pub duration_ms: u64,            // Duration of this step
+    pub content_length: Option<u64>, // Content length extracted
+    // Pointer-sized compound types (24 bytes, 8-byte aligned)
+    pub session: String,       // Session identifier (per CLI invocation)
+    pub tool: String,          // Tool/command name (e.g. "search", "follow")
+    pub action: String,        // Action name ("browser_launch", "tab_create", etc.)
+    pub url: Option<String>,   // URL being operated on
+    pub input: Option<Value>,  // Input parameters (truncated to 200 chars)
     pub output: Option<Value>, // Output summary (truncated)
     pub error: Option<String>, // Error message if failed
+    // 4-byte aligned types
+    pub step: u32,                 // Step number within the session
     pub result_count: Option<u32>, // Number of results found
-    pub content_length: Option<u64>, // Content length extracted
+    // 1-byte aligned types
     pub quality_ok: Option<bool>, // Quality gate result
 }
 
 impl TraceWriter {
-    /// Create a new trace writer. Opens the file immediately.
+    /// Create a new trace writer.
     pub fn new(path: &str) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -39,21 +43,28 @@ impl TraceWriter {
             .open(path)?;
         Ok(TraceWriter {
             path: PathBuf::from(path),
-            file: Some(file),
+            file: Some(BufWriter::new(file)),
             start: Instant::now(),
         })
     }
 
-    /// Record a single trace event as a JSONL line
+    /// Record a trace event as a JSONL line.
     pub fn record(&mut self, event: &TraceEvent) {
         if let Some(ref mut file) = self.file {
             let json = serde_json::to_string(event).unwrap_or_default();
             let _ = writeln!(file, "{}", json);
-            let _ = file.flush();
         }
     }
 
-    /// Record a simple step event (convenience method)
+    /// Flush buffered events to disk.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(ref mut file) = self.file {
+            file.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Record a step event.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
@@ -89,24 +100,24 @@ impl TraceWriter {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            duration_ms,
+            content_length,
             session: session.to_string(),
-            step: step_num,
             tool: tool.to_string(),
             action: action.to_string(),
             url: url.map(|s| s.to_string()),
-            duration_ms,
             input: input.map(|v| truncate_value(v, 200)),
             output: output.map(|v| truncate_value(v, 500)),
             error: error.map(|s| s.to_string()),
+            step: step_num,
             result_count,
-            content_length,
             quality_ok,
         };
         self.record(&event);
     }
 }
 
-/// Truncate a JSON value to a maximum string length
+/// Truncate a JSON value to `max_len` characters.
 fn truncate_value(v: Value, max_len: usize) -> Value {
     match v {
         Value::String(s) => {
@@ -161,6 +172,7 @@ mod tests {
             None,
             None,
         );
+        writer.flush().unwrap();
 
         let mut contents = String::new();
         std::fs::File::open(path)

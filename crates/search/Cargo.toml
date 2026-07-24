@@ -1,6 +1,6 @@
 [package]
 name = "search"
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,7 +17,6 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
-rand = "0.8"
 urlencoding = "2"
 
 [lints]

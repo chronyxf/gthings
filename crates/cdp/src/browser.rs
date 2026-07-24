@@ -21,9 +21,8 @@ struct BrowserState {
 
 impl Browser {
     /// Launch or reuse a persistent Chrome browser on port 9222.
-    /// If browser is already running, returns immediately.
+    #[allow(clippy::result_large_err)]
     pub async fn launch() -> Result<Self> {
-        // Check if browser already running
         tracing::info!("Checking for existing browser on port 9222");
         if let Some(browser) = Self::find_existing().await {
             tracing::info!("Found existing browser, reusing");
@@ -39,7 +38,14 @@ impl Browser {
         // Use real profile to avoid onboarding / first-run dialogs
         let profile_dir = Self::real_profile_dir()
             .unwrap_or_else(|| std::path::PathBuf::from(format!("/tmp/cdp-profile-{}", port)));
-        Self::clean_profile_locks(&profile_dir);
+        {
+            let dir = profile_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                Self::clean_profile_locks(&dir);
+            })
+            .await
+            .map_err(|e| CdpError::LaunchFailed(format!("spawn_blocking failed: {e}")))?;
+        }
 
         tracing::info!(
             "Launching Chrome on port {} with profile {:?}",
@@ -66,7 +72,6 @@ impl Browser {
             .take()
             .ok_or_else(|| CdpError::LaunchFailed("No stderr on Chrome process".into()))?;
 
-        // Read stderr line by line looking for the DevTools URL
         let reader = BufReader::new(stderr);
         let mut ws_url = None;
 
@@ -86,43 +91,51 @@ impl Browser {
         let ws_url = ws_url.ok_or(CdpError::NoWsUrl)?;
         let pid = child.id();
 
-        // Save state (port is always 9222)
         let state = BrowserState { pid };
         let state_json = serde_json::to_string(&state)?;
-        // Atomic write — write to temp file, then rename
-        let tmp_path = Self::state_path().with_extension("json.tmp");
-        std::fs::write(&tmp_path, &state_json)
-            .map_err(|e| CdpError::LaunchFailed(format!("Cannot save state: {e}")))?;
-        std::fs::rename(&tmp_path, Self::state_path())
-            .map_err(|e| CdpError::LaunchFailed(format!("Cannot commit state: {e}")))?;
+        // Atomic write: temp file then rename
+        let final_path = Self::state_path();
+        let tmp_path = final_path.with_extension("json.tmp");
+        let json = state_json;
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = final_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&tmp_path, &json)
+                .map_err(|e| CdpError::LaunchFailed(format!("Cannot save state: {e}")))?;
+            std::fs::rename(&tmp_path, &final_path)
+                .map_err(|e| CdpError::LaunchFailed(format!("Cannot commit state: {e}")))?;
+            Ok::<_, CdpError>(())
+        })
+        .await
+        .map_err(|e| CdpError::LaunchFailed(format!("spawn_blocking failed: {e}")))??;
 
         tracing::info!("Launched persistent browser (pid={})", pid);
 
-        // Don't own the child — browser stays alive after drop
+        // Detach — browser stays alive after Drop
         drop(child);
 
         Ok(Browser { ws_url })
     }
 
-    /// Connect to Chrome's CDP WebSocket and return a Connection.
+    /// Connect to CDP WebSocket.
     pub async fn connect(&self) -> Result<Connection> {
         tracing::info!("Connecting to CDP: {}", self.ws_url);
 
         let (ws_stream, _) = tokio_tungstenite::connect_async(self.ws_url.clone()).await?;
-        // Create a kill channel but leak the sender so kill_rx never fires
+        // Leak kill_tx so kill_rx never fires
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
         std::mem::forget(kill_tx);
         Connection::new(ws_stream, kill_rx).await
     }
 
-    /// Get the WebSocket URL
+    /// Get the WebSocket URL.
     pub fn ws_url(&self) -> &str {
         &self.ws_url
     }
 
-    /// Find Chrome executable on the system
+    /// Locate Chrome executable.
     fn find_chrome() -> Option<String> {
-        // Common Chrome paths on macOS
         let candidates = [
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chrome.app/Contents/MacOS/Chrome",
@@ -134,14 +147,12 @@ impl Browser {
             "/Applications/Dia.app/Contents/MacOS/Dia",
         ];
 
-        // Check common locations
         for path in &candidates {
             if std::path::Path::new(path).exists() {
                 return Some(path.to_string());
             }
         }
 
-        // Try which command
         if let Ok(path) = std::process::Command::new("which")
             .arg("google-chrome")
             .arg("chromium")
@@ -160,7 +171,7 @@ impl Browser {
         None
     }
 
-    /// Find the real browser profile directory (Dia or Chrome)
+    /// Locate browser profile directory.
     fn real_profile_dir() -> Option<std::path::PathBuf> {
         let home = std::env::var("HOME").ok()?;
         let candidates = [
@@ -177,7 +188,7 @@ impl Browser {
         None
     }
 
-    /// Clean browser profile lock files before launching
+    /// Clean profile lock files.
     fn clean_profile_locks(profile_dir: &std::path::Path) {
         let lock_files = [
             "SingletonLock",
@@ -198,13 +209,9 @@ impl Browser {
         Self::probe_port()
     }
 
-    // Persistent browser management
-
     /// Get the path to the browser state file.
     fn state_path() -> PathBuf {
-        let dir = Self::home_dir().join(".gthings");
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("browser.json")
+        Self::home_dir().join(".gthings/browser.json")
     }
 
     /// Get home directory.
@@ -219,34 +226,45 @@ impl Browser {
         Self::state_path()
     }
 
-    /// Find an existing browser by checking state file and probing port 9222.
+    /// Find existing browser via state file and port probe.
     pub async fn find_existing() -> Option<Self> {
         let state_path = Self::state_path();
         if !state_path.exists() {
             return None;
         }
 
-        let state_str = std::fs::read_to_string(&state_path).ok()?;
+        let path = state_path.clone();
+        let state_str: String =
+            tokio::task::spawn_blocking(move || std::fs::read_to_string(&path).ok())
+                .await
+                .unwrap_or(None)?;
         let state: BrowserState = serde_json::from_str(&state_str).ok()?;
 
-        // Check if process is alive
         if !Self::is_process_alive(state.pid) {
             tracing::warn!("Browser pid={} is dead, removing stale state", state.pid);
-            let _ = std::fs::remove_file(&state_path);
+            let path = state_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(&path);
+            })
+            .await
+            .ok();
             return None;
         }
 
-        // Probe port 9222 to see if CDP is responding
         if !Self::probe_port() {
             tracing::warn!(
                 "Browser port {} not responding, removing stale state",
                 CDP_PORT
             );
-            let _ = std::fs::remove_file(&state_path);
+            let path = state_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(&path);
+            })
+            .await
+            .ok();
             return None;
         }
 
-        // Fetch ws_url from the browser's HTTP API
         let ws_url = Self::fetch_ws_url().await?;
 
         tracing::info!("Found existing browser (pid={})", state.pid);
@@ -254,7 +272,7 @@ impl Browser {
         Some(Browser { ws_url })
     }
 
-    /// Fetch the WebSocket debugger URL from the browser's /json/version endpoint.
+    /// Fetch WebSocket debugger URL from /json/version.
     async fn fetch_ws_url() -> Option<String> {
         let url = format!("http://127.0.0.1:{}/json/version", CDP_PORT);
         let resp = reqwest::get(&url).await.ok()?;
@@ -295,16 +313,20 @@ impl Browser {
     }
 
     /// Get the browser pid from the state file.
-    pub fn pid(&self) -> Option<u32> {
+    pub async fn pid(&self) -> Option<u32> {
         let state_path = Self::state_path();
-        if state_path.exists() {
-            if let Ok(state_str) = std::fs::read_to_string(&state_path) {
-                if let Ok(state) = serde_json::from_str::<BrowserState>(&state_str) {
-                    return Some(state.pid);
+        tokio::task::spawn_blocking(move || {
+            if state_path.exists() {
+                if let Ok(state_str) = std::fs::read_to_string(&state_path) {
+                    if let Ok(state) = serde_json::from_str::<BrowserState>(&state_str) {
+                        return Some(state.pid);
+                    }
                 }
             }
-        }
-        None
+            None
+        })
+        .await
+        .unwrap_or(None)
     }
 }
 
@@ -320,7 +342,6 @@ mod tests {
 
     #[test]
     fn test_probe_port_no_server() {
-        // Verifies is_alive delegates to probe_port consistently
         assert_eq!(Browser::is_alive(), Browser::probe_port());
     }
 

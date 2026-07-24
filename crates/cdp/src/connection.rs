@@ -15,9 +15,7 @@ use crate::error::{CdpError, Result};
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
-/// CDP WebSocket connection with oneshot command dispatch.
-/// Each command is sent with a unique `id`, and the response is matched
-/// by that id via a oneshot channel.
+/// CDP WebSocket connection dispatching commands via oneshot channels.
 pub struct Connection {
     write: futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     pending: PendingMap,
@@ -25,8 +23,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Create a new CDP connection from a WebSocket stream.
-    /// Spawns a background reader task that dispatches responses to pending oneshots.
+    /// Create a new CDP connection. Spawns a background reader for response dispatch.
     pub async fn new(
         ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
         mut kill_rx: tokio::sync::oneshot::Receiver<()>,
@@ -35,7 +32,6 @@ impl Connection {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_clone = pending.clone();
 
-        // Spawn reader task
         tokio::spawn(async move {
             let mut read = read;
             loop {
@@ -43,7 +39,6 @@ impl Connection {
                     msg = read.next() => {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
-                                // Parse response
                                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
                                     if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
                                         let mut map = pending_clone.lock().await;
@@ -87,9 +82,7 @@ impl Connection {
         })
     }
 
-    /// Send a CDP command and wait for the response.
-    /// Uses oneshot dispatch: sends the command with a unique id, registers
-    /// the oneshot sender in the pending map, and awaits the response.
+    /// Send a CDP command and wait for the response via oneshot dispatch.
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -109,13 +102,11 @@ impl Connection {
 
         self.write.send(Message::Text(text)).await?;
 
-        // Wait for response with 30s timeout
         let response = tokio::time::timeout(Duration::from_secs(30), rx)
             .await
             .map_err(|_| CdpError::Timeout(30000))?
             .map_err(|_| CdpError::ChannelBroken)?;
 
-        // Check for CDP error
         if let Some(err) = response.get("error") {
             let msg = err
                 .get("message")

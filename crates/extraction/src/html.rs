@@ -1,7 +1,4 @@
 /// HTML content extraction utilities.
-///
-/// Provides CSS-selector-based content extraction, heading-based section
-/// detection, and HTML tag stripping.
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -68,15 +65,20 @@ impl HtmlExtractor {
             doc.select(&body_sel).next().unwrap_or(doc.root_element())
         });
 
-        // Extract full text from the root element
-        let full_text: String = root.text().collect::<Vec<_>>().join(" ");
+        // Fold avoids intermediate Vec allocation
+        let full_text: String = root.text().fold(String::new(), |mut acc, s| {
+            if !acc.is_empty() {
+                acc.push(' ');
+            }
+            acc.push_str(s);
+            acc
+        });
         let total_length = full_text.len();
 
-        // Detect sections from heading elements within the root
         let sections = Self::detect_sections_html(&root, &full_text);
 
         Ok(ExtractedContent {
-            content: full_text.clone(),
+            content: full_text, // moved, no clone
             total_length,
             offset: 0,
             truncated: false,
@@ -84,13 +86,9 @@ impl HtmlExtractor {
         })
     }
 
-    /// Detect section boundaries from heading tags (h1, h2, h3).
+    /// Detect section boundaries from heading-like patterns in plain text.
     ///
-    /// Given a plain text body, splits it into sections by looking for
-    /// lines that match heading-like patterns (ALL CAPS, short lines
-    /// ending with colon, or numbered sections).
-    ///
-    /// This is a heuristic for text that has already had HTML stripped.
+    /// Heuristic for text that has already had HTML stripped.
     pub fn detect_sections(text: &str) -> Vec<Section> {
         if text.is_empty() {
             return Vec::new();
@@ -142,10 +140,7 @@ impl HtmlExtractor {
         sections
     }
 
-    /// Strip HTML tags, keeping text content.
-    ///
-    /// Removes all HTML tags and decodes common HTML entities.
-    /// Uses regex-based tag removal for simplicity.
+    /// Strip HTML tags, decoding common HTML entities.
     ///
     /// # Examples
     ///
@@ -155,16 +150,19 @@ impl HtmlExtractor {
     /// assert_eq!(text, "Hello world");
     /// ```
     pub fn strip_tags(html: &str) -> String {
-        static TAG_RE: OnceLock<Regex> = OnceLock::new();
-        let tag_re = TAG_RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("valid regex"));
-        let result = tag_re.replace_all(html, " ");
-
-        static ENTITY_RE: OnceLock<Regex> = OnceLock::new();
-        let entity_re = ENTITY_RE.get_or_init(|| {
-            Regex::new(r"&(amp|lt|gt|quot|nbsp|apos|#x?[0-9a-fA-F]+);").expect("valid regex")
+        // Single regex matching tags and entities.
+        static ALL_RE: OnceLock<Regex> = OnceLock::new();
+        let all_re = ALL_RE.get_or_init(|| {
+            Regex::new(r"<[^>]+>|&(amp|lt|gt|quot|nbsp|apos|#x?[0-9a-fA-F]+);")
+                .expect("valid regex")
         });
-        let result = entity_re.replace_all(&result, |caps: &regex::Captures| -> String {
-            match &caps[1] {
+        let result = all_re.replace_all(html, |caps: &regex::Captures| -> String {
+            let m = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            if m.starts_with('<') {
+                return " ".to_string();
+            }
+            let name = &caps[1];
+            match name {
                 "amp" => "&".to_string(),
                 "lt" => "<".to_string(),
                 "gt" => ">".to_string(),
@@ -182,23 +180,14 @@ impl HtmlExtractor {
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| format!("&{other};"))
                 }
-                _ => format!("&{};", &caps[1]),
+                _ => format!("&{};", name),
             }
         });
-
-        // Collapse whitespace
-        static WS_RE: OnceLock<Regex> = OnceLock::new();
-        let ws_re = WS_RE.get_or_init(|| Regex::new(r"\s+").expect("valid regex"));
-        let result = ws_re.replace_all(&result, " ");
-
-        result.trim().to_string()
+        result.split_whitespace().collect::<Vec<_>>().join(" ")
     }
-
-    // Section detection from parsed HTML
 
     /// Detect sections from a scraper HTML element tree.
     fn detect_sections_html(root: &scraper::ElementRef, full_text: &str) -> Vec<Section> {
-        // Find all h1, h2, h3 elements within the root
         let heading_sel = match scraper::Selector::parse("h1, h2, h3") {
             Ok(sel) => sel,
             Err(_) => return Vec::new(),
@@ -249,8 +238,6 @@ impl HtmlExtractor {
         sections
     }
 }
-
-// Helpers
 
 /// Check if a text line looks like a section heading.
 fn is_heading_line(line: &str) -> bool {

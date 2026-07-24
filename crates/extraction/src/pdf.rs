@@ -1,14 +1,8 @@
 /// PDF text extraction — pure Rust implementation.
 ///
-///
-/// Pipeline:
-/// 1. Validate PDF magic number (`%PDF-`)
-/// 2. Find stream objects with their filter metadata
-/// 3. Decompress FlateDecode streams via `flate2`
-/// 4. Extract parenthesized strings from content stream operators (Tj, TJ)
-/// 5. Join and return the extracted text
-///
-/// No external PDF library is needed — this works with raw bytes and regex.
+/// Pipeline: validate magic number, find streams, decompress FlateDecode,
+/// extract parenthesized strings from content operators, join text.
+/// No external PDF library — raw bytes and regex.
 use flate2::read::ZlibDecoder;
 use regex::Regex;
 use std::io::Read;
@@ -146,26 +140,19 @@ impl PdfExtractor {
     }
 }
 
-// Stream extraction
-
 /// Extract all stream objects from raw PDF bytes.
 ///
-/// Each PDF object is delimited by `N M obj` ... `endobj`.
-/// Each stream object contains `stream` ... `endstream` with raw data.
-/// `FlateDecode` filter is detected by scanning the object header.
+/// Detects FlateDecode filter by scanning the object header.
 fn extract_streams(bytes: &[u8]) -> Vec<PdfStream> {
     let mut streams: Vec<PdfStream> = Vec::new();
     let mut pos = 0;
 
     while let Some(stream_start) = find_pattern(bytes, b"stream", pos) {
-        let data_begin = stream_start + 6; // skip "stream"
-        // Skip whitespace/newline after "stream"
-        let mut data_start = data_begin;
+        let mut data_start = stream_start + 6;
         while data_start < bytes.len() && is_pdf_whitespace(bytes[data_start]) {
             data_start += 1;
         }
 
-        // Find "endstream"
         match find_pattern(bytes, b"endstream", data_start) {
             Some(end_pos) => {
                 // Trim trailing whitespace before endstream
@@ -186,7 +173,7 @@ fn extract_streams(bytes: &[u8]) -> Vec<PdfStream> {
                     obj_header,
                 });
 
-                pos = end_pos + 9; // skip "endstream"
+                pos = end_pos + 9;
             }
             None => break,
         }
@@ -213,10 +200,8 @@ fn is_pdf_whitespace(b: u8) -> bool {
 
 /// Get the object header text between `obj` and `stream` for filter detection.
 ///
-/// Scans backward from `stream_pos` to find the containing `obj` keyword and
-/// returns the header text. Returns an empty string if no `obj` is found.
+/// Returns empty string if no `obj` is found.
 fn get_obj_header(bytes: &[u8], stream_pos: usize) -> String {
-    // Scan backward from stream_pos to find "obj"
     let search_start = stream_pos.saturating_sub(500);
     let before = &bytes[search_start..stream_pos];
 
@@ -227,8 +212,6 @@ fn get_obj_header(bytes: &[u8], stream_pos: usize) -> String {
         String::new()
     }
 }
-
-// Decompression
 
 /// Decompress a FlateDecode (zlib) stream.
 fn decompress_flate(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -252,57 +235,35 @@ fn decompress_flate(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-// Text extraction from content streams
-
 /// Extract text from a decompressed PDF content stream.
 ///
-/// Uses PDF text operators:
-/// - `Tj`: show string (parenthesized text followed by Tj)
-/// - `TJ`: show with positioning array
-/// - `'` : move to next line and show string
-/// - `"` : set word/char spacing and show
-///
-/// PDF text in content streams is enclosed in parentheses with backslash escapes:
-/// - `\(` → `(`, `\)` → `)`, `\\` → `\`
-/// - `\ddd` → octal character code (e.g., `\050` → `(`)
-/// - `\n` → newline (literal `\n` in the PDF source)
+/// Handles parenthesized text with backslash escapes and PDF text operators.
 fn extract_text_from_stream(data: &[u8]) -> String {
-    let src = String::from_utf8_lossy(data);
     let mut results: Vec<String> = Vec::new();
-
-    // Match parenthesized strings in PDF content streams.
-    // Handles basic nested parentheses by tracking depth.
-    let chars: Vec<char> = src.chars().collect();
-    let len = chars.len();
+    let len = data.len();
     let mut i = 0;
 
+    // Scan bytes directly — avoid Vec<char> allocation and lossy UTF-8 conversion
     while i < len {
-        if chars[i] == '(' {
+        if data[i] == b'(' {
             let mut depth = 1;
             let mut j = i + 1;
-            let mut escaped = false;
 
             while j < len && depth > 0 {
-                if escaped {
-                    escaped = false;
-                    j += 1;
+                if data[j] == b'\\' {
+                    j += 2; // skip escaped character
                     continue;
                 }
-                if chars[j] == '\\' {
-                    escaped = true;
-                    j += 1;
-                    continue;
-                }
-                if chars[j] == '(' {
+                if data[j] == b'(' {
                     depth += 1;
-                } else if chars[j] == ')' {
+                } else if data[j] == b')' {
                     depth -= 1;
                 }
                 j += 1;
             }
 
-            let inner: String = chars[i + 1..j - 1].iter().collect();
-            let unescaped = unescape_pdf_string(&inner);
+            let inner = &data[i + 1..j - 1];
+            let unescaped = unescape_pdf_string_bytes(inner);
             if !unescaped.is_empty() {
                 results.push(unescaped);
             }
@@ -316,34 +277,30 @@ fn extract_text_from_stream(data: &[u8]) -> String {
     results.join(" ")
 }
 
-/// Unescape a PDF string according to the PDF spec.
-///
-/// Handles:
-/// - Octal escapes: `\ddd` (e.g., `\050` → `(`)
-/// - Backslash escapes: `\(` → `(`, `\)` → `)`, `\\` → `\`
-/// - Literal newlines: `\n` → newline
+/// Unescape a PDF string (octal, backslash escapes, and literal newlines).
 fn unescape_pdf_string(s: &str) -> String {
-    static OCTAL_RE: OnceLock<Regex> = OnceLock::new();
-    let octal_re = OCTAL_RE.get_or_init(|| Regex::new(r"\\([0-7]{3})").expect("valid regex"));
-
-    // Step 1: replace octal escapes
-    let s = octal_re.replace_all(s, |caps: &regex::Captures| {
-        let oct = caps.get(1).map_or("", |m| m.as_str());
-        let code = u32::from_str_radix(oct, 8).unwrap_or(0);
-        char::from_u32(code).map_or_else(|| '\u{FFFD}'.to_string(), |c| c.to_string())
-    });
-
-    // Step 2: replace `\n` with actual newline
-    static NL_RE: OnceLock<Regex> = OnceLock::new();
-    let nl_re = NL_RE.get_or_init(|| Regex::new(r"\\n").expect("valid regex"));
-    let s = nl_re.replace_all(&s, "\n");
-
-    // Step 3: remove remaining backslash escapes (\, \(, \), etc.)
     static ESC_RE: OnceLock<Regex> = OnceLock::new();
-    let esc_re = ESC_RE.get_or_init(|| Regex::new(r"\\(.)").expect("valid regex"));
-    let s = esc_re.replace_all(&s, "$1");
-
+    let esc_re =
+        ESC_RE.get_or_init(|| Regex::new(r"\\(?:([0-7]{3})|(n)|(.))").expect("valid regex"));
+    let s = esc_re.replace_all(s, |caps: &regex::Captures| -> String {
+        if let Some(oct) = caps.get(1) {
+            let code = u32::from_str_radix(oct.as_str(), 8).unwrap_or(0);
+            return char::from_u32(code).map_or_else(|| '\u{FFFD}'.to_string(), |c| c.to_string());
+        }
+        if caps.get(2).is_some() {
+            return "\n".to_string();
+        }
+        // General escape: \X → X
+        caps.get(3)
+            .map_or(String::new(), |m| m.as_str().to_string())
+    });
     s.trim().to_string()
+}
+
+/// Byte-level variant of `unescape_pdf_string`.
+fn unescape_pdf_string_bytes(data: &[u8]) -> String {
+    let s = std::str::from_utf8(data).unwrap_or("");
+    unescape_pdf_string(s)
 }
 
 #[cfg(test)]

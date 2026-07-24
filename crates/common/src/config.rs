@@ -1,18 +1,9 @@
 /// Application configuration loaded from environment variables and defaults.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GthingsConfig {
-    /// Port for the CDP (Chrome DevTools Protocol) endpoint.
-    pub cdp_port: u16,
-    /// Optional custom path to the browser executable.
-    pub browser_path: Option<std::path::PathBuf>,
-    /// Optional custom browser profile directory.
-    pub profile_dir: Option<std::path::PathBuf>,
-    /// Directory used for persistent disk cache.
-    pub cache_dir: std::path::PathBuf,
+    // 8-byte aligned types first
     /// Cache TTL in seconds.
     pub cache_ttl_secs: u64,
-    /// Log level filter string (e.g. "info", "debug", "warn").
-    pub log_level: String,
     /// Request timeout in milliseconds.
     pub request_timeout_ms: u64,
     /// Max concurrent tabs for search phase (default 3).
@@ -21,27 +12,39 @@ pub struct GthingsConfig {
     pub follow_concurrency: usize,
     /// Max chars per page extraction (default 50000).
     pub max_chars: usize,
+    // Pointer-sized compound types (8-byte aligned internally)
+    /// Optional custom path to the browser executable.
+    pub browser_path: Option<std::path::PathBuf>,
+    /// Optional custom browser profile directory.
+    pub profile_dir: Option<std::path::PathBuf>,
+    /// Directory used for persistent disk cache.
+    pub cache_dir: std::path::PathBuf,
+    /// Log level filter string (e.g. "info", "debug", "warn").
+    pub log_level: String,
     /// Hostnames to exclude from SERP results (e.g. Google chrome pages).
     pub deny_hosts: Vec<String>,
+    // 4-byte aligned types
     /// Steady-state requests per second per host for rate limiting (default 2).
     pub per_host_rate_per_sec: u32,
     /// Maximum burst size for per-host rate limiting (default 5).
     pub per_host_burst_size: u32,
+    // 2-byte aligned types
+    /// Port for the CDP (Chrome DevTools Protocol) endpoint.
+    pub cdp_port: u16,
 }
 
 impl Default for GthingsConfig {
     fn default() -> Self {
         Self {
-            cdp_port: 9222,
-            browser_path: None,
-            profile_dir: None,
-            cache_dir: std::path::PathBuf::from("/tmp/nyx-search-cache"),
             cache_ttl_secs: 3600,
-            log_level: "info".to_string(),
             request_timeout_ms: 30_000,
             search_concurrency: 3,
             follow_concurrency: 3,
             max_chars: 50_000,
+            browser_path: None,
+            profile_dir: None,
+            cache_dir: std::path::PathBuf::from("/tmp/nyx-search-cache"),
+            log_level: "info".to_string(),
             deny_hosts: vec![
                 "accounts.google.com".to_string(),
                 "support.google.com".to_string(),
@@ -49,15 +52,14 @@ impl Default for GthingsConfig {
             ],
             per_host_rate_per_sec: 2,
             per_host_burst_size: 5,
+            cdp_port: 9222,
         }
     }
 }
 
 impl GthingsConfig {
-    /// Build a [`GthingsConfig`] by reading environment variables.
-    ///
-    /// Each field can be overridden by its corresponding environment variable;
-    /// values not set will fall back to [`GthingsConfig::default()`].
+    /// Build a [`GthingsConfig`] from environment variables.
+    /// Unset variables fall back to [`GthingsConfig::default()`].
     ///
     /// | Variable                  | Field              |
     /// | `GTHINGS_CDP_PORT`        | `cdp_port`         |
@@ -77,27 +79,10 @@ impl GthingsConfig {
         let defaults = Self::default();
 
         Self {
-            cdp_port: std::env::var("GTHINGS_CDP_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(defaults.cdp_port),
-            browser_path: std::env::var("GTHINGS_BROWSER_PATH")
-                .ok()
-                .map(std::path::PathBuf::from),
-            profile_dir: std::env::var("GTHINGS_PROFILE_DIR")
-                .ok()
-                .map(std::path::PathBuf::from),
-            cache_dir: std::env::var("GTHINGS_CACHE_DIR")
-                .ok()
-                .map(std::path::PathBuf::from)
-                .unwrap_or(defaults.cache_dir),
             cache_ttl_secs: std::env::var("GTHINGS_CACHE_TTL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(defaults.cache_ttl_secs),
-            log_level: std::env::var("GTHINGS_LOG_LEVEL")
-                .ok()
-                .unwrap_or(defaults.log_level),
             request_timeout_ms: std::env::var("GTHINGS_REQUEST_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -114,6 +99,19 @@ impl GthingsConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(defaults.max_chars),
+            browser_path: std::env::var("GTHINGS_BROWSER_PATH")
+                .ok()
+                .map(std::path::PathBuf::from),
+            profile_dir: std::env::var("GTHINGS_PROFILE_DIR")
+                .ok()
+                .map(std::path::PathBuf::from),
+            cache_dir: std::env::var("GTHINGS_CACHE_DIR")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .unwrap_or(defaults.cache_dir),
+            log_level: std::env::var("GTHINGS_LOG_LEVEL")
+                .ok()
+                .unwrap_or(defaults.log_level),
             deny_hosts: std::env::var("GTHINGS_DENY_HOSTS")
                 .ok()
                 .map(|v| {
@@ -131,6 +129,10 @@ impl GthingsConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(defaults.per_host_burst_size),
+            cdp_port: std::env::var("GTHINGS_CDP_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.cdp_port),
         }
     }
 }

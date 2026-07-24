@@ -142,15 +142,12 @@ enum PdfCommand {
 async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
-    // Initialize tracing
     let filter = tracing_subscriber::EnvFilter::try_new(&cli.log_level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    // Load config from environment
     let config = common::config::GthingsConfig::from_env();
 
-    // Telemetry setup
     let session_id = format!(
         "ses_{:x}",
         SystemTime::now()
@@ -237,7 +234,6 @@ async fn main() -> Result<(), anyhow::Error> {
         },
     };
 
-    // Telemetry capture via TraceWriter
     let cmd_duration_ms = cmd_start.elapsed().as_millis() as u64;
     let exit_code = if result.is_ok() { 0 } else { 1 };
 
@@ -282,7 +278,7 @@ async fn handle_browser_start(json: bool) -> Result<(), anyhow::Error> {
         .connect()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect: {e}"))?;
-    let pid = browser.pid().unwrap_or(0);
+    let pid = browser.pid().await.unwrap_or(0);
     if json {
         println!(
             "{}",
@@ -299,7 +295,7 @@ async fn handle_browser_start(json: bool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Stop the persistent browser: kill process and remove state file.
+/// Stop the persistent browser.
 async fn handle_browser_stop(json: bool) -> Result<(), anyhow::Error> {
     let state_path = browser_state_path();
     if !state_path.exists() {
@@ -314,14 +310,12 @@ async fn handle_browser_stop(json: bool) -> Result<(), anyhow::Error> {
     let state: serde_json::Value = serde_json::from_str(&state_str)?;
     let pid = state["pid"].as_u64().unwrap_or(0);
 
-    // Kill the process
     if pid > 0 {
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
             .status();
     }
 
-    // Remove state file
     std::fs::remove_file(&state_path)?;
 
     if json {
@@ -332,11 +326,11 @@ async fn handle_browser_stop(json: bool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Show browser status (running or stopped).
+/// Show browser status.
 async fn handle_browser_status(json: bool) -> Result<(), anyhow::Error> {
     let existing = cdp::Browser::find_existing().await;
     if let Some(browser) = existing {
-        let pid = browser.pid().unwrap_or(0);
+        let pid = browser.pid().await.unwrap_or(0);
         if json {
             println!(
                 "{}",
@@ -360,7 +354,7 @@ async fn handle_browser_status(json: bool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Extract command name and key arguments from the Command enum for telemetry.
+/// Extract command metadata for telemetry.
 fn command_metadata(cmd: &Command) -> (&'static str, serde_json::Value) {
     match cmd {
         Command::Search(args) => match &args.command {
