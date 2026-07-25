@@ -4,10 +4,11 @@
 
 ### Fixes
 
-#### - Removed unused config.rs and logging.rs modules
+#### - Removed config module (GthingsConfig, from_env) — configuration now uses ad-hoc env var reads in CLI
 
-- Internal cleanup of unused dependencies
-- Refactored cache module for consistency
+- Removed logging module (init_tracing, TraceWriter) — tracing setup moved to CLI
+- Simplified error module — removed unused error variants
+- Simplified lib.rs exports to only cache, error, trace modules
 
 ## 0.3.2 — 2026-07-24
 

@@ -218,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_get_raw_content() {
-        let dir = std::env::temp_dir().join(format!("_cache_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join("_cache_test_set_get_raw");
         let cache = Sha256DiskCache::new(&dir, 3600);
         let key = cache.key("https://set-get-test", 0, 100);
         let content = "raw content, not JSON wrapped";
@@ -235,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_expired_by_mtime() {
-        let dir = std::env::temp_dir().join(format!("_cache_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join("_cache_test_get_expired");
         let cache = Sha256DiskCache::new(&dir, 0); // 0-second TTL — immediately expired
         let key = cache.key("https://expired-test", 0, 100);
         cache.set(&key, "will expire").await;
