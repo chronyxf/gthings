@@ -1,24 +1,21 @@
 [package]
 name = "gthings-search"
-version = "0.3.8"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Web search orchestration: Google CDP search, page following, batch harvest pipeline"
 
 [dependencies]
-gthings-common = { path = "../common", version = "0.3.2" }
-gthings-extraction = { path = "../extraction", version = "0.3.1" }
-gthings-cdp = { path = "../cdp", version = "0.4.6" }
-tokio = { workspace = true }
+gthings-cdp = { path = "../cdp" }
+gthings-common = { path = "../common" }
+gthings-extraction = { path = "../extraction" , version = "0.3.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
+tokio = { workspace = true }
 url = { workspace = true }
-chrono = { workspace = true }
-urlencoding = "2"
+
 
 [lints]
 workspace = true

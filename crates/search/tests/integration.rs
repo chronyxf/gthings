@@ -95,3 +95,5 @@ fn test_follow_result_serde() {
     assert!(!parsed.truncated);
     assert!(parsed.error.is_empty());
 }
+
+

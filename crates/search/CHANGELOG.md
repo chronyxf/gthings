@@ -1,5 +1,18 @@
 # Changelog — gthings-search
 
+## 0.5.0 (2026-07-25)
+
+### Breaking Changes
+
+#### - Removed shared types.rs module — SearchResult moved to search.rs, FollowResult moved to follow.rs
+
+- Simplified SearchResult and FollowResult — removed unused fields (query, total_length, sections, quality, etc.)
+- Removed two-phase harvest pipeline (search + follow) — BatchProcessor::harvest deleted
+- Removed BatchProcessor::follow — multi-URL follow deleted
+- Fixed batch timeout safety — close_tab now runs outside tokio::time::timeout, preventing window leaks on cancellation
+- BatchProcessor::search now takes Arc<Session> instead of &self with GthingsConfig
+- search and follow functions now accept &Session and &Tab instead of &mut Connection
+
 ## 0.3.8 (2026-07-25)
 
 ### Fixes
