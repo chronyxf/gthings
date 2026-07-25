@@ -1,6 +1,6 @@
 # Changelog — gthings (CLI)
 
-## 0.3.6 (2026-07-25)
+## 0.4.0 (2026-07-25)
 
 ### Features
 
