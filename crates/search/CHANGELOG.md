@@ -1,5 +1,11 @@
 # Changelog — gthings-search
 
+## 0.3.4 (2026-07-25)
+
+### Fixes
+
+- Fix: update gthings-cdp dependency to 0.4.3 which reads `profile.last_used` from `Local State` and passes `--profile-directory=<last_used>` so the browser opens the real user profile (with bookmarks, history, cookies) instead of a fresh Default profile
+
 ## 0.3.3 (2026-07-25)
 
 ### Fixes

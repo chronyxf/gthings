@@ -68,20 +68,49 @@ fn browser_exec_name(bundle_path: &std::path::Path) -> Option<&'static str> {
 fn browser_profile_suffix(bundle_path: &std::path::Path) -> Option<&'static str> {
     let path_str = bundle_path.to_string_lossy();
     if path_str.contains("Google Chrome") {
-        Some("Google/Chrome")
+        Some("Google/Chrome/User Data")
     } else if path_str.contains("Dia") {
-        Some("Dia")
+        Some("Dia/User Data")
     } else if path_str.contains("Arc") {
-        Some("Arc")
+        Some("Arc/User Data")
     } else if path_str.contains("Brave Browser") || path_str.contains("Brave") {
-        Some("BraveSoftware/Brave-Browser")
+        Some("BraveSoftware/Brave-Browser/User Data")
     } else if path_str.contains("Microsoft Edge") {
-        Some("Microsoft Edge")
+        Some("Microsoft Edge/User Data")
     } else if path_str.contains("Chromium") {
-        Some("Chromium")
+        Some("Chromium/User Data")
     } else {
         None
     }
+}
+
+/// Read the last-used profile directory name from the browser's Local State file.
+/// Returns "Default" as fallback if Local State can't be read or last_used is missing.
+fn detect_last_used_profile(user_data_dir: &std::path::Path) -> String {
+    let local_state_path = user_data_dir.join("Local State");
+    let content = match std::fs::read_to_string(&local_state_path) {
+        Ok(c) => c,
+        Err(_) => return "Default".to_string(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return "Default".to_string(),
+    };
+    // Look for "profile.last_used" path in the JSON
+    if let Some(last_used) = json.get("profile").and_then(|p| p.get("last_used")).and_then(|l| l.as_str()) {
+        if user_data_dir.join(last_used).exists() {
+            return last_used.to_string();
+        }
+    }
+    // Fallback: first key in profile.info_cache
+    if let Some(info_cache) = json.get("profile").and_then(|p| p.get("info_cache")) {
+        if let Some(obj) = info_cache.as_object() {
+            if let Some(first_key) = obj.keys().next() {
+                return first_key.clone();
+            }
+        }
+    }
+    "Default".to_string()
 }
 
 /// Build the executable path from a bundle path
@@ -129,10 +158,12 @@ impl Browser {
             .map_err(|e| CdpError::LaunchFailed(format!("spawn_blocking failed: {e}")))?;
         }
 
+        let active_profile = detect_last_used_profile(&profile_dir);
         tracing::info!(
-            "Launching browser on port {} with profile {:?}",
+            "Launching browser on port {} with profile {:?} (sub-profile: {})",
             port,
-            profile_dir
+            profile_dir,
+            active_profile
         );
 
         let mut cmd = Command::new(&chrome_path);
@@ -149,6 +180,7 @@ impl Browser {
             .arg("--password-store=basic")
             .arg("--use-mock-keychain")
             .arg(format!("--user-data-dir={}", profile_dir.display()))
+            .arg(format!("--profile-directory={}", active_profile))
             .arg("about:blank")
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -305,12 +337,12 @@ impl Browser {
 
         // 3. Fallback: check common profile directories
         let common_profiles = [
-            "Google/Chrome",
-            "Dia",
-            "Chromium",
-            "BraveSoftware/Brave-Browser",
-            "Microsoft Edge",
-            "Arc",
+            "Google/Chrome/User Data",
+            "Dia/User Data",
+            "Chromium/User Data",
+            "BraveSoftware/Brave-Browser/User Data",
+            "Microsoft Edge/User Data",
+            "Arc/User Data",
         ];
 
         for suffix in &common_profiles {

@@ -1,5 +1,13 @@
 # Changelog — gthings-cdp
 
+## 0.4.3 (2026-07-25)
+
+### Fixes
+
+- Fix: correct browser profile paths to include `/User Data` subdirectory so `Local State` and profiles are found correctly
+- Fix: add `detect_last_used_profile()` that reads `profile.last_used` from `Local State` to identify the user's actual profile (not just `Default`)
+- Fix: add `--profile-directory` flag to launch command so the browser opens the real profile with bookmarks, history, and cookies instead of triggering onboarding
+
 ## 0.4.2 (2026-07-25)
 
 ### Fixes
