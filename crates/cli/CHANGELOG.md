@@ -1,5 +1,11 @@
 # Changelog — gthings (CLI)
 
+## 0.4.3 (2026-07-25)
+
+### Fixes
+
+- Fix: update gthings-search dependency to 0.3.2 which uses temp browser profiles for search operations
+
 ## 0.4.0 (2026-07-25)
 
 ### Features

@@ -1,5 +1,11 @@
 # Changelog — gthings-search
 
+## 0.3.2 (2026-07-25)
+
+### Fixes
+
+- Fix: update gthings-cdp dependency to 0.4.1 which uses temporary browser profiles, eliminating "Something went wrong when opening your profile" errors during search operations
+
 ## 0.3.1 — 2026-07-24
 
 ### Changed
