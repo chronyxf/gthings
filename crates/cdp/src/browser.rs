@@ -229,29 +229,24 @@ impl Browser {
     pub async fn connect(&self) -> Result<Connection> {
         tracing::info!("Connecting to CDP: {}", self.ws_url);
 
-        // Dismiss any "Allow debugging connection?" dialog that may appear
-        // during WebSocket connection. The dialog appears asynchronously
-        // when the CDP connection is attempted, so we dismiss it repeatedly.
-        #[cfg(target_os = "macos")]
-        let _ws_url = self.ws_url.clone();
-        #[cfg(target_os = "macos")]
-        let dismiss_handle = tokio::spawn(async move {
-            for _i in 0..10 {
-                dismiss_allow_debugging_dialog();
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        });
+        // Start WebSocket connection and 600ms timer concurrently.
+        // The timer dismisses Dia's "Allow debugging connection?" dialog
+        // if the WS is still connecting after 600ms. Matches gsearch's approach:
+        //   session.ts:189-197 — setTimeout at 600ms, dismissDiaAllowPrompt()
+        let connect_fut = tokio_tungstenite::connect_async(&self.ws_url);
+        let dismiss_fut = tokio::time::sleep(std::time::Duration::from_millis(600));
 
-        let connect_result = tokio_tungstenite::connect_async(&self.ws_url).await;
+        // Pin both futures
+        tokio::pin!(connect_fut);
+        tokio::pin!(dismiss_fut);
 
-        // Wait for dismiss task to finish
+        // After 600ms, dismiss dialog regardless of connection state
+        (&mut dismiss_fut).await;
         #[cfg(target_os = "macos")]
-        let _ = dismiss_handle.await;
+        dismiss_allow_debugging_dialog();
 
-        let (ws_stream, _) = connect_result.map_err(|e| {
-            // One more dismiss attempt in case the dialog blocked the connection
-            #[cfg(target_os = "macos")]
-            dismiss_allow_debugging_dialog();
+        // Now wait for connection
+        let (ws_stream, _) = connect_fut.await.map_err(|e| {
             CdpError::LaunchFailed(format!("WebSocket connect failed: {e}"))
         })?;
 
@@ -567,45 +562,23 @@ impl Browser {
 
 }
 
-/// Dismiss the "Allow debugging connection?" dialog that Chrome/Dia shows
-/// when a CDP connection is attempted. The dialog text reads:
-///   "An application is requesting access to debug this browser.
-///    This gives it full access to your browsing data and browser functionality."
+/// Dismiss the "Allow debugging connection?" dialog that Dia shows when a CDP
+/// connection is attempted. Matches gsearch's exact approach:
+///   browser-harness-js/session.ts:434-446
 ///
-/// Uses macOS AppleScript/System Events to click the "Allow" button.
-/// Runs multiple times with delays since the dialog appears asynchronously
-/// during WebSocket connection.
+/// Sends a Return keystroke to the Dia process via osascript/System Events.
+/// The dialog is a sheet on the window — pressing Return dismisses it.
 #[cfg(target_os = "macos")]
 pub fn dismiss_allow_debugging_dialog() {
-    // AppleScript to find and click "Allow" button in the debugging dialog
-    // Tries multiple approaches since dialog may be from Dia or Chrome
-    let scripts = [
-        // Approach 1: Find by window title containing "debug" or "Allow"
-        r#"tell application "System Events"
-            set browserProcesses to {"Dia", "Google Chrome", "Chromium", "Brave Browser", "Microsoft Edge"}
-            repeat with procName in browserProcesses
-                try
-                    tell process procName
-                        if exists (window 1) then
-                            try
-                                click button "Allow" of window 1
-                            end try
-                        end if
-                    end tell
-                end try
-            end repeat
-        end tell"#,
-        // Approach 2: Accessibility press (works for sheets/dialogs)
-        r#"tell application "System Events"
-            key code 36
-        end tell"#,
-    ];
-    
-    for script in &scripts {
-        let _ = std::process::Command::new("osascript")
-            .args(["-e", script])
-            .output();
-    }
+    let script = r#"tell application "System Events"
+        try
+            set frontmost of process "Dia" to true
+        end try
+        tell process "Dia" to keystroke return
+    end tell"#;
+    let _ = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .output();
 }
 
 /// Non-macOS: no-op

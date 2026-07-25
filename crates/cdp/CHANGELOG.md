@@ -1,5 +1,13 @@
 # Changelog — gthings-cdp
 
+## 0.4.12 (2026-07-25)
+
+### Fixes
+
+#### - Fix: `dismiss_allow_debugging_dialog()` now matches gsearch's exact approach — sends `keystroke return` to Dia process via osascript after 600ms delay, instead of attempting to click a button immediately
+
+- Fix: `connect()` uses oneshot 600ms timer before dismissing dialog (dialog appears ~500ms after WS connect), matching `browser-harness-js/session.ts:189-197`
+
 ## 0.4.11 (2026-07-25)
 
 ### Fixes
