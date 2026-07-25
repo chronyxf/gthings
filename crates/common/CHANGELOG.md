@@ -1,5 +1,14 @@
 # Changelog — gthings-common
 
+## 0.3.3 (2026-07-25)
+
+### Fixes
+
+#### - Removed unused config.rs and logging.rs modules
+
+- Internal cleanup of unused dependencies
+- Refactored cache module for consistency
+
 ## 0.3.2 — 2026-07-24
 
 ### Changed
