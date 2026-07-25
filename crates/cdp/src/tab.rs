@@ -1,263 +1,199 @@
-use crate::connection::Connection;
+use crate::connection::CdpEvent;
 use crate::error::{CdpError, Result};
-use serde_json::{Value, json};
+use crate::session::Session;
+use serde_json::{json, Value};
 use std::time::Duration;
 use tracing;
 
-
-/// A CDP tab session, representing one browser tab.
+/// Represents a browser tab/page
+#[derive(Debug, Clone)]
 pub struct Tab {
-    /// The CDP session ID for this tab's target
-    pub session_id: String,
-    /// The target ID
     pub target_id: String,
+    pub session_id: Option<String>,
 }
 
 impl Tab {
-    /// Create a new tab. Uses `Target.createTarget`; attaches via CDP if sessionId is missing.
-    pub async fn create(conn: &mut Connection, _ws_url: &str, url: &str) -> Result<Self> {
+    /// Create a new tab via CDP. If background=true, opens without focusing.
+    pub async fn create(session: &Session, url: &str) -> Result<Self> {
+        let conn = session.connection();
         let result = conn
             .call(
                 "Target.createTarget",
-                json!({
-                    "url": url,
-                    "newWindow": false,
-                }),
+                json!({ "url": url }),
+                None,
             )
-            .await;
+            .await?;
 
-        if let Ok(result) = result {
-            if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
-                let target_id = result
-                    .get("targetId")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| CdpError::CommandFailed {
-                        method: "Target.createTarget".into(),
-                        msg: "no targetId in response".into(),
-                    })?
-                    .to_string();
+        // Try to get sessionId first (standard CDP behavior)
+        if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
+            let target_id = result
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| CdpError::CdpCallFailed {
+                    method: "Target.createTarget".into(),
+                    detail: "no targetId in response".into(),
+                })?
+                .to_string();
 
-                tracing::debug!("Created tab: target={}, session={}", target_id, session_id);
-
-                return Ok(Tab {
-                    session_id: session_id.to_string(),
-                    target_id,
-                });
-            }
-            // Missing sessionId — Dia returns targetId without sessionId.
-            // Attach to the target via CDP instead of falling back to HTTP
-            // (Dia doesn't support HTTP endpoints like /json/new).
-            if let Some(target_id) = result.get("targetId").and_then(|v| v.as_str()) {
-                tracing::warn!(
-                    "Target.createTarget returned targetId without sessionId, attaching..."
-                );
-                let attach = conn
-                    .call(
-                        "Target.attachToTarget",
-                        json!({
-                            "targetId": target_id,
-                            "flatten": true,
-                        }),
-                    )
-                    .await
-                    .map_err(|e| CdpError::CommandFailed {
-                        method: "Target.attachToTarget".into(),
-                        msg: format!("attach failed: {e}"),
-                    })?;
-
-                let session_id = attach
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| CdpError::CommandFailed {
-                        method: "Target.attachToTarget".into(),
-                        msg: "no sessionId in attach response".into(),
-                    })?
-                    .to_string();
-
-                tracing::info!(
-                    "Attached to created target: {} (session={})",
-                    target_id,
-                    session_id
-                );
-
-                return Ok(Tab {
-                    session_id,
-                    target_id: target_id.to_string(),
-                });
-            }
-            tracing::warn!(
-                "Target.createTarget returned neither sessionId nor targetId, cannot attach"
+            tracing::debug!(
+                "Created tab: target={target}, session={session_id}",
+                target = target_id
             );
-        } else {
-            tracing::warn!("Target.createTarget failed");
+
+            return Ok(Tab {
+                session_id: Some(session_id.to_string()),
+                target_id,
+            });
         }
 
-        Err(CdpError::CommandFailed {
+        // Missing sessionId — Dia returns targetId without sessionId.
+        // Attach to the target via CDP instead of falling back to HTTP.
+        if let Some(target_id) = result.get("targetId").and_then(|v| v.as_str()) {
+            tracing::warn!(
+                "Target.createTarget returned targetId without sessionId, attaching..."
+            );
+            let attach = conn
+                .call(
+                    "Target.attachToTarget",
+                    json!({
+                        "targetId": target_id,
+                        "flatten": true,
+                    }),
+                    None,
+                )
+                .await
+                .map_err(|e| CdpError::CdpCallFailed {
+                    method: "Target.attachToTarget".into(),
+                    detail: format!("attach failed: {e}"),
+                })?;
+
+            let session_id = attach
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| CdpError::CdpCallFailed {
+                    method: "Target.attachToTarget".into(),
+                    detail: "no sessionId in attach response".into(),
+                })?
+                .to_string();
+
+            tracing::info!(
+                "Attached to created target: {target_id} (session={session_id})",
+            );
+
+            return Ok(Tab {
+                session_id: Some(session_id),
+                target_id: target_id.to_string(),
+            });
+        }
+
+        Err(CdpError::CdpCallFailed {
             method: "Target.createTarget".into(),
-            msg: "could not create tab: all methods exhausted".into(),
+            detail: "could not create tab: no targetId or sessionId in response".into(),
         })
     }
 
-    /// Navigate the tab to a URL. Waits for the page to reach a stable state.
-    pub async fn navigate(&self, conn: &mut Connection, url: &str) -> Result<()> {
-        tracing::info!("Navigating to: {}", url);
-
-        let result = conn
-            .call_with_session(&self.session_id, "Page.enable", json!({}))
-            .await?;
-        tracing::debug!("Page.enable: {:?}", result);
-
-        let _result = conn
-            .call_with_session(
-                &self.session_id,
-                "Page.navigate",
-                json!({
-                    "url": url,
-                }),
-            )
-            .await?;
-
-        // Wait for page readyState
-        self.wait_for_page_load(conn, 10000).await
+    /// Navigate to URL and wait for fully loaded. Delegates to Session::navigate.
+    pub async fn navigate(&self, session: &Session, url: &str) -> Result<()> {
+        session.navigate(self, url).await
     }
 
-    /// Wait for the page to reach `complete` readyState, with partial content fallback.
-    async fn wait_for_page_load(&self, conn: &mut Connection, timeout_ms: u64) -> Result<()> {
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_millis(timeout_ms);
+    /// Evaluate JS in tab context, return JSON result
+    pub async fn evaluate(&self, session: &Session, js: &str) -> Result<Value> {
+        let conn = session.connection();
+        let sid = self.session_id.as_deref();
 
-        loop {
-            if start.elapsed() > timeout {
-                tracing::warn!("Page load timed out after {}ms", timeout_ms);
-                return Ok(()); // Don't fail on timeout — content may still be partial
-            }
-
-            let result = conn
-                .call_with_session(
-                    &self.session_id,
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": "document.readyState",
-                        "returnByValue": true,
-                    }),
-                )
-                .await?;
-
-            let ready_state = result["result"]["value"].as_str().unwrap_or("unknown");
-
-            if ready_state == "complete" {
-                tracing::debug!("Page loaded (readyState=complete)");
-                return Ok(());
-            }
-
-            // Fallback: check for partial content
-            let has_content = conn.call_with_session(&self.session_id, "Runtime.evaluate", json!({
-                "expression": "document.body ? document.body.innerText.length > 100 : false",
-                "returnByValue": true,
-            })).await?;
-
-            if has_content["result"]["value"].as_bool().unwrap_or(false) {
-                tracing::debug!("Page has sufficient content (readyState={})", ready_state);
-                return Ok(());
-            }
-
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-
-    /// Evaluate JavaScript in the tab context and return the result.
-    pub async fn evaluate(&self, conn: &mut Connection, js: &str) -> Result<Value> {
         let result = conn
-            .call_with_session(
-                &self.session_id,
+            .call(
                 "Runtime.evaluate",
                 json!({
                     "expression": js,
                     "returnByValue": true,
                 }),
+                sid,
             )
             .await?;
 
         Ok(result)
     }
 
-    /// Extract the page content. Returns innerText of body.
-    pub async fn extract_text(&self, conn: &mut Connection) -> Result<String> {
-        let result = self
-            .evaluate(conn, "document.body?.innerText || ''")
+    /// Wait until page is fully loaded using lifecycle events
+    pub async fn wait_loaded(&self, session: &Session, timeout: Duration) -> Result<()> {
+        let sid = self.session_id.clone();
+
+        session
+            .wait_for(
+                "Page.lifecycleEvent",
+                move |evt: &CdpEvent| {
+                    // Check that the event belongs to our session (if we have one)
+                    let session_match = match &sid {
+                        Some(sid) => evt.session_id.as_deref() == Some(sid.as_str()),
+                        None => true,
+                    };
+                    // Check lifecycle name is networkIdle
+                    let name_match = evt
+                        .params
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        == Some("networkIdle");
+                    session_match && name_match
+                },
+                timeout,
+            )
             .await?;
-        let text = result["result"]["value"].as_str().unwrap_or("").to_string();
-        Ok(text)
+
+        Ok(())
     }
 
-    /// Extract the page title.
-    pub async fn extract_title(&self, conn: &mut Connection) -> Result<String> {
-        let result = self.evaluate(conn, "document.title || ''").await?;
-        let title = result["result"]["value"].as_str().unwrap_or("").to_string();
-        Ok(title)
-    }
-
-    /// Extract HTML content.
-    pub async fn extract_html(&self, conn: &mut Connection) -> Result<String> {
-        let result = self
-            .evaluate(conn, "document.documentElement?.outerHTML || ''")
-            .await?;
-        let html = result["result"]["value"].as_str().unwrap_or("").to_string();
-        Ok(html)
-    }
-
-    /// Execute multiple JS snippets in sequence.
-    pub async fn evaluate_all(
-        &self,
-        conn: &mut Connection,
-        scripts: &[&str],
-    ) -> Result<Vec<Value>> {
-        let mut results = Vec::with_capacity(scripts.len());
-        for script in scripts {
-            let result = self.evaluate(conn, script).await?;
-            results.push(result);
+    /// Extract page title
+    pub async fn title(&self, session: &Session) -> Result<String> {
+        match self.evaluate(session, "document.title || ''").await {
+            Ok(val) => {
+                let title = val
+                    .get("result")
+                    .and_then(|r| r.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| {
+                        tracing::warn!("failed to extract title");
+                        ""
+                    });
+                Ok(title.to_string())
+            }
+            Err(e) => {
+                tracing::warn!("failed to extract title: {e}");
+                Ok(String::new())
+            }
         }
-        Ok(results)
     }
 
-    /// Close this tab. Uses `window.close()` first, then `Target.closeTarget` as fallback.
-    /// Errors are logged but not propagated.
-    pub async fn close(self, conn: &mut Connection) {
+    /// Close the tab
+    pub async fn close(self, session: &Session) -> Result<()> {
+        let conn = session.connection();
+        let sid = self.session_id.as_deref();
+
+        // Best-effort: close via JS first (Dia needs this before CDP close)
         let _ = conn
-            .call_with_session(
-                &self.session_id,
+            .call(
                 "Runtime.evaluate",
                 json!({
                     "expression": "window.close()",
+                    "userGesture": true,
                 }),
+                sid,
             )
             .await;
 
-        // Short delay for clean shutdown
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait briefly for the JS close to take effect
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let _ = conn
-            .call(
-                "Target.closeTarget",
-                json!({
-                    "targetId": self.target_id,
-                }),
-            )
-            .await;
+        // Then close via CDP
+        conn.call(
+            "Target.closeTarget",
+            json!({ "targetId": self.target_id }),
+            None,
+        )
+        .await?;
+        Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn test_tab_struct_creation() {
-        let tab = Tab {
-            session_id: "test-session".into(),
-            target_id: "test-target".into(),
-        };
-        assert_eq!(tab.session_id, "test-session");
-        assert_eq!(tab.target_id, "test-target");
-    }
-}

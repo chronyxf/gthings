@@ -1,5 +1,19 @@
 # Changelog — gthings-cdp
 
+## 0.4.14 (2026-07-25)
+
+### Features
+
+#### - New Session struct wrapping Connection with high-level API (create_tab, navigate, evaluate, wait_for, close_tab, disconnect)
+
+- Stateless browser detection via detect(port) — probes HTTP endpoints and DevToolsActivePort files, never launches Chrome
+- Event-driven Connection with broadcast channel for CDP events
+- Fixed newWindow bug in Target.createTarget — tabs now open in existing window, not new OS windows
+- Added window.close() via Runtime.evaluate before Target.closeTarget for reliable tab cleanup (Dia compatibility)
+- Removed Browser lifetimes from tab methods — Tab::create and Tab::close now take &Session instead of &mut Connection
+- Removed background parameter from Tab::create and Session::create_tab
+- Added CdpEvent struct for event-driven patterns
+
 ## 0.4.13 (2026-07-25)
 
 ### Fixes

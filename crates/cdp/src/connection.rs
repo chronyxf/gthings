@@ -1,171 +1,294 @@
+use crate::error::{CdpError, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::sync::{Mutex, oneshot};
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+#[cfg(target_os = "macos")]
+use crate::browser::dismiss_allow_debugging_dialog;
 use tokio_tungstenite::tungstenite::Message;
 use tracing;
 
-use crate::error::{CdpError, Result};
+static NEXT_CDP_ID: AtomicU64 = AtomicU64::new(1);
 
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+/// A CDP event received from the browser (no "id" field, has "method" field).
+#[derive(Debug, Clone)]
+pub struct CdpEvent {
+    pub method: String,
+    pub params: Value,
+    pub session_id: Option<String>,
+}
 
-/// CDP WebSocket connection dispatching commands via oneshot channels.
+/// Internal bookkeeping for an in-flight CDP command.
+struct PendingCall {
+    method: String,
+    tx: oneshot::Sender<Result<Value>>,
+}
+
+type PendingMap = HashMap<u64, PendingCall>;
+
+/// Internal messages sent from `Connection::call` to the background I/O task.
+enum InternalMessage {
+    Call {
+        id: u64,
+        method: String,
+        params: Value,
+        session_id: Option<String>,
+        tx: oneshot::Sender<Result<Value>>,
+    },
+}
+
+/// Event-driven CDP WebSocket connection.
+///
+/// Spawns a background task that multiplexes outgoing CDP commands and
+/// incoming messages (responses → oneshot dispatch, events → broadcast).
 pub struct Connection {
-    write: futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    pending: PendingMap,
-    next_id: AtomicU64,
+    write: mpsc::UnboundedSender<InternalMessage>,
+    events: broadcast::Sender<CdpEvent>,
+    #[allow(dead_code)]
+    handle: JoinHandle<()>,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection").finish_non_exhaustive()
+    }
 }
 
 impl Connection {
-    /// Create a new CDP connection. Spawns a background reader for response dispatch.
-    pub async fn new(
-        ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-        mut kill_rx: tokio::sync::oneshot::Receiver<()>,
-    ) -> Result<Self> {
-        let (write, read) = ws_stream.split();
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        let pending_clone = pending.clone();
+    /// Connect to a CDP WebSocket endpoint.
+    pub async fn connect(ws_url: &str) -> Result<Self> {
+        // Start connecting in background
+        let ws_url_owned = ws_url.to_owned();
+        let connect_fut = tokio::spawn(async move {
+            connect_async(&ws_url_owned).await
+        });
 
-        tokio::spawn(async move {
-            let mut read = read;
-            loop {
-                tokio::select! {
-                    msg = read.next() => {
-                        match msg {
-                            Some(Ok(Message::Text(text))) => {
-                                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                    if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
-                                        let mut map = pending_clone.lock().await;
-                                        if let Some(tx) = map.remove(&id) {
-                                            let _ = tx.send(value);
-                                        }
-                                    }
-                                    // Events (no "id" field) are silently ignored
-                                }
-                            }
-                            Some(Ok(Message::Binary(_))) => {
-                                // Binary frames not expected from CDP
-                            }
-                            Some(Ok(Message::Close(frame))) => {
-                                tracing::debug!("CDP WebSocket closed: {:?}", frame);
-                                break;
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!("CDP WebSocket error: {e}");
-                                break;
-                            }
-                            None => {
-                                tracing::debug!("CDP WebSocket stream ended");
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ = &mut kill_rx => {
-                        tracing::debug!("Kill signal received, stopping reader");
-                        break;
-                    }
-                }
-            }
+        // Wait 600ms, then dismiss the Dia dialog (if on macOS).
+        // The dialog appears during the WebSocket handshake, so we must
+        // dismiss it *while* the connection is still in progress.
+        #[cfg(target_os = "macos")]
+        {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            dismiss_allow_debugging_dialog();
+        }
+
+        // Await the connection
+        let (ws_stream, _) = connect_fut
+            .await
+            .map_err(|e| CdpError::ConnectionFailed {
+                detail: format!("task join: {e}"),
+            })?
+            .map_err(|e| CdpError::ConnectionFailed {
+                detail: format!("WebSocket connect to {ws_url} failed: {e}"),
+            })?;
+
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<InternalMessage>();
+        let (events_tx, _) = broadcast::channel::<CdpEvent>(256);
+        let pending: PendingMap = HashMap::new();
+
+        let (ws_writer, ws_reader) = ws_stream.split();
+        let events_clone = events_tx.clone();
+
+        let handle = tokio::spawn(async move {
+            Self::run(write_rx, ws_writer, ws_reader, pending, events_clone).await;
         });
 
         Ok(Connection {
-            write,
-            pending,
-            next_id: AtomicU64::new(1),
+            write: write_tx,
+            events: events_tx,
+            handle,
         })
     }
 
-    /// Send a CDP command and wait for the response via oneshot dispatch.
-    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-
-        let cmd = serde_json::json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-
-        let text = serde_json::to_string(&cmd)?;
-
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut map = self.pending.lock().await;
-            map.insert(id, tx);
+    /// Background I/O loop: processes outgoing commands and incoming WebSocket messages.
+    async fn run(
+        mut write_rx: mpsc::UnboundedReceiver<InternalMessage>,
+        mut ws_writer: futures_util::stream::SplitSink<
+            WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+            Message,
+        >,
+        mut ws_reader: futures_util::stream::SplitStream<
+            WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        >,
+        mut pending: PendingMap,
+        events: broadcast::Sender<CdpEvent>,
+    ) {
+        loop {
+            tokio::select! {
+                // Outgoing CDP commands from Connection::call
+                msg = write_rx.recv() => {
+                    match msg {
+                        Some(InternalMessage::Call { id, method, params, session_id, tx }) => {
+                            let cmd = if let Some(ref sid) = session_id {
+                                serde_json::json!({
+                                    "id": id,
+                                    "method": method,
+                                    "params": params,
+                                    "sessionId": sid,
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "id": id,
+                                    "method": method,
+                                    "params": params,
+                                })
+                            };
+                            let text = match serde_json::to_string(&cmd) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    tracing::warn!("Failed to serialize CDP command: {e}");
+                                    let _ = tx.send(Err(CdpError::Json(e)));
+                                    continue;
+                                }
+                            };
+                            // Store pending before sending to avoid race
+                            pending.insert(id, PendingCall { method, tx });
+                            if let Err(e) = ws_writer.send(Message::Text(text)).await {
+                                tracing::warn!("WS send error: {e}");
+                                if let Some(pc) = pending.remove(&id) {
+                                    let _ = pc.tx.send(Err(CdpError::ConnectionFailed {
+                                        detail: format!("WebSocket send failed: {e}"),
+                                    }));
+                                }
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                // Incoming WebSocket messages
+                msg = ws_reader.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                Self::dispatch_message(value, &mut pending, &events).await;
+                            }
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            tracing::debug!("CDP WebSocket closed: {frame:?}");
+                            break;
+                        }
+                        Some(Ok(Message::Binary(_))) => {
+                            // Binary frames not expected from CDP
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("CDP WebSocket read error: {e}");
+                            break;
+                        }
+                        None => {
+                            tracing::debug!("CDP WebSocket stream ended");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
-        self.write.send(Message::Text(text)).await?;
-
-        let response = tokio::time::timeout(Duration::from_secs(30), rx)
-            .await
-            .map_err(|_| CdpError::Timeout(30000))?
-            .map_err(|_| CdpError::ChannelBroken)?;
-
-        if let Some(err) = response.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error")
-                .to_string();
-            return Err(CdpError::CommandFailed {
-                method: method.to_string(),
-                msg,
-            });
+        // Clean up all pending calls when the loop exits
+        for (_, pc) in pending.drain() {
+            let _ = pc.tx.send(Err(CdpError::ConnectionFailed {
+                detail: "WebSocket connection closed".into(),
+            }));
         }
-
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// Send a CDP command with an explicit sessionId (for tab-specific commands).
-    pub async fn call_with_session(
-        &mut self,
-        session_id: &str,
+    /// Route an incoming JSON message: either a response (has "id") or an event (has "method").
+    async fn dispatch_message(
+        value: Value,
+        pending: &mut PendingMap,
+        events: &broadcast::Sender<CdpEvent>,
+    ) {
+        if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
+            // Command response — route to the waiting oneshot
+            if let Some(pc) = pending.remove(&id) {
+                let result = if let Some(err) = value.get("error") {
+                    let detail = err
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error")
+                        .to_string();
+                    Err(CdpError::CdpCallFailed {
+                        method: pc.method,
+                        detail,
+                    })
+                } else {
+                    Ok(value.get("result").cloned().unwrap_or(Value::Null))
+                };
+                let _ = pc.tx.send(result);
+            }
+        } else if let Some(method) = value.get("method").and_then(|v| v.as_str()) {
+            // CDP event — broadcast to subscribers
+            let session_id = value
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let evt = CdpEvent {
+                method: method.to_string(),
+                params: value.get("params").cloned().unwrap_or(Value::Null),
+                session_id,
+            };
+            let _ = events.send(evt);
+        }
+    }
+
+    /// Send a CDP command and wait for the response.
+    ///
+    /// If `session_id` is `Some`, the command is sent as a Target-scoped message;
+    /// if `None`, it is sent as a Browser-level message.
+    pub async fn call(
+        &self,
         method: &str,
         params: Value,
+        session_id: Option<&str>,
     ) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-
-        let cmd = serde_json::json!({
-            "id": id,
-            "method": method,
-            "params": params,
-            "sessionId": session_id,
-        });
-
-        let text = serde_json::to_string(&cmd)?;
-
+        let id = NEXT_CDP_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        {
-            let mut map = self.pending.lock().await;
-            map.insert(id, tx);
-        }
 
-        self.write.send(Message::Text(text)).await?;
+        let msg = InternalMessage::Call {
+            id,
+            method: method.to_string(),
+            params,
+            session_id: session_id.map(String::from),
+            tx,
+        };
 
-        let response = tokio::time::timeout(Duration::from_secs(30), rx)
+        self.write.send(msg).map_err(|_| CdpError::ConnectionFailed {
+            detail: "background I/O task has terminated".into(),
+        })?;
+
+        tokio::time::timeout(Duration::from_secs(30), rx)
             .await
-            .map_err(|_| CdpError::Timeout(30000))?
-            .map_err(|_| CdpError::ChannelBroken)?;
-
-        if let Some(err) = response.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error")
-                .to_string();
-            return Err(CdpError::CommandFailed {
+            .map_err(|_| CdpError::CdpCallFailed {
                 method: method.to_string(),
-                msg,
-            });
-        }
+                detail: "timeout waiting for response".into(),
+            })? // -> Result<Result<Value, CdpError>, RecvError>
+            .map_err(|_| CdpError::CdpCallFailed {
+                method: method.to_string(),
+                detail: "oneshot channel closed".into(),
+            })? // -> Result<Value, CdpError>
+    }
 
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    /// Subscribe to all CDP events broadcast from the browser.
+    pub fn event_rx(&self) -> broadcast::Receiver<CdpEvent> {
+        self.events.subscribe()
+    }
+
+    /// Disconnect cleanly. Closes the command channel and waits for the
+    /// background I/O task to finish.
+    pub async fn close(self) {
+        let Self {
+            write,
+            events: _,
+            handle,
+        } = self;
+        drop(write); // Signals the background loop to exit
+        let _ = handle.await;
     }
 }
 
@@ -198,5 +321,16 @@ mod tests {
         assert!(event.get("id").is_none());
         assert!(event.get("method").is_some());
         assert!(event.get("params").is_some());
+    }
+
+    #[test]
+    fn test_cdp_event_with_session_id() {
+        let event = json!({
+            "method": "Runtime.consoleAPICalled",
+            "params": {},
+            "sessionId": "session-123"
+        });
+        assert!(event.get("id").is_none());
+        assert_eq!(event["sessionId"].as_str(), Some("session-123"));
     }
 }

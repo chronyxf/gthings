@@ -88,8 +88,12 @@ impl Session {
         let mut rx = conn.event_rx();
 
         // 3. Start navigation
-        conn.call("Page.navigate", serde_json::json!({"url": url}), sid)
-            .await?;
+        conn.call(
+            "Page.navigate",
+            serde_json::json!({"url": url}),
+            sid,
+        )
+        .await?;
 
         // 4. Wait for networkIdle using the pre-subscribed receiver
         let result = wait_for_event(

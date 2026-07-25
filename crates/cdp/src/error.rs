@@ -1,33 +1,30 @@
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum CdpError {
-    #[error("Browser launch failed: {0}")]
-    LaunchFailed(String),
+    #[error("Browser not found on port {port}")]
+    BrowserNotFound { port: u16 },
 
-    #[error("WebSocket error: {0}")]
-    Ws(#[from] tokio_tungstenite::tungstenite::Error),
+    #[error("Connection failed: {detail}")]
+    ConnectionFailed { detail: String },
 
-    #[error("CDP command failed: {msg} (method: {method})")]
-    CommandFailed { method: String, msg: String },
+    #[error("CDP call {method} failed: {detail}")]
+    CdpCallFailed { method: String, detail: String },
 
-    #[error("Timeout after {0}ms")]
-    Timeout(u64),
-
-    #[error("Oneshot channel broken")]
-    ChannelBroken,
-
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("Navigation timeout: {url} did not load within {timeout}s")]
+    NavigationTimeout { url: String, timeout: u64 },
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Chrome process exited unexpectedly with code {0}")]
-    ChromeExited(i32),
+    #[error("WebSocket error: {0}")]
+    Ws(#[from] tokio_tungstenite::tungstenite::Error),
 
-    #[error("Could not find DevTools WebSocket URL in Chrome output")]
-    NoWsUrl,
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
 }
 
 pub type Result<T> = std::result::Result<T, CdpError>;
@@ -37,32 +34,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_error_display() {
-        let err = CdpError::LaunchFailed("test".into());
-        assert_eq!(format!("{}", err), "Browser launch failed: test");
+    fn test_error_display_browser_not_found() {
+        let err = CdpError::BrowserNotFound { port: 9222 };
+        assert_eq!(format!("{}", err), "Browser not found on port 9222");
+    }
 
-        let err = CdpError::NoWsUrl;
-        assert_eq!(
-            format!("{}", err),
-            "Could not find DevTools WebSocket URL in Chrome output"
-        );
+    #[test]
+    fn test_error_display_connection_failed() {
+        let err = CdpError::ConnectionFailed {
+            detail: "refused".into(),
+        };
+        assert_eq!(format!("{}", err), "Connection failed: refused");
+    }
 
-        let err = CdpError::Timeout(5000);
-        assert_eq!(format!("{}", err), "Timeout after 5000ms");
-
-        let err = CdpError::CommandFailed {
+    #[test]
+    fn test_error_display_cdp_call_failed() {
+        let err = CdpError::CdpCallFailed {
             method: "Page.navigate".into(),
-            msg: "timeout".into(),
+            detail: "timeout".into(),
         };
         assert_eq!(
             format!("{}", err),
-            "CDP command failed: timeout (method: Page.navigate)"
+            "CDP call Page.navigate failed: timeout"
         );
     }
 
     #[test]
-    fn test_error_debug() {
-        let err = CdpError::NoWsUrl;
-        assert!(format!("{:?}", err).contains("NoWsUrl"));
+    fn test_error_display_navigation_timeout() {
+        let err = CdpError::NavigationTimeout {
+            url: "https://example.com".into(),
+            timeout: 30,
+        };
+        assert_eq!(
+            format!("{}", err),
+            "Navigation timeout: https://example.com did not load within 30s"
+        );
     }
 }
