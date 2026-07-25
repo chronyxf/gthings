@@ -134,7 +134,7 @@ impl Browser {
             }
         };
 
-        if let Some(browser) = Self::find_existing(&profile_dir, cdp_port).await {
+        if let Some(browser) = Self::find_existing(Some(&profile_dir), cdp_port).await {
             tracing::info!("Found existing browser, reusing");
             return Ok(browser);
         }
@@ -228,6 +228,10 @@ impl Browser {
 
     /// Connect to CDP WebSocket.
     pub async fn connect(&self) -> Result<Connection> {
+        // Dismiss any "Allow debugging connection?" dialog
+        #[cfg(target_os = "macos")]
+        dismiss_allow_debugging_dialog();
+
         tracing::info!("Connecting to CDP: {}", self.ws_url);
 
         let (ws_stream, _) = tokio_tungstenite::connect_async(self.ws_url.clone()).await?;
@@ -240,11 +244,6 @@ impl Browser {
     /// Get the WebSocket URL.
     pub fn ws_url(&self) -> &str {
         &self.ws_url
-    }
-
-    /// Get the process ID (always 0; PID tracking was removed in stateless rewrite).
-    pub async fn pid(&self) -> u64 {
-        0
     }
 
     /// Locate Chrome executable.
@@ -319,7 +318,7 @@ impl Browser {
         #[cfg(target_os = "macos")]
         if let Some(bundle) = default_browser_bundle() {
             if let Some(suffix) = browser_profile_suffix(&bundle) {
-                if let Some(home) = Self::home_dir() {
+                if let Some(home) = std::env::var("HOME").ok().map(std::path::PathBuf::from) {
                     let path = home.join("Library/Application Support").join(suffix);
                     if path.exists() && !Self::is_profile_in_use(&path) {
                         return Some(path);
@@ -334,7 +333,7 @@ impl Browser {
             "Library/Application Support/Dia/User Data",
             "Library/Application Support/BraveSoftware/Brave-Browser/User Data",
         ];
-        if let Some(home) = Self::home_dir() {
+        if let Some(home) = std::env::var("HOME").ok().map(std::path::PathBuf::from) {
             for suffix in &common_paths {
                 let path = home.join(suffix);
                 if path.exists() && !Self::is_profile_in_use(&path) {
@@ -345,10 +344,6 @@ impl Browser {
 
         // No usable real profile found → use seeded temp
         None
-    }
-
-    fn home_dir() -> Option<std::path::PathBuf> {
-        std::env::var("HOME").ok().map(std::path::PathBuf::from)
     }
 
     /// Seed a fresh profile directory with synthetic Preferences and Local State
@@ -447,34 +442,77 @@ impl Browser {
         Self::probe_port(cdp_port)
     }
 
-    /// Find existing browser by reading DevToolsActivePort and verifying WS.
-    pub async fn find_existing(profile_dir: &std::path::Path, cdp_port: u16) -> Option<Self> {
-        // 1. Read DevToolsActivePort
-        let active_port_path = profile_dir.join("DevToolsActivePort");
-        let content = std::fs::read_to_string(&active_port_path).ok()?;
-        let lines: Vec<&str> = content.trim().lines().collect();
-        if lines.len() < 2 {
-            return None;
-        }
-
-        let file_port: u16 = lines[0].trim().parse().ok()?;
-        let ws_path = lines[1].trim();
-        if file_port != cdp_port {
-            return None;
-        }
-
-        // 2. TCP connect probe
+    /// Find existing browser by TCP probing and discovering WS URL.
+    pub async fn find_existing(explicit_profile_dir: Option<&std::path::Path>, cdp_port: u16) -> Option<Self> {
+        // Step 1: TCP probe — is anything listening on this port?
         if !Self::probe_port(cdp_port) {
             return None;
         }
 
-        // 3. Build WS URL and verify with Browser.getVersion
-        let ws_url = format!("ws://127.0.0.1:{}{}", cdp_port, ws_path);
-        Self::verify_ws(&ws_url).await?;
+        // Step 2: Try to discover WS URL from DevToolsActivePort
+        let ws_url = Self::discover_ws_url(explicit_profile_dir, cdp_port).await;
 
-        tracing::info!("Found existing browser on port {cdp_port}");
+        if let Some(ref url) = ws_url {
+            // Step 3: Verify via WebSocket
+            if Self::verify_ws(url).await.is_some() {
+                return Some(Browser {
+                    ws_url: url.clone(),
+                    cdp_port,
+                });
+            }
+        }
 
-        Some(Browser { ws_url, cdp_port })
+        None
+    }
+
+    /// Discover WS URL by searching for DevToolsActivePort in common profile paths.
+    pub async fn discover_ws_url(explicit_profile_dir: Option<&std::path::Path>, cdp_port: u16) -> Option<String> {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+        // 1. Explicit profile dir if provided
+        if let Some(dir) = explicit_profile_dir {
+            candidates.push(dir.to_path_buf());
+        }
+
+        // 2. Common macOS profile paths
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(home) = std::env::var("HOME").ok().map(std::path::PathBuf::from) {
+                let common = [
+                    "Library/Application Support/Dia/User Data",
+                    "Library/Application Support/Google/Chrome",
+                    "Library/Application Support/BraveSoftware/Brave-Browser/User Data",
+                    "Library/Application Support/Microsoft Edge/User Data",
+                ];
+                for path in &common {
+                    let full = home.join(path);
+                    if full.exists() {
+                        candidates.push(full);
+                    }
+                }
+            }
+        }
+
+        // Deduplicate
+        candidates.sort();
+        candidates.dedup();
+
+        for profile_dir in &candidates {
+            let active_port_path = profile_dir.join("DevToolsActivePort");
+            if let Ok(content) = std::fs::read_to_string(&active_port_path) {
+                let lines: Vec<&str> = content.trim().lines().collect();
+                if lines.len() >= 2 {
+                    if let Ok(file_port) = lines[0].trim().parse::<u16>() {
+                        if file_port == cdp_port {
+                            let ws_path = lines[1].trim();
+                            return Some(format!("ws://127.0.0.1:{}{}", cdp_port, ws_path));
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Verify a WebSocket debugger URL by connecting and sending Browser.getVersion.
@@ -491,7 +529,7 @@ impl Browser {
 
     /// Probe port to see if it's accepting connections.
     /// Tries IPv4 first, then IPv6.
-    fn probe_port(cdp_port: u16) -> bool {
+    pub fn probe_port(cdp_port: u16) -> bool {
         let addrs = [format!("127.0.0.1:{cdp_port}"), format!("[::1]:{cdp_port}")];
         for addr in &addrs {
             if let Ok(parsed) = addr.parse::<std::net::SocketAddr>() {
@@ -509,6 +547,36 @@ impl Browser {
     }
 
 }
+
+/// Dismiss the "Allow debugging connection?" dialog that may appear when
+/// connecting to a Chrome/Dia browser profile via CDP for the first time.
+/// Uses macOS AppleScript to programmatically click the "Allow" button.
+#[cfg(target_os = "macos")]
+pub fn dismiss_allow_debugging_dialog() {
+    // Try AppleScript to click "Allow" button in the dialog
+    let script = r#"tell application "System Events"
+        set diaProcess to first process whose name contains "Dia" or name contains "Google Chrome" or name contains "Chromium"
+        tell diaProcess
+            set allowButton to first button of first window whose description contains "Allow"
+            if allowButton exists then
+                click allowButton
+            end if
+        end tell
+    end tell"#;
+
+    let _ = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .output();
+
+    // Also try simple Return keystroke as fallback
+    let _ = std::process::Command::new("osascript")
+        .args(["-e", r#"tell application "System Events" to keystroke return"#])
+        .output();
+}
+
+/// Non-macOS: no-op
+#[cfg(not(target_os = "macos"))]
+pub fn dismiss_allow_debugging_dialog() {}
 
 impl Drop for Browser {
     fn drop(&mut self) {

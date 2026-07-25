@@ -120,3 +120,47 @@ fn test_cleanup_browser() {
         status_json
     );
 }
+
+// Test 6: No state file is written (stateless design)
+#[test]
+fn test_no_state_file_created() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let state_path = std::path::Path::new(&home).join(".gthings").join("browser.json");
+    assert!(!state_path.exists(), "State file should not exist (stateless design)");
+}
+
+// Test 7: dismiss_allow_debugging_dialog does not panic
+#[test]
+fn test_dismiss_dialog_no_panic() {
+    // dismiss_allow_debugging_dialog should not panic even when no dialog is shown
+    gthings_cdp::browser::dismiss_allow_debugging_dialog();
+}
+
+// Test 8: Browser detection on unused port
+#[test]
+fn test_browser_detection() {
+    // Use a non-standard port so we don't interfere with user's browser
+    let port = 29997;
+
+    // Should not find a browser on unused port
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(async {
+        gthings_cdp::Browser::find_existing(None, port).await
+    });
+    assert!(result.is_none(), "Should not find browser on unused port {}", port);
+}
+
+// Test 9: Follow extracts content from example.com
+#[test]
+fn test_follow_extracts_content() {
+    let (json, _) = crate::common::run_gthings(&[
+        "--json", "follow", "url", "https://example.com",
+    ]);
+    assert!(json.get("content").is_some(), "Follow should extract content");
+    let content = json["content"].as_str().unwrap_or("");
+    assert!(!content.is_empty(), "Content should not be empty");
+    assert!(
+        content.contains("Example Domain") || content.contains("example"),
+        "Content should contain expected text"
+    );
+}

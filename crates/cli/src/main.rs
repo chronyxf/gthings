@@ -295,14 +295,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
 // Browser lifecycle handlers
 
-/// Path to the browser state file.
-fn browser_state_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-    home.join(".gthings").join("browser.json")
-}
-
 /// Start the persistent browser.
 async fn handle_browser_start(
     json: bool,
@@ -319,18 +311,16 @@ async fn handle_browser_start(
         .connect()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect: {e}"))?;
-    let pid = browser.pid().await;
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "status": "started",
-                "pid": pid,
                 "ws_url": browser.ws_url(),
             })
         );
     } else {
-        println!("Browser started (pid={})", pid);
+        println!("Browser started");
         println!("WebSocket URL: {}", browser.ws_url());
     }
     Ok(())
@@ -338,31 +328,43 @@ async fn handle_browser_start(
 
 /// Stop the persistent browser.
 async fn handle_browser_stop(json: bool) -> Result<(), anyhow::Error> {
-    let state_path = browser_state_path();
-    if !state_path.exists() {
+    let cdp_port = std::env::var("GTHINGS_CDP_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(9222);
+
+    let output = std::process::Command::new("lsof")
+        .args(["-ti", &format!(":{}", cdp_port)])
+        .output()
+        .ok();
+
+    let Some(output) = output else {
         if json {
             println!("{}", serde_json::json!({"status": "not_running"}));
         } else {
-            println!("No browser state found — browser is not running");
+            println!("No browser found on port {} — browser is not running", cdp_port);
+        }
+        return Ok(());
+    };
+
+    let pids = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if pids.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({"status": "not_running"}));
+        } else {
+            println!("No browser found on port {} — browser is not running", cdp_port);
         }
         return Ok(());
     }
-    let state_str = std::fs::read_to_string(&state_path)?;
-    let state: serde_json::Value = serde_json::from_str(&state_str)?;
-    let pid = state["pid"].as_u64().unwrap_or(0);
 
-    if pid > 0 {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .status();
+    for pid_str in pids.lines() {
+        let _ = std::process::Command::new("kill").arg(pid_str).status();
     }
 
-    std::fs::remove_file(&state_path)?;
-
     if json {
-        println!("{}", serde_json::json!({"status": "stopped", "pid": pid}));
+        println!("{}", serde_json::json!({"status": "stopped", "pid_count": pids.lines().count()}));
     } else {
-        println!("Browser stopped (pid={})", pid);
+        println!("Browser stopped ({} process{})", pids.lines().count(), if pids.lines().count() == 1 { "" } else { "es" });
     }
     Ok(())
 }
@@ -372,24 +374,22 @@ async fn handle_browser_status(
     json: bool,
     config: &gthings_common::config::GthingsConfig,
 ) -> Result<(), anyhow::Error> {
-    let profile_dir = config
-        .profile_dir
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    let existing = gthings_cdp::Browser::find_existing(&profile_dir, config.cdp_port).await;
+    let existing = gthings_cdp::Browser::find_existing(
+        config.profile_dir.as_deref(),
+        config.cdp_port,
+    ).await;
+
     if let Some(browser) = existing {
-        let pid = browser.pid().await;
         if json {
             println!(
                 "{}",
                 serde_json::json!({
                     "status": "running",
-                    "pid": pid,
                     "ws_url": browser.ws_url(),
                 })
             );
         } else {
-            println!("Browser is RUNNING (pid={})", pid);
+            println!("Browser is RUNNING");
             println!("WebSocket URL: {}", browser.ws_url());
         }
     } else {

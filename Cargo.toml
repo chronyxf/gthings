@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dev-dependencies]
+gthings-cdp = { path = "crates/cdp" }
 gthings-common = { path = "crates/common" }
 gthings-extraction = { path = "crates/extraction" }
 gthings-search = { path = "crates/search" }
