@@ -260,9 +260,9 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         },
         Command::Browser(args) => match &args.command {
-            BrowserCommand::Start => handle_browser_start(cli.json).await,
+            BrowserCommand::Start => handle_browser_start(cli.json, &config).await,
             BrowserCommand::Stop => handle_browser_stop(cli.json).await,
-            BrowserCommand::Status => handle_browser_status(cli.json).await,
+            BrowserCommand::Status => handle_browser_status(cli.json, &config).await,
         },
         Command::Update => cmd_update().await,
         Command::Skill(args) => cmd_skill(args).await,
@@ -304,10 +304,17 @@ fn browser_state_path() -> std::path::PathBuf {
 }
 
 /// Start the persistent browser.
-async fn handle_browser_start(json: bool) -> Result<(), anyhow::Error> {
-    let browser = gthings_cdp::Browser::launch()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start browser: {e}"))?;
+async fn handle_browser_start(
+    json: bool,
+    config: &gthings_common::config::GthingsConfig,
+) -> Result<(), anyhow::Error> {
+    let browser = gthings_cdp::Browser::launch(
+        config.browser_path.clone(),
+        config.profile_dir.clone(),
+        config.cdp_port,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to start browser: {e}"))?;
     let _conn = browser
         .connect()
         .await
@@ -361,8 +368,11 @@ async fn handle_browser_stop(json: bool) -> Result<(), anyhow::Error> {
 }
 
 /// Show browser status.
-async fn handle_browser_status(json: bool) -> Result<(), anyhow::Error> {
-    let existing = gthings_cdp::Browser::find_existing().await;
+async fn handle_browser_status(
+    json: bool,
+    config: &gthings_common::config::GthingsConfig,
+) -> Result<(), anyhow::Error> {
+    let existing = gthings_cdp::Browser::find_existing(config.cdp_port).await;
     if let Some(browser) = existing {
         let pid = browser.pid().await.unwrap_or(0);
         if json {

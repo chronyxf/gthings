@@ -1,5 +1,18 @@
 # Changelog — gthings-cdp
 
+## 0.3.3 (2026-07-25)
+
+### Features
+
+- batch harvest with parallel sessions and SERP filtering
+- add daemon context to trace and browser type detection
+- add direct CDP browser automation crate
+
+### Fixes
+
+- daemonize, close orphan tabs, add changeset tooling
+- format changelog
+
 ## 0.3.2 — 2026-07-24
 
 ### Changed

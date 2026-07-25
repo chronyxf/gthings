@@ -1,6 +1,6 @@
 [package]
 name = "gthings-search"
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ description = "Web search orchestration: Google CDP search, page following, batc
 
 [dependencies]
 gthings-common = { path = "../common", version = "0.3.2" }
-gthings-extraction = { path = "../extraction", version = "0.3.1" }
+gthings-extraction = { path = "../extraction", version = "0.3.2" }
 gthings-cdp = { path = "../cdp", version = "0.3.2" }
 tokio = { workspace = true }
 serde = { workspace = true }

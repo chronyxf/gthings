@@ -6,11 +6,11 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing;
 
-const CDP_PORT: u16 = 9222;
-
 /// A persistent Chrome browser instance. Stays alive after Drop.
 pub struct Browser {
     ws_url: String,
+    #[allow(dead_code)]
+    cdp_port: u16,
 }
 
 /// Saved browser state for reuse across commands.
@@ -19,25 +19,102 @@ struct BrowserState {
     pid: u32,
 }
 
+/// Detect the default browser for HTTP URLs using macOS Launch Services.
+/// Returns the path to the .app bundle (e.g., "/Applications/Google Chrome.app").
+#[cfg(target_os = "macos")]
+fn default_browser_bundle() -> Option<std::path::PathBuf> {
+    let script = r#"import AppKit; let ws = NSWorkspace.shared; if let url = ws.urlForApplication(toOpen: URL(string: "https://")!) { print(url.path) }"#;
+    let output = std::process::Command::new("swift")
+        .args(["-e", script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path_str = std::str::from_utf8(&output.stdout).ok()?.trim();
+    if path_str.is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(path_str);
+    if path.exists() { Some(path) } else { None }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_browser_bundle() -> Option<std::path::PathBuf> {
+    None // Non-macOS fallback: no default browser detection
+}
+
+/// Map a browser bundle path to its executable name inside Contents/MacOS/
+fn browser_exec_name(bundle_path: &std::path::Path) -> Option<&'static str> {
+    let path_str = bundle_path.to_string_lossy();
+    if path_str.contains("Google Chrome") {
+        Some("Google Chrome")
+    } else if path_str.contains("Dia") {
+        Some("Dia")
+    } else if path_str.contains("Arc") {
+        Some("Arc")
+    } else if path_str.contains("Brave Browser") || path_str.contains("Brave") {
+        Some("Brave Browser")
+    } else if path_str.contains("Microsoft Edge") {
+        Some("Microsoft Edge")
+    } else if path_str.contains("Chromium") {
+        Some("Chromium")
+    } else {
+        None
+    }
+}
+
+/// Map a browser bundle path to its profile directory suffix (under ~/Library/Application Support/)
+fn browser_profile_suffix(bundle_path: &std::path::Path) -> Option<&'static str> {
+    let path_str = bundle_path.to_string_lossy();
+    if path_str.contains("Google Chrome") {
+        Some("Google/Chrome")
+    } else if path_str.contains("Dia") {
+        Some("Dia")
+    } else if path_str.contains("Arc") {
+        Some("Arc")
+    } else if path_str.contains("Brave Browser") || path_str.contains("Brave") {
+        Some("BraveSoftware/Brave-Browser")
+    } else if path_str.contains("Microsoft Edge") {
+        Some("Microsoft Edge")
+    } else if path_str.contains("Chromium") {
+        Some("Chromium")
+    } else {
+        None
+    }
+}
+
+/// Build the executable path from a bundle path
+fn bundle_to_exec(bundle: &std::path::Path, exec_name: &str) -> std::path::PathBuf {
+    bundle.join("Contents").join("MacOS").join(exec_name)
+}
+
 impl Browser {
-    /// Launch or reuse a persistent Chrome browser on port 9222.
+    /// Launch or reuse a persistent Chrome browser.
     #[allow(clippy::result_large_err)]
-    pub async fn launch() -> Result<Self> {
-        tracing::info!("Checking for existing browser on port 9222");
-        if let Some(browser) = Self::find_existing().await {
+    pub async fn launch(
+        browser_path: Option<std::path::PathBuf>,
+        profile_dir: Option<std::path::PathBuf>,
+        cdp_port: u16,
+    ) -> Result<Self> {
+        tracing::info!("Checking for existing browser on port {cdp_port}");
+        if let Some(browser) = Self::find_existing(cdp_port).await {
             tracing::info!("Found existing browser, reusing");
             return Ok(browser);
         }
         tracing::info!("No existing browser found, launching new one");
 
-        let chrome_path = Self::find_chrome()
+        let chrome_path = Self::find_chrome(browser_path)
             .ok_or_else(|| CdpError::LaunchFailed("No Chrome/Chromium browser found".into()))?;
 
-        let port = CDP_PORT;
+        let port = cdp_port;
 
         // Use real profile to avoid onboarding / first-run dialogs
-        let profile_dir = Self::real_profile_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from(format!("/tmp/cdp-profile-{}", port)));
+        let profile_dir = Self::real_profile_dir(profile_dir).unwrap_or_else(|| {
+            let tmp = std::path::PathBuf::from(format!("/tmp/gthings-{}", port));
+            let _ = std::fs::create_dir_all(&tmp);
+            tmp
+        });
         {
             let dir = profile_dir.clone();
             tokio::task::spawn_blocking(move || {
@@ -56,6 +133,8 @@ impl Browser {
         let mut cmd = Command::new(&chrome_path);
         cmd.arg(format!("--remote-debugging-port={}", port))
             .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--disable-sync")
             .arg("--remote-allow-origins=*")
             .arg(format!("--user-data-dir={}", profile_dir.display()))
             .arg("about:blank")
@@ -115,7 +194,7 @@ impl Browser {
         // Detach — browser stays alive after Drop
         drop(child);
 
-        Ok(Browser { ws_url })
+        Ok(Browser { ws_url, cdp_port })
     }
 
     /// Connect to CDP WebSocket.
@@ -135,35 +214,52 @@ impl Browser {
     }
 
     /// Locate Chrome executable.
-    fn find_chrome() -> Option<String> {
+    fn find_chrome(browser_path: Option<std::path::PathBuf>) -> Option<String> {
+        // 1. Check explicit env var first (already done in Level 0)
+        if let Some(path) = browser_path {
+            if path.exists() {
+                return Some(path.to_string_lossy().to_string());
+            }
+        }
+
+        // 2. Check macOS default browser
+        #[cfg(target_os = "macos")]
+        if let Some(bundle) = default_browser_bundle() {
+            if let Some(exec_name) = browser_exec_name(&bundle) {
+                let exec = bundle_to_exec(&bundle, exec_name);
+                if exec.exists() {
+                    return Some(exec.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        // 3. Fallback: hardcoded path list (original behavior)
         let candidates = [
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chrome.app/Contents/MacOS/Chrome",
             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
             "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Arc.app/Contents/MacOS/Arc",
+            "/Applications/Dia.app/Contents/MacOS/Dia",
             "/usr/bin/chromium",
             "/usr/bin/chromium-browser",
             "/snap/bin/chromium",
-            "/Applications/Dia.app/Contents/MacOS/Dia",
         ];
 
-        for path in &candidates {
-            if std::path::Path::new(path).exists() {
-                return Some(path.to_string());
+        for candidate in &candidates {
+            if std::path::Path::new(candidate).exists() {
+                return Some(candidate.to_string());
             }
         }
 
-        if let Ok(path) = std::process::Command::new("which")
-            .arg("google-chrome")
-            .arg("chromium")
-            .arg("google-chrome-stable")
-            .arg("dia")
-            .output()
-        {
-            let output = String::from_utf8_lossy(&path.stdout);
-            for line in output.lines() {
-                if !line.is_empty() {
-                    return Some(line.to_string());
+        // 4. Fallback: `which` search
+        for name in &["google-chrome", "chromium", "google-chrome-stable", "dia"] {
+            if let Ok(output) = std::process::Command::new("which").arg(name).output() {
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !path.is_empty() && std::path::Path::new(&path).exists() {
+                        return Some(path);
+                    }
                 }
             }
         }
@@ -172,19 +268,48 @@ impl Browser {
     }
 
     /// Locate browser profile directory.
-    fn real_profile_dir() -> Option<std::path::PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        let candidates = [
-            std::path::PathBuf::from(&home).join("Library/Application Support/Dia/User Data"),
-            std::path::PathBuf::from(&home).join("Library/Application Support/Google/Chrome"),
-            std::path::PathBuf::from(&home).join("Library/Application Support/Chromium"),
-        ];
-
-        for candidate in &candidates {
-            if candidate.exists() {
-                return Some(candidate.clone());
+    fn real_profile_dir(profile_dir: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+        // 1. Check explicit env var first (already done in Level 0)
+        if let Some(dir) = profile_dir {
+            if dir.exists() {
+                return Some(dir);
             }
         }
+
+        let home = std::env::var("HOME").ok()?;
+
+        // 2. Try to match profile to the default browser
+        #[cfg(target_os = "macos")]
+        if let Some(bundle) = default_browser_bundle() {
+            if let Some(suffix) = browser_profile_suffix(&bundle) {
+                let profile = std::path::PathBuf::from(&home)
+                    .join("Library/Application Support")
+                    .join(suffix);
+                if profile.exists() {
+                    return Some(profile);
+                }
+            }
+        }
+
+        // 3. Fallback: check common profile directories (prioritize Chrome)
+        let common_profiles = [
+            "Google/Chrome",
+            "Dia",
+            "Chromium",
+            "BraveSoftware/Brave-Browser",
+            "Microsoft Edge",
+            "Arc",
+        ];
+
+        for suffix in &common_profiles {
+            let profile = std::path::PathBuf::from(&home)
+                .join("Library/Application Support")
+                .join(suffix);
+            if profile.exists() {
+                return Some(profile);
+            }
+        }
+
         None
     }
 
@@ -204,9 +329,9 @@ impl Browser {
         }
     }
 
-    /// Check if the browser is alive by probing port 9222.
-    pub fn is_alive() -> bool {
-        Self::probe_port()
+    /// Check if the browser is alive by probing the given port.
+    pub fn is_alive(cdp_port: u16) -> bool {
+        Self::probe_port(cdp_port)
     }
 
     /// Get the path to the browser state file.
@@ -227,7 +352,7 @@ impl Browser {
     }
 
     /// Find existing browser via state file and port probe.
-    pub async fn find_existing() -> Option<Self> {
+    pub async fn find_existing(cdp_port: u16) -> Option<Self> {
         let state_path = Self::state_path();
         if !state_path.exists() {
             return None;
@@ -251,10 +376,10 @@ impl Browser {
             return None;
         }
 
-        if !Self::probe_port() {
+        if !Self::probe_port(cdp_port) {
             tracing::warn!(
                 "Browser port {} not responding, removing stale state",
-                CDP_PORT
+                cdp_port
             );
             let path = state_path.clone();
             tokio::task::spawn_blocking(move || {
@@ -265,16 +390,16 @@ impl Browser {
             return None;
         }
 
-        let ws_url = Self::fetch_ws_url().await?;
+        let ws_url = Self::fetch_ws_url(cdp_port).await?;
 
         tracing::info!("Found existing browser (pid={})", state.pid);
 
-        Some(Browser { ws_url })
+        Some(Browser { ws_url, cdp_port })
     }
 
     /// Fetch WebSocket debugger URL from /json/version.
-    async fn fetch_ws_url() -> Option<String> {
-        let url = format!("http://127.0.0.1:{}/json/version", CDP_PORT);
+    async fn fetch_ws_url(cdp_port: u16) -> Option<String> {
+        let url = format!("http://127.0.0.1:{cdp_port}/json/version");
         let resp = reqwest::get(&url).await.ok()?;
         let json: serde_json::Value = resp.json().await.ok()?;
         json["webSocketDebuggerUrl"].as_str().map(|s| s.to_string())
@@ -290,13 +415,10 @@ impl Browser {
             .unwrap_or(false)
     }
 
-    /// Probe port 9222 to see if it's accepting connections.
+    /// Probe port to see if it's accepting connections.
     /// Tries IPv4 first, then IPv6.
-    fn probe_port() -> bool {
-        let addrs = [
-            format!("127.0.0.1:{}", CDP_PORT),
-            format!("[::1]:{}", CDP_PORT),
-        ];
+    fn probe_port(cdp_port: u16) -> bool {
+        let addrs = [format!("127.0.0.1:{cdp_port}"), format!("[::1]:{cdp_port}")];
         for addr in &addrs {
             if let Ok(parsed) = addr.parse::<std::net::SocketAddr>() {
                 if std::net::TcpStream::connect_timeout(
@@ -342,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_probe_port_no_server() {
-        assert_eq!(Browser::is_alive(), Browser::probe_port());
+        assert_eq!(Browser::is_alive(9222), Browser::probe_port(9222));
     }
 
     #[test]
@@ -353,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_find_chrome_returns_some_or_none() {
-        let result = Browser::find_chrome();
+        let result = Browser::find_chrome(None);
         // Either finds Chrome or returns None — don't panic either way
         if let Some(path) = result {
             assert!(

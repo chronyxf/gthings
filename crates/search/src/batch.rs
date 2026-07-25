@@ -88,9 +88,13 @@ impl BatchProcessor {
         let start = Instant::now();
 
         let browser = Arc::new(
-            Browser::launch()
-                .await
-                .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?,
+            Browser::launch(
+                self.config.browser_path.clone(),
+                self.config.profile_dir.clone(),
+                self.config.cdp_port,
+            )
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?,
         );
         let ws_url = browser.ws_url().to_string();
 
@@ -244,9 +248,13 @@ impl BatchProcessor {
         }
 
         let browser = Arc::new(
-            Browser::launch()
-                .await
-                .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?,
+            Browser::launch(
+                self.config.browser_path.clone(),
+                self.config.profile_dir.clone(),
+                self.config.cdp_port,
+            )
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?,
         );
         let ws_url = browser.ws_url().to_string();
 
@@ -383,9 +391,13 @@ impl BatchProcessor {
 
         // Phase 1: Search all queries (parallel)
         let browser = Arc::new(
-            Browser::launch()
-                .await
-                .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?,
+            Browser::launch(
+                self.config.browser_path.clone(),
+                self.config.profile_dir.clone(),
+                self.config.cdp_port,
+            )
+            .await
+            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?,
         );
         let ws_url = browser.ws_url().to_string();
 

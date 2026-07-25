@@ -97,13 +97,14 @@ async fn wait_for_page_load(
 /// with [`HtmlExtractor`], checks quality, and persists to disk cache.
 pub struct PageFollower {
     cache: Sha256DiskCache,
+    config: GthingsConfig,
 }
 
 impl PageFollower {
     /// Create a new [`PageFollower`].
     pub fn new(config: GthingsConfig) -> Self {
         let cache = Sha256DiskCache::new(&config.cache_dir, config.cache_ttl_secs);
-        Self { cache }
+        Self { cache, config }
     }
 
     /// Internal helper: follow a URL with cache check + set.
@@ -185,9 +186,13 @@ impl PageFollower {
     ) -> Result<FollowResult, GthingsError> {
         // Step 1: Browser launch / reuse
         let browser_start = Instant::now();
-        let browser = Browser::launch()
-            .await
-            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
+        let browser = Browser::launch(
+            self.config.browser_path.clone(),
+            self.config.profile_dir.clone(),
+            self.config.cdp_port,
+        )
+        .await
+        .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
         if let Some(ref mut t) = trace {
             t.step(
                 "session",

@@ -20,12 +20,14 @@ use crate::types::{BatchSearchResult, SearchMeta, SearchResult};
 /// Each [`query`](GoogleSearch::query) call launches an ephemeral Chrome
 /// instance, navigates to `google.com/search`, extracts organic results
 /// via CDP JavaScript evaluation, then shuts Chrome down on Drop.
-pub struct GoogleSearch;
+pub struct GoogleSearch {
+    config: GthingsConfig,
+}
 
 impl GoogleSearch {
     /// Create a new [`GoogleSearch`] instance.
-    pub fn new(_config: GthingsConfig) -> Self {
-        Self
+    pub fn new(config: GthingsConfig) -> Self {
+        Self { config }
     }
 
     /// Execute a single Google search query.
@@ -93,9 +95,13 @@ impl GoogleSearch {
     ) -> Result<Vec<SearchResult>, GthingsError> {
         // Step 1: Browser launch / reuse
         let browser_start = Instant::now();
-        let browser = Browser::launch()
-            .await
-            .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
+        let browser = Browser::launch(
+            self.config.browser_path.clone(),
+            self.config.profile_dir.clone(),
+            self.config.cdp_port,
+        )
+        .await
+        .map_err(|e| GthingsError::Cdp(format!("Launch: {e}")))?;
         if let Some(ref mut t) = trace {
             t.step(
                 "session",
