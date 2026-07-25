@@ -180,7 +180,7 @@ impl ContentQuality {
     /// # Examples
     ///
     /// ```
-    /// # use extraction::ContentQuality;
+    /// # use gthings_extraction::ContentQuality;
     /// assert!(ContentQuality::detect_bot("Checking your browser before accessing"));
     /// assert!(!ContentQuality::detect_bot("Normal article content here"));
     /// ```

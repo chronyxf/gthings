@@ -1,5 +1,13 @@
 # Changelog — gthings-extraction
 
+## 0.3.2 (2026-07-25)
+
+### Fixes
+
+#### - Updated ContentQuality validation thresholds
+
+- Internal refactoring in quality module
+
 ## 0.3.1 — 2026-07-24
 
 ### Changed
