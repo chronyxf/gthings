@@ -262,21 +262,6 @@ impl PageFollower {
             .await
             .map_err(|e| GthingsError::Cdp(format!("Title: {e}")))?;
 
-        // Dismiss any overlays blocking content (e.g. sign-in dialogs)
-        tab.evaluate(
-            &mut conn,
-            r#"(() => {
-    const d = () => {
-        document.querySelectorAll('[class*="onboarding"],[class*="welcome"],[class*="signin"],[class*="sign-in"],[class*="login"],[aria-modal="true"],[role="dialog"],[class*="overlay"]').forEach(e=>e.remove());
-        document.querySelectorAll('iframe[src*="atlassian"],iframe[src*="login"],iframe[src*="accounts"]').forEach(e=>e.remove());
-        document.querySelectorAll('button,a[role="button"]').forEach(b=>{if(/skip|maybe later|not now|dismiss|close|no thanks/i.test(b.textContent))b.click()});
-    };
-    d();
-})()"#,
-        )
-        .await
-        .ok();
-
         // Extract HTML and parse with HtmlExtractor
         let html = tab
             .extract_html(&mut conn)

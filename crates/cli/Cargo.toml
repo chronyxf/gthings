@@ -8,7 +8,7 @@ description = "CLI binary for gthings — browser-automated web research toolkit
 
 [dependencies]
 gthings-common = { path = "../common", version = "0.3.2" }
-gthings-search = { path = "../search", version = "0.3.7" }
+gthings-search = { path = "../search", version = "0.3.8" }
 gthings-extraction = { path = "../extraction", version = "0.3.1" }
 gthings-cdp = { path = "../cdp", version = "0.4.6" }
 clap = { workspace = true, features = ["derive"] }

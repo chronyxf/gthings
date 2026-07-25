@@ -121,12 +121,18 @@ impl Browser {
     ) -> Result<Self> {
         tracing::info!("Checking for existing browser on port {cdp_port}");
 
-        // Resolve profile directory before find_existing (needs path for DevToolsActivePort)
-        let profile_dir = Self::real_profile_dir(profile_dir).unwrap_or_else(|| {
-            let tmp = std::path::PathBuf::from(format!("/tmp/gthings-{}", cdp_port));
-            let _ = std::fs::create_dir_all(&tmp);
-            tmp
-        });
+        // gsearch approach: prefer real profile if available AND not in use.
+        // If real profile is in use (user's browser is open), fall back to
+        // seeded temp profile to avoid crashing the user's session.
+        let profile_dir = match Self::resolve_profile(profile_dir) {
+            Some(dir) => dir,
+            None => {
+                let tmp = std::path::PathBuf::from(format!("/tmp/gthings-{}", cdp_port));
+                let _ = std::fs::create_dir_all(&tmp);
+                Self::seed_profile(&tmp);
+                tmp
+            }
+        };
 
         if let Some(browser) = Self::find_existing(&profile_dir, cdp_port).await {
             tracing::info!("Found existing browser, reusing");
@@ -139,19 +145,16 @@ impl Browser {
 
         let port = cdp_port;
 
-        // If no existing browser is found, we clean locks and launch fresh.
-
-        // Check if the profile directory is currently in use by another browser process
-        // before cleaning SingletonLocks. This prevents crashing a real user session.
-        if Self::is_profile_in_use(&profile_dir) {
+        // Only check profile-in-use for real profiles (temp profiles are always clean)
+        if profile_dir.to_string_lossy().contains("/tmp/") {
+            // Temp profile — no lock cleaning needed
+        } else if Self::is_profile_in_use(&profile_dir) {
             return Err(CdpError::LaunchFailed(format!(
-                "Profile {:?} is already in use by another browser. Close it first.",
+                "Profile {:?} is in use by another browser. Close it first or set GTHINGS_PROFILE_DIR.",
                 profile_dir
             )));
-        }
-
-        // Clean locks before fresh launch
-        {
+        } else {
+            // Clean locks on real profile before launch
             let dir = profile_dir.clone();
             tokio::task::spawn_blocking(move || {
                 Self::clean_profile_locks(&dir);
@@ -298,50 +301,106 @@ impl Browser {
         None
     }
 
-    /// Locate browser profile directory.
-    fn real_profile_dir(profile_dir: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
-        // 1. Check explicit env var first (GTHINGS_PROFILE_DIR)
-        if let Some(dir) = profile_dir {
-            if dir.exists() {
-                return Some(dir);
-            }
-        }
-
-        let home = std::env::var("HOME").ok()?;
-
-        // 2. Try to match profile to the default browser
-        #[cfg(target_os = "macos")]
-        if let Some(bundle) = default_browser_bundle() {
-            if let Some(suffix) = browser_profile_suffix(&bundle) {
-                let profile = std::path::PathBuf::from(&home)
-                    .join("Library/Application Support")
-                    .join(suffix);
-                if profile.exists() {
-                    return Some(profile);
+    /// Resolve which profile directory to use.
+    /// Returns the real profile if available AND not in use by another browser.
+    /// Returns None to signal that a seeded temp profile should be used.
+    fn resolve_profile(explicit: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+        // 1. Explicit profile from env var takes priority
+        if let Some(p) = explicit {
+            if p.exists() {
+                // Even explicit: check not in use to avoid crashes
+                if !Self::is_profile_in_use(&p) {
+                    return Some(p);
                 }
             }
         }
 
-        // 3. Fallback: check common profile directories
-        let common_profiles = [
-            "Google/Chrome/User Data",
-            "Dia/User Data",
-            "Chromium/User Data",
-            "BraveSoftware/Brave-Browser/User Data",
-            "Microsoft Edge/User Data",
-            "Arc/User Data",
-        ];
-
-        for suffix in &common_profiles {
-            let profile = std::path::PathBuf::from(&home)
-                .join("Library/Application Support")
-                .join(suffix);
-            if profile.exists() {
-                return Some(profile);
+        // 2. macOS default browser's real profile
+        #[cfg(target_os = "macos")]
+        if let Some(bundle) = default_browser_bundle() {
+            if let Some(suffix) = browser_profile_suffix(&bundle) {
+                if let Some(home) = Self::home_dir() {
+                    let path = home.join("Library/Application Support").join(suffix);
+                    if path.exists() && !Self::is_profile_in_use(&path) {
+                        return Some(path);
+                    }
+                }
             }
         }
 
+        // 3. Fallback: common profile paths (check not in use)
+        let common_paths = [
+            "Library/Application Support/Google/Chrome/User Data",
+            "Library/Application Support/Dia/User Data",
+            "Library/Application Support/BraveSoftware/Brave-Browser/User Data",
+        ];
+        if let Some(home) = Self::home_dir() {
+            for suffix in &common_paths {
+                let path = home.join(suffix);
+                if path.exists() && !Self::is_profile_in_use(&path) {
+                    return Some(path);
+                }
+            }
+        }
+
+        // No usable real profile found → use seeded temp
         None
+    }
+
+    fn home_dir() -> Option<std::path::PathBuf> {
+        std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    }
+
+    /// Seed a fresh profile directory with synthetic Preferences and Local State
+    /// to suppress ALL first-run dialogs including sign-in forms.
+    /// Matches gsearch's `_pre_seed_profile()` function exactly.
+    fn seed_profile(profile_dir: &std::path::Path) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        // Write Preferences (suppresses welcome page, onboarding, etc.)
+        let prefs = serde_json::json!({
+            "browser": {
+                "has_seen_welcome_page": true
+            },
+            "profile": {
+                "exit_type": "Normal"
+            },
+            "default_apps_install_state": 3,
+            "in_product_help": {
+                "session_last_active_time": now.to_string(),
+                "session_number": 5,
+                "session_start_time": now.to_string()
+            }
+        });
+
+        // Write Local State (enterprise policy: skip_first_run_ui SUPPRESSES ALL DIALOGS)
+        let local_state = serde_json::json!({
+            "browser": {
+                "enabled_labs_experiments": [],
+                "last_redirect_origin": "",
+                "last_whats_new_milestone": "150"
+            },
+            "distribution": {
+                "skip_first_run_ui": true  // ← THIS IS THE KEY FIELD
+            }
+        });
+
+        // Write to both User Data/Default and Default (matching gsearch)
+        for sub in &["User Data/Default", "Default"] {
+            let prefs_dir = profile_dir.join(sub);
+            let _ = std::fs::create_dir_all(&prefs_dir);
+            let _ = std::fs::write(prefs_dir.join("Preferences"), serde_json::to_string(&prefs).unwrap());
+        }
+
+        // Write Local State to User Data and root (matching gsearch)
+        for sub in &["User Data", "."] {
+            let state_dir = profile_dir.join(sub);
+            let _ = std::fs::create_dir_all(&state_dir);
+            let _ = std::fs::write(state_dir.join("Local State"), serde_json::to_string(&local_state).unwrap());
+        }
     }
 
     /// Clean profile lock files.

@@ -1,5 +1,18 @@
 # Changelog — gthings-cdp
 
+## 0.4.8 (2026-07-25)
+
+### Fixes
+
+#### - Fix: refactor profile resolution to match gsearch's proven approach
+
+- Add: `resolve_profile()` — prefers real profile if not in use, falls back to seeded temp profile
+- Add: `seed_profile()` — writes synthetic Preferences and Local State with `distribution.skip_first_run_ui: true` to suppress ALL first-run dialogs including Dia's Atlassian sign-in form
+- Fix: `launch()` only cleans locks on real profiles — temp profiles skip lock cleaning entirely
+- Fix: `is_profile_in_use()` prevents launching with a profile that has a running browser, avoiding crashes
+- Remove: `real_profile_dir()` — replaced by `resolve_profile()` with proper in-use detection
+- Remove: overlay dismissal JS from search/batch/follow extraction (unnecessary with proper profile seeding)
+
 ## 0.4.7 (2026-07-25)
 
 ### Fixes
