@@ -1,5 +1,13 @@
 # Changelog — gthings-search
 
+## 0.3.7 (2026-07-25)
+
+### Fixes
+
+#### - Fix: dismiss Dia sign-in overlay and other blocking dialogs via CDP JavaScript before page content extraction
+
+- Add: overlay removal JS (onboarding, signin, login, aria-modal dialogs, Atlassian iframes) to search, batch, and follow extraction
+
 ## 0.3.6 (2026-07-25)
 
 ### Fixes

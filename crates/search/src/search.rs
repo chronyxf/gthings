@@ -169,7 +169,22 @@ impl GoogleSearch {
         // Extract organic results via JS
         let js = format!(
             r#"
-(() => {{
+(async () => {{
+    // Dismiss all overlays/dialogs that block content
+    const dismissOverlays = () => {{
+        // Remove common overlay containers
+        document.querySelectorAll('[class*="onboarding"], [class*="welcome"], [class*="signin"], [class*="sign-in"], [class*="login"], [aria-modal="true"], [role="dialog"], [class*="overlay"]').forEach(el => el.remove());
+        // Remove interstitial iframes (Atlassian sign-in)
+        document.querySelectorAll('iframe[src*="atlassian"], iframe[src*="login"], iframe[src*="accounts"]').forEach(el => el.remove());
+        // Click "Skip" or "Maybe later" buttons
+        document.querySelectorAll('button, a[role="button"]').forEach(b => {{
+            if (/skip|maybe later|not now|dismiss|close|no thanks/i.test(b.textContent)) b.click();
+        }});
+    }};
+    dismissOverlays();
+    // Small delay for overlays to disappear
+    await new Promise(r => setTimeout(r, 200));
+    
     const results = [];
     const selectors = [
         'div.tF2Cxc',
