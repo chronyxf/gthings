@@ -1,5 +1,14 @@
 # Changelog — gthings-cdp
 
+## 0.4.9 (2026-07-25)
+
+### Fixes
+
+#### - Fix: tab creation for Dia browser — when `Target.createTarget` returns `targetId` without `sessionId` (Dia CDP quirk), call `Target.attachToTarget` via CDP instead of falling back to HTTP (Dia doesn't support HTTP endpoints like `/json/new`)
+
+- Remove: `create_via_http()` method — no longer needed since CDP attach works for all supported browsers
+- Remove: `url` dependency usage — no HTTP URL parsing needed for tab creation
+
 ## 0.4.8 (2026-07-25)
 
 ### Fixes

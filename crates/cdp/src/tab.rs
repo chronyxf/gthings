@@ -3,7 +3,7 @@ use crate::error::{CdpError, Result};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tracing;
-use url::Url;
+
 
 /// A CDP tab session, representing one browser tab.
 pub struct Tab {
@@ -14,8 +14,8 @@ pub struct Tab {
 }
 
 impl Tab {
-    /// Create a new tab. Uses `Target.createTarget`; falls back to HTTP `/json/new` for Dia.
-    pub async fn create(conn: &mut Connection, ws_url: &str, url: &str) -> Result<Self> {
+    /// Create a new tab. Uses `Target.createTarget`; attaches via CDP if sessionId is missing.
+    pub async fn create(conn: &mut Connection, _ws_url: &str, url: &str) -> Result<Self> {
         let result = conn
             .call(
                 "Target.createTarget",
@@ -44,89 +44,57 @@ impl Tab {
                     target_id,
                 });
             }
-            // Missing sessionId, fall back to HTTP attach
+            // Missing sessionId — Dia returns targetId without sessionId.
+            // Attach to the target via CDP instead of falling back to HTTP
+            // (Dia doesn't support HTTP endpoints like /json/new).
+            if let Some(target_id) = result.get("targetId").and_then(|v| v.as_str()) {
+                tracing::warn!(
+                    "Target.createTarget returned targetId without sessionId, attaching..."
+                );
+                let attach = conn
+                    .call(
+                        "Target.attachToTarget",
+                        json!({
+                            "targetId": target_id,
+                            "flatten": true,
+                        }),
+                    )
+                    .await
+                    .map_err(|e| CdpError::CommandFailed {
+                        method: "Target.attachToTarget".into(),
+                        msg: format!("attach failed: {e}"),
+                    })?;
+
+                let session_id = attach
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| CdpError::CommandFailed {
+                        method: "Target.attachToTarget".into(),
+                        msg: "no sessionId in attach response".into(),
+                    })?
+                    .to_string();
+
+                tracing::info!(
+                    "Attached to created target: {} (session={})",
+                    target_id,
+                    session_id
+                );
+
+                return Ok(Tab {
+                    session_id,
+                    target_id: target_id.to_string(),
+                });
+            }
             tracing::warn!(
-                "Target.createTarget returned targetId without sessionId, falling back to HTTP"
+                "Target.createTarget returned neither sessionId nor targetId, cannot attach"
             );
         } else {
-            tracing::warn!("Target.createTarget failed, trying HTTP /json/new");
+            tracing::warn!("Target.createTarget failed");
         }
 
-        // Fallback: HTTP /json/new for Dia compatibility
-        Self::create_via_http(conn, ws_url, url).await
-    }
-
-    /// Create a target via the HTTP `/json/new` endpoint.
-    async fn create_via_http(conn: &mut Connection, ws_url: &str, url: &str) -> Result<Self> {
-        // Parse port from ws_url
-        let parsed = Url::parse(ws_url).map_err(|_| CdpError::CommandFailed {
-            method: "create_via_http".into(),
-            msg: "invalid ws_url".into(),
-        })?;
-        let port = parsed.port().ok_or_else(|| CdpError::CommandFailed {
-            method: "create_via_http".into(),
-            msg: "no port in ws_url".into(),
-        })?;
-        let host = parsed.host_str().unwrap_or("127.0.0.1");
-
-        let http_url = format!("http://{}:{}/json/new?{}", host, port, url);
-
-        tracing::debug!("HTTP create target: {}", http_url);
-
-        let client = reqwest::Client::new();
-        let resp = client
-            .put(&http_url)
-            .send()
-            .await
-            .map_err(|e| CdpError::CommandFailed {
-                method: "create_via_http".into(),
-                msg: format!("HTTP request failed: {e}"),
-            })?;
-
-        let target_info: Value = resp.json().await.map_err(|e| CdpError::CommandFailed {
-            method: "create_via_http".into(),
-            msg: format!("HTTP response parse failed: {e}"),
-        })?;
-
-        let target_id = target_info
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| CdpError::CommandFailed {
-                method: "create_via_http".into(),
-                msg: "no id in HTTP response".into(),
-            })?
-            .to_string();
-
-        tracing::debug!("Created target via HTTP: target={}", target_id);
-
-        let attach_result = conn
-            .call(
-                "Target.attachToTarget",
-                json!({
-                    "targetId": target_id,
-                    "flatten": true,
-                }),
-            )
-            .await?;
-
-        let session_id = attach_result
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| CdpError::CommandFailed {
-                method: "Target.attachToTarget".into(),
-                msg: "no sessionId in response".into(),
-            })?
-            .to_string();
-
-        tracing::info!(
-            "Attached to created target: {} (session={})",
-            target_id,
-            session_id
-        );
-
-        Ok(Tab {
-            session_id,
-            target_id,
+        Err(CdpError::CommandFailed {
+            method: "Target.createTarget".into(),
+            msg: "could not create tab: all methods exhausted".into(),
         })
     }
 
