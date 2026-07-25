@@ -64,6 +64,26 @@ fn browser_exec_name(bundle_path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
+/// Map a browser bundle path to its profile directory suffix (under ~/Library/Application Support/)
+fn browser_profile_suffix(bundle_path: &std::path::Path) -> Option<&'static str> {
+    let path_str = bundle_path.to_string_lossy();
+    if path_str.contains("Google Chrome") {
+        Some("Google/Chrome")
+    } else if path_str.contains("Dia") {
+        Some("Dia")
+    } else if path_str.contains("Arc") {
+        Some("Arc")
+    } else if path_str.contains("Brave Browser") || path_str.contains("Brave") {
+        Some("BraveSoftware/Brave-Browser")
+    } else if path_str.contains("Microsoft Edge") {
+        Some("Microsoft Edge")
+    } else if path_str.contains("Chromium") {
+        Some("Chromium")
+    } else {
+        None
+    }
+}
+
 /// Build the executable path from a bundle path
 fn bundle_to_exec(bundle: &std::path::Path, exec_name: &str) -> std::path::PathBuf {
     bundle.join("Contents").join("MacOS").join(exec_name)
@@ -89,16 +109,17 @@ impl Browser {
 
         let port = cdp_port;
 
-        // Use temporary profile to avoid profile conflicts.
-        // Puppeteer, Playwright, chrome-launcher, and chromedp all use temp profiles.
-        // GTHINGS_PROFILE_DIR can override for advanced use (may cause profile errors).
-        let profile_dir = profile_dir.unwrap_or_else(|| {
+        // Use real profile to avoid browser onboarding/login prompts.
+        // SingletonLock conflicts are avoided because find_existing() reuses
+        // the already-running browser instead of launching a second instance.
+        // If no existing browser is found, we clean locks and launch fresh.
+        let profile_dir = Self::real_profile_dir(profile_dir).unwrap_or_else(|| {
             let tmp = std::path::PathBuf::from(format!("/tmp/gthings-{}", port));
             let _ = std::fs::create_dir_all(&tmp);
             tmp
         });
 
-        // Clean locks only for explicit (non-temp) profiles
+        // Clean locks before fresh launch to avoid SingletonLock conflicts
         {
             let dir = profile_dir.clone();
             tokio::task::spawn_blocking(move || {
@@ -252,6 +273,52 @@ impl Browser {
                         return Some(path);
                     }
                 }
+            }
+        }
+
+        None
+    }
+
+    /// Locate browser profile directory.
+    fn real_profile_dir(profile_dir: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+        // 1. Check explicit env var first (GTHINGS_PROFILE_DIR)
+        if let Some(dir) = profile_dir {
+            if dir.exists() {
+                return Some(dir);
+            }
+        }
+
+        let home = std::env::var("HOME").ok()?;
+
+        // 2. Try to match profile to the default browser
+        #[cfg(target_os = "macos")]
+        if let Some(bundle) = default_browser_bundle() {
+            if let Some(suffix) = browser_profile_suffix(&bundle) {
+                let profile = std::path::PathBuf::from(&home)
+                    .join("Library/Application Support")
+                    .join(suffix);
+                if profile.exists() {
+                    return Some(profile);
+                }
+            }
+        }
+
+        // 3. Fallback: check common profile directories
+        let common_profiles = [
+            "Google/Chrome",
+            "Dia",
+            "Chromium",
+            "BraveSoftware/Brave-Browser",
+            "Microsoft Edge",
+            "Arc",
+        ];
+
+        for suffix in &common_profiles {
+            let profile = std::path::PathBuf::from(&home)
+                .join("Library/Application Support")
+                .join(suffix);
+            if profile.exists() {
+                return Some(profile);
             }
         }
 

@@ -1,5 +1,11 @@
 # Changelog — gthings-search
 
+## 0.3.3 (2026-07-25)
+
+### Fixes
+
+- Fix: update gthings-cdp dependency to 0.4.2 for real profile detection with SingletonLock-safe browser reuse
+
 ## 0.3.2 (2026-07-25)
 
 ### Fixes
