@@ -1,5 +1,13 @@
 # Changelog — gthings-cdp
 
+## 0.4.13 (2026-07-25)
+
+### Fixes
+
+#### fix(cdp): stop deleting DevToolsActivePort in clean_profile_locks — this was destroying the file that discover_ws_url() relies on to find existing browsers
+
+fix(cdp): add HTTP /json/version fallback in discover_ws_url() — detects browsers even when DevToolsActivePort is missing or at an unexpected path
+
 ## 0.4.12 (2026-07-25)
 
 ### Fixes

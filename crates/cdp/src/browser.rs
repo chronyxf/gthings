@@ -418,7 +418,6 @@ impl Browser {
             "SingletonLock",
             "SingletonSocket",
             "SingletonCookie",
-            "DevToolsActivePort",
         ];
         for name in &lock_files {
             let path = profile_dir.join(name);
@@ -521,6 +520,23 @@ impl Browser {
                             let ws_path = lines[1].trim();
                             return Some(format!("ws://127.0.0.1:{}{}", cdp_port, ws_path));
                         }
+                    }
+                }
+            }
+        }
+
+        // 3. HTTP /json/version fallback — try both IPv4 and IPv6
+        // Matches CDP skill (~/.agents/skills/cdp/sdk/session.ts:674-692)
+        let http_addrs = [
+            format!("http://127.0.0.1:{}/json/version", cdp_port),
+            format!("http://[::1]:{}/json/version", cdp_port),
+        ];
+        for url in &http_addrs {
+            if let Ok(resp) = reqwest::get(url).await {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                        tracing::info!("Discovered WS URL via HTTP: {ws_url}");
+                        return Some(ws_url.to_string());
                     }
                 }
             }
