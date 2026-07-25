@@ -1,5 +1,19 @@
 # Changelog — gthings-cdp
 
+## 0.4.6 (2026-07-25)
+
+### Fixes
+
+#### - Fix: add `--disable-fre` and `--disable-search-engine-choice-screen` launch flags to prevent first-run onboarding dialogs
+
+- Fix: remove `--enable-automation` flag which triggered Google anti-bot measures and automation infobar
+- Fix: add `--window-size=1280,720` for consistent viewport
+- Fix: `find_existing()` now reads `DevToolsActivePort` file instead of HTTP `/json/version` (Dia browser doesn't support HTTP CDP endpoints)
+- Fix: `launch()` checks if profile is in use before cleaning locks — prevents crashing user's real browser session
+- Remove: `BrowserState` struct, `state_path()`, `pid()`, `fetch_ws_url()` — fully stateless, no `~/.gthings/browser.json`
+- Add: `verify_ws()` for WebSocket-based browser aliveness check
+- Add: `is_profile_in_use()` to detect running browser on profile directory
+
 ## 0.4.5 (2026-07-25)
 
 ### Features

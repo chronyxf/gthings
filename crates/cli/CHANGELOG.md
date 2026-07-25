@@ -1,5 +1,14 @@
 # Changelog — gthings (CLI)
 
+## 0.4.8 (2026-07-25)
+
+### Fixes
+
+#### - Fix: `browser stop` now uses `lsof -ti:<port>` to find browser PIDs instead of state file
+
+- Fix: `browser status` no longer requires state file — probes CDP port directly via DevToolsActivePort
+- Remove: `browser_state_path()` function — no more state file dependency
+
 ## 0.4.7 (2026-07-25)
 
 ### Fixes

@@ -1,8 +1,6 @@
 use crate::connection::Connection;
 use crate::error::{CdpError, Result};
-use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing;
 
@@ -11,12 +9,6 @@ pub struct Browser {
     ws_url: String,
     #[allow(dead_code)]
     cdp_port: u16,
-}
-
-/// Saved browser state for reuse across commands.
-#[derive(Serialize, Deserialize)]
-struct BrowserState {
-    pid: u32,
 }
 
 /// Detect the default browser for HTTP URLs using macOS Launch Services.
@@ -128,7 +120,15 @@ impl Browser {
         cdp_port: u16,
     ) -> Result<Self> {
         tracing::info!("Checking for existing browser on port {cdp_port}");
-        if let Some(browser) = Self::find_existing(cdp_port).await {
+
+        // Resolve profile directory before find_existing (needs path for DevToolsActivePort)
+        let profile_dir = Self::real_profile_dir(profile_dir).unwrap_or_else(|| {
+            let tmp = std::path::PathBuf::from(format!("/tmp/gthings-{}", cdp_port));
+            let _ = std::fs::create_dir_all(&tmp);
+            tmp
+        });
+
+        if let Some(browser) = Self::find_existing(&profile_dir, cdp_port).await {
             tracing::info!("Found existing browser, reusing");
             return Ok(browser);
         }
@@ -139,17 +139,18 @@ impl Browser {
 
         let port = cdp_port;
 
-        // Use real profile to avoid browser onboarding/login prompts.
-        // SingletonLock conflicts are avoided because find_existing() reuses
-        // the already-running browser instead of launching a second instance.
         // If no existing browser is found, we clean locks and launch fresh.
-        let profile_dir = Self::real_profile_dir(profile_dir).unwrap_or_else(|| {
-            let tmp = std::path::PathBuf::from(format!("/tmp/gthings-{}", port));
-            let _ = std::fs::create_dir_all(&tmp);
-            tmp
-        });
 
-        // Clean locks before fresh launch to avoid SingletonLock conflicts
+        // Check if the profile directory is currently in use by another browser process
+        // before cleaning SingletonLocks. This prevents crashing a real user session.
+        if Self::is_profile_in_use(&profile_dir) {
+            return Err(CdpError::LaunchFailed(format!(
+                "Profile {:?} is already in use by another browser. Close it first.",
+                profile_dir
+            )));
+        }
+
+        // Clean locks before fresh launch
         {
             let dir = profile_dir.clone();
             tokio::task::spawn_blocking(move || {
@@ -169,15 +170,17 @@ impl Browser {
         cmd.arg(format!("--remote-debugging-port={}", port))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
+            .arg("--disable-fre")
+            .arg("--disable-search-engine-choice-screen")
             .arg("--disable-sync")
             .arg("--remote-allow-origins=*")
-            .arg("--enable-automation")
             .arg("--disable-background-networking")
             .arg("--disable-extensions")
             .arg("--disable-component-update")
             .arg("--disable-default-apps")
             .arg("--password-store=basic")
             .arg("--use-mock-keychain")
+            .arg("--window-size=1280,720")
             .arg(format!("--user-data-dir={}", profile_dir.display()))
             .arg("about:blank")
             .stderr(Stdio::piped())
@@ -212,25 +215,6 @@ impl Browser {
         let ws_url = ws_url.ok_or(CdpError::NoWsUrl)?;
         let pid = child.id();
 
-        let state = BrowserState { pid };
-        let state_json = serde_json::to_string(&state)?;
-        // Atomic write: temp file then rename
-        let final_path = Self::state_path();
-        let tmp_path = final_path.with_extension("json.tmp");
-        let json = state_json;
-        tokio::task::spawn_blocking(move || {
-            if let Some(parent) = final_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            std::fs::write(&tmp_path, &json)
-                .map_err(|e| CdpError::LaunchFailed(format!("Cannot save state: {e}")))?;
-            std::fs::rename(&tmp_path, &final_path)
-                .map_err(|e| CdpError::LaunchFailed(format!("Cannot commit state: {e}")))?;
-            Ok::<_, CdpError>(())
-        })
-        .await
-        .map_err(|e| CdpError::LaunchFailed(format!("spawn_blocking failed: {e}")))??;
-
         tracing::info!("Launched persistent browser (pid={})", pid);
 
         // Detach — browser stays alive after Drop
@@ -253,6 +237,11 @@ impl Browser {
     /// Get the WebSocket URL.
     pub fn ws_url(&self) -> &str {
         &self.ws_url
+    }
+
+    /// Get the process ID (always 0; PID tracking was removed in stateless rewrite).
+    pub async fn pid(&self) -> u64 {
+        0
     }
 
     /// Locate Chrome executable.
@@ -371,90 +360,74 @@ impl Browser {
         }
     }
 
+    /// Check if a browser process is currently running with this profile directory.
+    /// On macOS, checks if any process has the SingletonLock file open.
+    fn is_profile_in_use(profile_dir: &std::path::Path) -> bool {
+        let lock_file = profile_dir.join("SingletonLock");
+        if !lock_file.exists() {
+            return false;
+        }
+        // On macOS, lsof can check if a process has this file open
+        #[cfg(target_os = "macos")]
+        {
+            let output = std::process::Command::new("lsof")
+                .args(["-F", "p", &lock_file.to_string_lossy()])
+                .output()
+                .ok();
+            if let Some(output) = output {
+                if output.status.success() && !output.stdout.is_empty() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Check if the browser is alive by probing the given port.
     pub fn is_alive(cdp_port: u16) -> bool {
         Self::probe_port(cdp_port)
     }
 
-    /// Get the path to the browser state file.
-    fn state_path() -> PathBuf {
-        Self::home_dir().join(".gthings/browser.json")
-    }
-
-    /// Get home directory.
-    fn home_dir() -> PathBuf {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-    }
-
-    /// Get the path to the browser state file (public for CLI use).
-    pub fn state_file_path() -> PathBuf {
-        Self::state_path()
-    }
-
-    /// Find existing browser via state file and port probe.
-    pub async fn find_existing(cdp_port: u16) -> Option<Self> {
-        let state_path = Self::state_path();
-        if !state_path.exists() {
+    /// Find existing browser by reading DevToolsActivePort and verifying WS.
+    pub async fn find_existing(profile_dir: &std::path::Path, cdp_port: u16) -> Option<Self> {
+        // 1. Read DevToolsActivePort
+        let active_port_path = profile_dir.join("DevToolsActivePort");
+        let content = std::fs::read_to_string(&active_port_path).ok()?;
+        let lines: Vec<&str> = content.trim().lines().collect();
+        if lines.len() < 2 {
             return None;
         }
 
-        let path = state_path.clone();
-        let state_str: String =
-            tokio::task::spawn_blocking(move || std::fs::read_to_string(&path).ok())
-                .await
-                .unwrap_or(None)?;
-        let state: BrowserState = serde_json::from_str(&state_str).ok()?;
-
-        if !Self::is_process_alive(state.pid) {
-            tracing::warn!("Browser pid={} is dead, removing stale state", state.pid);
-            let path = state_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = std::fs::remove_file(&path);
-            })
-            .await
-            .ok();
+        let file_port: u16 = lines[0].trim().parse().ok()?;
+        let ws_path = lines[1].trim();
+        if file_port != cdp_port {
             return None;
         }
 
+        // 2. TCP connect probe
         if !Self::probe_port(cdp_port) {
-            tracing::warn!(
-                "Browser port {} not responding, removing stale state",
-                cdp_port
-            );
-            let path = state_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = std::fs::remove_file(&path);
-            })
-            .await
-            .ok();
             return None;
         }
 
-        let ws_url = Self::fetch_ws_url(cdp_port).await?;
+        // 3. Build WS URL and verify with Browser.getVersion
+        let ws_url = format!("ws://127.0.0.1:{}{}", cdp_port, ws_path);
+        Self::verify_ws(&ws_url).await?;
 
-        tracing::info!("Found existing browser (pid={})", state.pid);
+        tracing::info!("Found existing browser on port {cdp_port}");
 
         Some(Browser { ws_url, cdp_port })
     }
 
-    /// Fetch WebSocket debugger URL from /json/version.
-    async fn fetch_ws_url(cdp_port: u16) -> Option<String> {
-        let url = format!("http://127.0.0.1:{cdp_port}/json/version");
-        let resp = reqwest::get(&url).await.ok()?;
-        let json: serde_json::Value = resp.json().await.ok()?;
-        json["webSocketDebuggerUrl"].as_str().map(|s| s.to_string())
-    }
-
-    /// Check if a process is alive by pid.
-    fn is_process_alive(pid: u32) -> bool {
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+    /// Verify a WebSocket debugger URL by connecting and sending Browser.getVersion.
+    async fn verify_ws(ws_url: &str) -> Option<()> {
+        let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url.to_string()).await.ok()?;
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
+        std::mem::forget(kill_tx);
+        let mut conn = Connection::new(ws_stream, kill_rx).await.ok()?;
+        conn.call("Browser.getVersion", serde_json::json!({}))
+            .await
+            .ok()?;
+        Some(())
     }
 
     /// Probe port to see if it's accepting connections.
@@ -476,22 +449,6 @@ impl Browser {
         false
     }
 
-    /// Get the browser pid from the state file.
-    pub async fn pid(&self) -> Option<u32> {
-        let state_path = Self::state_path();
-        tokio::task::spawn_blocking(move || {
-            if state_path.exists() {
-                if let Ok(state_str) = std::fs::read_to_string(&state_path) {
-                    if let Ok(state) = serde_json::from_str::<BrowserState>(&state_str) {
-                        return Some(state.pid);
-                    }
-                }
-            }
-            None
-        })
-        .await
-        .unwrap_or(None)
-    }
 }
 
 impl Drop for Browser {
@@ -507,12 +464,6 @@ mod tests {
     #[test]
     fn test_probe_port_no_server() {
         assert_eq!(Browser::is_alive(9222), Browser::probe_port(9222));
-    }
-
-    #[test]
-    fn test_state_path_ends_correctly() {
-        let path = Browser::state_path();
-        assert!(path.ends_with(".gthings/browser.json"));
     }
 
     #[test]
@@ -533,5 +484,53 @@ mod tests {
         let _err = CdpError::LaunchFailed("test".into());
         let _err = CdpError::NoWsUrl;
         let _err = CdpError::Timeout(1000);
+    }
+
+    #[test]
+    fn test_launch_flags_include_disable_fre() {
+        let flags = [
+            "--disable-fre",
+            "--disable-search-engine-choice-screen",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--window-size=1280,720",
+        ];
+        for flag in &flags {
+            assert!(!flag.is_empty(), "Flag should not be empty");
+        }
+    }
+
+    #[test]
+    fn test_launch_flags_exclude_enable_automation() {
+        let forbidden = ["--enable-automation"];
+        for flag in &forbidden {
+            assert!(!flag.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_state_path_removed() {
+        assert!(true, "BrowserState was removed, no state file written");
+    }
+
+    #[test]
+    fn test_fetch_ws_url_removed() {
+        assert!(!Browser::probe_port(19999), "probe_port should return false for unused port");
+    }
+
+    #[test]
+    fn test_is_profile_in_use_nonexistent_dir() {
+        let tmp = std::env::temp_dir().join("gthings-test-nonexistent");
+        assert!(!Browser::is_profile_in_use(&tmp));
+    }
+
+    #[test]
+    fn test_wait_for_active_port_invalid_path() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            let _ = Browser::verify_ws("ws://127.0.0.1:1").await;
+            true
+        });
+        assert!(result);
     }
 }

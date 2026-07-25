@@ -319,7 +319,7 @@ async fn handle_browser_start(
         .connect()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect: {e}"))?;
-    let pid = browser.pid().await.unwrap_or(0);
+    let pid = browser.pid().await;
     if json {
         println!(
             "{}",
@@ -372,9 +372,13 @@ async fn handle_browser_status(
     json: bool,
     config: &gthings_common::config::GthingsConfig,
 ) -> Result<(), anyhow::Error> {
-    let existing = gthings_cdp::Browser::find_existing(config.cdp_port).await;
+    let profile_dir = config
+        .profile_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let existing = gthings_cdp::Browser::find_existing(&profile_dir, config.cdp_port).await;
     if let Some(browser) = existing {
-        let pid = browser.pid().await.unwrap_or(0);
+        let pid = browser.pid().await;
         if json {
             println!(
                 "{}",

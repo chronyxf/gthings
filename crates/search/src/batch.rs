@@ -133,7 +133,9 @@ impl BatchProcessor {
 (() => {{
     const results = [];
     const selectors = [
-        'div.g', 'div[data-hveid]', 'div.yuRUbf',
+        'div.tF2Cxc',
+        'div.MjjYud',
+        'div.g',
     ];
     const seen = new Set();
     for (const sel of selectors) {{
@@ -141,11 +143,11 @@ impl BatchProcessor {
         for (const item of items) {{
             const titleEl = item.querySelector('h3');
             const linkEl = item.querySelector('a[href^="http"]');
-            const snippetEl = item.querySelector('.VwiC3b, .st, [data-sncf], .lEBKkf span');
             if (titleEl && linkEl) {{
                 const url = linkEl.href || '';
                 if (seen.has(url)) continue;
                 seen.add(url);
+                const snippetEl = item.querySelector('.VwiC3b, [data-sncf], .IsZvec, .GI74Re, .kb0PBd');
                 results.push({{
                     title: (titleEl.innerText || titleEl.textContent || '').trim(),
                     url: url,
@@ -435,18 +437,22 @@ impl BatchProcessor {
                 r#"
 (() => {{
     const results = [];
-    const selectors = ['div.g', 'div[data-hveid]', 'div.yuRUbf'];
+    const selectors = [
+        'div.tF2Cxc',
+        'div.MjjYud',
+        'div.g',
+    ];
     const seen = new Set();
     for (const sel of selectors) {{
         const items = document.querySelectorAll(sel);
         for (const item of items) {{
             const titleEl = item.querySelector('h3');
             const linkEl = item.querySelector('a[href^="http"]');
-            const snippetEl = item.querySelector('.VwiC3b, .st, [data-sncf], .lEBKkf span');
             if (titleEl && linkEl) {{
                 const url = linkEl.href || '';
                 if (seen.has(url)) continue;
                 seen.add(url);
+                const snippetEl = item.querySelector('.VwiC3b, [data-sncf], .IsZvec, .GI74Re, .kb0PBd');
                 results.push({{ title: (titleEl.innerText || '').trim(), url, snippet: (snippetEl?.innerText || '').trim() }});
             }}
         }}

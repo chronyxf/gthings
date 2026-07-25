@@ -172,9 +172,9 @@ impl GoogleSearch {
 (() => {{
     const results = [];
     const selectors = [
+        'div.tF2Cxc',
+        'div.MjjYud',
         'div.g',
-        'div[data-hveid]',
-        'div.yuRUbf',
     ];
     const seen = new Set();
     for (const sel of selectors) {{
@@ -182,11 +182,11 @@ impl GoogleSearch {
         for (const item of items) {{
             const titleEl = item.querySelector('h3');
             const linkEl = item.querySelector('a[href^="http"]');
-            const snippetEl = item.querySelector('.VwiC3b, .st, [data-sncf], .lEBKkf span');
             if (titleEl && linkEl) {{
                 const url = linkEl.href || '';
                 if (seen.has(url)) continue;
                 seen.add(url);
+                const snippetEl = item.querySelector('.VwiC3b, [data-sncf], .IsZvec, .GI74Re, .kb0PBd');
                 results.push({{
                     title: (titleEl.innerText || titleEl.textContent || '').trim(),
                     url: url,

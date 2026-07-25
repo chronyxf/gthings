@@ -1,5 +1,13 @@
 # Changelog — gthings-search
 
+## 0.3.6 (2026-07-25)
+
+### Fixes
+
+#### - Fix: update Google SERP CSS selectors from deprecated `div.g`, `div.yuRUbf` to current `div.tF2Cxc`, `div.MjjYud`
+
+- Fix: update snippet selectors to include `.IsZvec`, `.GI74Re`, `.kb0PBd` in addition to existing `.VwiC3b`
+
 ## 0.3.5 (2026-07-25)
 
 ### Fixes
