@@ -1,5 +1,16 @@
 # Changelog — gthings-cdp
 
+## 0.4.5 (2026-07-25)
+
+### Features
+
+#### - Refactor: fully stateless browser detection using DevToolsActivePort instead of PID state file
+
+- Fix: redirect browser stderr to `/dev/null` (`Stdio::null()`) instead of piping and dropping — browser no longer exits after command completes
+- Remove: `BrowserState` struct, `state_path()`, `pid()` — no more `~/.gthings/browser.json`
+- Change: `find_existing()` now requires `profile_dir` parameter and uses DevToolsActivePort file + TCP probe + WebSocket verify instead of HTTP `/json/version` (Dia browser doesn't support HTTP CDP endpoints)
+- Add: `wait_for_active_port()` polls `DevToolsActivePort` with exponential backoff; `verify_ws()` confirms browser is alive with `Browser.getVersion` CDP command
+
 ## 0.4.4 (2026-07-25)
 
 ### Fixes

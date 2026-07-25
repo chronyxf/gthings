@@ -1,5 +1,14 @@
 # Changelog — gthings (CLI)
 
+## 0.4.7 (2026-07-25)
+
+### Fixes
+
+#### - Refactor: remove browser state file (`~/.gthings/browser.json`) — fully stateless browser management
+
+- Fix: `browser stop` now uses `lsof -ti:<port>` to find and kill browser PIDs instead of reading state file
+- Fix: `browser status` no longer requires state file — probes CDP port directly
+
 ## 0.4.6 (2026-07-25)
 
 ### Fixes
