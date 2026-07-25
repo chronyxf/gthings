@@ -30,7 +30,7 @@ cargo test --workspace
 
 ### 2. Changeset
 
-Create a changeset file in `.changesets/` with YAML frontmatter:
+Create a changeset file in `.changesets/` (the configured changes directory for knope) with YAML frontmatter:
 
 ```markdown
 ---
@@ -49,7 +49,7 @@ knope release
 ```
 
 - Reads changeset files from `.changesets/`
-- Bumps versions in Cargo.toml and Cargo.lock
+- Bumps versions in Cargo.toml
 - Updates dependency version constraints in dependent crates
 - Prepends entries to each crate's CHANGELOG.md
 - Deletes consumed changeset files
@@ -69,8 +69,8 @@ Publish in dependency order (bottom-up):
 
 ```bash
 cargo publish -p gthings-common
-cargo publish -p gthings-cdp
 cargo publish -p gthings-extraction
+cargo publish -p gthings-cdp
 cargo publish -p gthings-search
 cargo publish -p gthings
 ```
