@@ -1,5 +1,11 @@
 # Changelog — gthings (CLI)
 
+## 0.4.6 (2026-07-25)
+
+### Fixes
+
+- Fix: update gthings-cdp dependency to 0.4.4 which corrects the profile path to include `/User Data` subdirectory and removes the crashing `--profile-directory` flag
+
 ## 0.4.5 (2026-07-25)
 
 ### Fixes

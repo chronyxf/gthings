@@ -86,6 +86,7 @@ fn browser_profile_suffix(bundle_path: &std::path::Path) -> Option<&'static str>
 
 /// Read the last-used profile directory name from the browser's Local State file.
 /// Returns "Default" as fallback if Local State can't be read or last_used is missing.
+#[allow(dead_code)]
 fn detect_last_used_profile(user_data_dir: &std::path::Path) -> String {
     let local_state_path = user_data_dir.join("Local State");
     let content = match std::fs::read_to_string(&local_state_path) {
@@ -158,12 +159,10 @@ impl Browser {
             .map_err(|e| CdpError::LaunchFailed(format!("spawn_blocking failed: {e}")))?;
         }
 
-        let active_profile = detect_last_used_profile(&profile_dir);
         tracing::info!(
-            "Launching browser on port {} with profile {:?} (sub-profile: {})",
+            "Launching browser on port {} with profile {:?}",
             port,
             profile_dir,
-            active_profile
         );
 
         let mut cmd = Command::new(&chrome_path);
@@ -180,7 +179,6 @@ impl Browser {
             .arg("--password-store=basic")
             .arg("--use-mock-keychain")
             .arg(format!("--user-data-dir={}", profile_dir.display()))
-            .arg(format!("--profile-directory={}", active_profile))
             .arg("about:blank")
             .stderr(Stdio::piped())
             .stdout(Stdio::null())

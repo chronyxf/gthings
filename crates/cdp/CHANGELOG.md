@@ -1,5 +1,11 @@
 # Changelog — gthings-cdp
 
+## 0.4.4 (2026-07-25)
+
+### Fixes
+
+- Fix: correct browser profile paths to include `/User Data` subdirectory so the browser finds its `Local State` and opens the real user profile (bookmarks, history, cookies preserved). Previous version tried `--profile-directory` which crashed Dia — removed.
+
 ## 0.4.3 (2026-07-25)
 
 ### Fixes
