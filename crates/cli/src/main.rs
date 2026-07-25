@@ -1,6 +1,7 @@
 mod follow_commands;
 mod pdf_commands;
 mod search_commands;
+mod shell;
 
 use clap::Parser;
 use gthings_common::trace::TraceWriter;
@@ -45,7 +46,7 @@ enum Command {
     /// Browser lifecycle management
     #[command(name = "browser", hide = true)]
     Browser(BrowserArgs),
-    /// Update gthings to the latest version
+    /// Update gthings to the latest version, configure shell PATH, and install skills
     Update,
     /// Manage gthings skills (install to opencode or agents)
     Skill(SkillArgs),
@@ -388,6 +389,7 @@ async fn handle_browser_status(json: bool) -> Result<(), anyhow::Error> {
 }
 
 async fn cmd_update() -> anyhow::Result<()> {
+    // Step 1: Update binary
     println!("Updating gthings...");
     let status = std::process::Command::new("cargo")
         .args(["install", "gthings"])
@@ -400,7 +402,70 @@ async fn cmd_update() -> anyhow::Result<()> {
         );
     }
     println!("gthings updated to latest version.");
-    println!("  Run 'gthings skill add --all' to update skill files.");
+
+    // Step 2: Configure shell PATH
+    let shell = shell::detect_shell();
+    let cargo_bin = shell::cargo_bin_dir();
+    println!("  Shell: {:?}", shell);
+    println!("  Cargo bin: {}", cargo_bin.display());
+
+    match shell::ensure_path_in_shell_config(&shell) {
+        Ok(true) => {
+            let config_file = shell::shell_config_file(&shell)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "shell config".to_string());
+            println!("  Added cargo bin to: {}", config_file);
+            shell::print_post_init_hint(&shell, true);
+        }
+        Ok(false) => {
+            println!("  Cargo bin already in shell PATH.");
+        }
+        Err(e) => {
+            eprintln!("  Warning: could not update shell config: {}", e);
+        }
+    }
+
+    // Step 3: Install skills to both opencode and agents
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            println!("  Warning: HOME not set, skipping skill installation.");
+            return Ok(());
+        }
+    };
+
+    // Install to agents
+    let agents_dest = std::path::Path::new(&home)
+        .join(".agents")
+        .join("skills")
+        .join("gthings");
+    if let Some(agents_dir) = SKILLS_DIR.get_dir("agents/gthings") {
+        copy_embedded_dir(agents_dir, &agents_dest)?;
+        let _count = count_files(agents_dir);
+        println!("  Skills installed to agents: {}", agents_dest.display());
+    }
+
+    // Install to opencode
+    let opencode_base = std::path::Path::new(&home)
+        .join(".config")
+        .join("opencode")
+        .join("skills");
+    if let Some(opencode_dir) = SKILLS_DIR.get_dir("opencode") {
+        for skill_subdir in opencode_dir.dirs() {
+            let skill_name = skill_subdir
+                .path()
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("Invalid skill directory name"))?;
+            let skill_dest = opencode_base.join(skill_name);
+            copy_embedded_dir(skill_subdir, &skill_dest)?;
+        }
+        println!(
+            "  Skills installed to opencode: {}",
+            opencode_base.display()
+        );
+    }
+
+    println!("gthings update complete.");
     Ok(())
 }
 

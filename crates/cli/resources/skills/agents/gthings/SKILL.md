@@ -11,8 +11,28 @@ Browser automation and web research toolkit. Native Rust binary — single stati
 5. **Expect ~2s cold start** — first call launches Chrome. Subsequent calls reuse it.
 6. **Check `quality.is_ok`** before processing followed content.
 
+## Installation
+
+```bash
+cargo install gthings
+```
+
+After installation, run `gthings update` to configure your shell and install skills:
+
+- Detects your shell (bash, zsh, fish)
+- Adds `~/.cargo/bin` to your PATH (auto-edits shell config file)
+- Installs gthings skills to opencode and agents directories
+
+```bash
+gthings update
+```
+
+Then restart your terminal or source your config file.
+
 ## Commands (all support `--json` and `--trace <file>`)
 
+**update** — one-command update: upgrades binary, configures shell PATH, installs skills.
+**skill add** — install gthings skills to `~/.config/opencode/skills/` or `~/.agents/skills/`.
 **search query** `<query>` `--count N` — single Google search.
 ```json
 {"meta":{"total":5,"query":"...","duration_ms":2340},"results":[{"title":"...","url":"...","snippet":"..."}]}

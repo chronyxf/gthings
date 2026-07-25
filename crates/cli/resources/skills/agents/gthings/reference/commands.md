@@ -4,6 +4,20 @@ Every command supports `--json` (global, structured JSON output) and `--trace <f
 
 Chrome is auto-launched on first use and stays alive (persistent on port 9222). No manual browser management needed — but use `browser start`, `browser stop`, `browser status` to control it explicitly.
 
+## Update
+
+### `gthings update`
+
+One-command update. Does everything:
+1. Upgrades gthings binary via `cargo install gthings`
+2. Detects your shell (`$SHELL`) and adds `~/.cargo/bin` to your shell config file
+3. Installs skill files to both `~/.agents/skills/gthings/` and `~/.config/opencode/skills/`
+
+Supported shells: Bash (`~/.bashrc` or `~/.bash_profile`), Zsh (`~/.zshrc`), Fish (`~/.config/fish/config.fish`).
+
+After running, restart your terminal or source your config file.
+
+
 ## Search
 
 ### `gthings --json search query "<query>" --count N`
