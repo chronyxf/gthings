@@ -1,5 +1,19 @@
 # Changelog — gthings (CLI)
 
+## 0.4.9 (2026-07-25)
+
+### Fixes
+
+#### - Fix: tab creation for Dia — use `Target.attachToTarget` when `createTarget` returns no `sessionId` instead of failing via HTTP
+
+- Fix: `find_existing()` now discovers WS URL from DevToolsActivePort across all common browser profile paths (Dia, Chrome, Brave, Edge)
+- Fix: `handle_browser_status()` no longer falls back to `/tmp` for profile detection
+- Add: `dismiss_allow_debugging_dialog()` — macOS AppleScript to auto-click "Allow" on "Allow debugging connection?" dialog
+- Remove: `BrowserState`, `state_path()`, `pid()`, `home_dir()` — fully stateless
+- Remove: `browser_state_path()` from CLI — no more `~/.gthings/browser.json`
+- Test: 7 integration tests for DevToolsActivePort parsing, WS URL discovery, port probing
+- Test: 4 E2E tests for stateless detection, no state file, dialog dismiss, content extraction
+
 ## 0.4.8 (2026-07-25)
 
 ### Fixes
