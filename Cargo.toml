@@ -2,18 +2,11 @@
 name = "gthings-tests"
 version = "0.3.0"
 edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
 publish = false
 
 [dev-dependencies]
-gthings-cdp = { path = "crates/cdp" }
-gthings-common = { path = "crates/common" }
-gthings-extraction = { path = "crates/extraction" }
-gthings-search = { path = "crates/search" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tempfile = "3"
 
 [workspace]
 resolver = "2"
