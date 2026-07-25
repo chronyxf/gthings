@@ -178,7 +178,6 @@ impl Browser {
             .arg("--disable-sync")
             .arg("--remote-allow-origins=*")
             .arg("--disable-background-networking")
-            .arg("--disable-extensions")
             .arg("--disable-component-update")
             .arg("--disable-default-apps")
             .arg("--password-store=basic")
@@ -228,14 +227,34 @@ impl Browser {
 
     /// Connect to CDP WebSocket.
     pub async fn connect(&self) -> Result<Connection> {
-        // Dismiss any "Allow debugging connection?" dialog
-        #[cfg(target_os = "macos")]
-        dismiss_allow_debugging_dialog();
-
         tracing::info!("Connecting to CDP: {}", self.ws_url);
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(self.ws_url.clone()).await?;
-        // Leak kill_tx so kill_rx never fires
+        // Dismiss any "Allow debugging connection?" dialog that may appear
+        // during WebSocket connection. The dialog appears asynchronously
+        // when the CDP connection is attempted, so we dismiss it repeatedly.
+        #[cfg(target_os = "macos")]
+        let _ws_url = self.ws_url.clone();
+        #[cfg(target_os = "macos")]
+        let dismiss_handle = tokio::spawn(async move {
+            for _i in 0..10 {
+                dismiss_allow_debugging_dialog();
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+
+        let connect_result = tokio_tungstenite::connect_async(&self.ws_url).await;
+
+        // Wait for dismiss task to finish
+        #[cfg(target_os = "macos")]
+        let _ = dismiss_handle.await;
+
+        let (ws_stream, _) = connect_result.map_err(|e| {
+            // One more dismiss attempt in case the dialog blocked the connection
+            #[cfg(target_os = "macos")]
+            dismiss_allow_debugging_dialog();
+            CdpError::LaunchFailed(format!("WebSocket connect failed: {e}"))
+        })?;
+
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
         std::mem::forget(kill_tx);
         Connection::new(ws_stream, kill_rx).await
@@ -548,30 +567,45 @@ impl Browser {
 
 }
 
-/// Dismiss the "Allow debugging connection?" dialog that may appear when
-/// connecting to a Chrome/Dia browser profile via CDP for the first time.
-/// Uses macOS AppleScript to programmatically click the "Allow" button.
+/// Dismiss the "Allow debugging connection?" dialog that Chrome/Dia shows
+/// when a CDP connection is attempted. The dialog text reads:
+///   "An application is requesting access to debug this browser.
+///    This gives it full access to your browsing data and browser functionality."
+///
+/// Uses macOS AppleScript/System Events to click the "Allow" button.
+/// Runs multiple times with delays since the dialog appears asynchronously
+/// during WebSocket connection.
 #[cfg(target_os = "macos")]
 pub fn dismiss_allow_debugging_dialog() {
-    // Try AppleScript to click "Allow" button in the dialog
-    let script = r#"tell application "System Events"
-        set diaProcess to first process whose name contains "Dia" or name contains "Google Chrome" or name contains "Chromium"
-        tell diaProcess
-            set allowButton to first button of first window whose description contains "Allow"
-            if allowButton exists then
-                click allowButton
-            end if
-        end tell
-    end tell"#;
-
-    let _ = std::process::Command::new("osascript")
-        .args(["-e", script])
-        .output();
-
-    // Also try simple Return keystroke as fallback
-    let _ = std::process::Command::new("osascript")
-        .args(["-e", r#"tell application "System Events" to keystroke return"#])
-        .output();
+    // AppleScript to find and click "Allow" button in the debugging dialog
+    // Tries multiple approaches since dialog may be from Dia or Chrome
+    let scripts = [
+        // Approach 1: Find by window title containing "debug" or "Allow"
+        r#"tell application "System Events"
+            set browserProcesses to {"Dia", "Google Chrome", "Chromium", "Brave Browser", "Microsoft Edge"}
+            repeat with procName in browserProcesses
+                try
+                    tell process procName
+                        if exists (window 1) then
+                            try
+                                click button "Allow" of window 1
+                            end try
+                        end if
+                    end tell
+                end try
+            end repeat
+        end tell"#,
+        // Approach 2: Accessibility press (works for sheets/dialogs)
+        r#"tell application "System Events"
+            key code 36
+        end tell"#,
+    ];
+    
+    for script in &scripts {
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", script])
+            .output();
+    }
 }
 
 /// Non-macOS: no-op

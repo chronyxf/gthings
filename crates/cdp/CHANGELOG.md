@@ -1,5 +1,14 @@
 # Changelog — gthings-cdp
 
+## 0.4.11 (2026-07-25)
+
+### Fixes
+
+#### - Fix: remove `--disable-extensions` flag — users can now have browser extensions active
+
+- Fix: `dismiss_allow_debugging_dialog()` now matches actual dialog text and iterates over Dia, Chrome, Brave, Edge processes
+- Fix: `connect()` spawns background task to dismiss dialog DURING WebSocket connection (dialog appears during WS handshake, not before)
+
 ## 0.4.10 (2026-07-25)
 
 ### Fixes
