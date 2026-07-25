@@ -7,7 +7,7 @@ versioned_files = ["crates/common/Cargo.toml"]
 changelog = "crates/common/CHANGELOG.md"
 
 [packages.gthings-cdp]
-versioned_files = ["crates/cdp/Cargo.toml"]
+versioned_files = ["crates/cdp/Cargo.toml", { path = "crates/search/Cargo.toml", dependency = "gthings-cdp" }, { path = "crates/cli/Cargo.toml", dependency = "gthings-cdp" }]
 changelog = "crates/cdp/CHANGELOG.md"
 
 [packages.gthings-extraction]
@@ -15,7 +15,7 @@ versioned_files = ["crates/extraction/Cargo.toml", { path = "crates/search/Cargo
 changelog = "crates/extraction/CHANGELOG.md"
 
 [packages.gthings-search]
-versioned_files = ["crates/search/Cargo.toml", { path = "crates/cli/Cargo.toml", dependency = "gthings-search" }]
+versioned_files = ["crates/search/Cargo.toml", { path = "crates/cli/Cargo.toml", dependency = "gthings-search" }, { path = "crates/search/Cargo.toml", dependency = "gthings-cdp" }, { path = "crates/search/Cargo.toml", dependency = "gthings-common" }]
 changelog = "crates/search/CHANGELOG.md"
 
 [packages.gthings]

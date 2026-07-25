@@ -7,7 +7,7 @@ license.workspace = true
 description = "CLI binary for gthings — browser-automated web research toolkit"
 
 [dependencies]
-gthings-cdp = { path = "../cdp" }
+gthings-cdp = { path = "../cdp", version = "0.4.14" }
 gthings-search = { path = "../search" , version = "0.5.0" }
 clap = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
