@@ -1,784 +1,369 @@
-mod follow_commands;
-mod pdf_commands;
-mod search_commands;
-mod shell;
+use std::sync::Arc;
 
 use clap::Parser;
-use gthings_common::trace::TraceWriter;
-use include_dir::{Dir, include_dir};
-use std::fs;
-use std::path::Path;
-use std::time::SystemTime;
+use gthings_cdp::{detect, CdpError, Session};
+use gthings_search::{follow, search, BatchProcessor};
 
-static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/resources/skills");
-
-#[derive(clap::Parser)]
-#[command(
-    name = "gthings",
-    version,
-    about = "Browser automation and web research toolkit"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-
-    /// Output as JSON Lines
-    #[arg(global = true, long)]
-    json: bool,
-
-    /// Log level
-    #[arg(global = true, long, default_value = "info")]
-    log_level: String,
-
-    /// Trace file path — write structured JSONL telemetry for every command
-    #[arg(global = true, long)]
-    trace: Option<String>,
-}
-
-#[derive(clap::Subcommand)]
+#[derive(Parser)]
+#[command(name = "gthings", version, about = "Browser automation and web research toolkit", disable_help_subcommand = true)]
 enum Command {
-    /// Search the web
-    Search(SearchArgs),
-    /// Follow/extract page content
-    Follow(FollowArgs),
-    /// PDF text extraction
-    Pdf(PdfArgs),
-    /// Browser lifecycle management
-    #[command(name = "browser", hide = true)]
-    Browser(BrowserArgs),
-    /// Update gthings to the latest version, configure shell PATH, and install skills
-    Update,
-    /// Manage gthings skills (install to opencode or agents)
-    Skill(SkillArgs),
-}
-
-#[derive(clap::Args)]
-struct BrowserArgs {
-    #[command(subcommand)]
-    command: BrowserCommand,
-}
-
-#[derive(clap::Subcommand)]
-enum BrowserCommand {
-    /// Start the persistent browser (auto-started on first use)
-    Start,
-    /// Stop the persistent browser
-    Stop,
-    /// Show browser status
-    Status,
-}
-
-#[derive(clap::Args)]
-struct SearchArgs {
-    #[command(subcommand)]
-    command: SearchCommand,
-}
-
-#[derive(clap::Subcommand)]
-enum SearchCommand {
-    /// Single Google search
-    Query {
+    /// Search Google and return results (JSON array)
+    Search {
         query: String,
-        #[arg(long, default_value = "10")]
-        count: usize,
-    },
-    /// Batch search multiple queries
-    Batch {
-        queries: Vec<String>,
-        #[arg(long, default_value = "5")]
-        count: usize,
-    },
-    /// Two-phase: search then follow top results
-    Harvest {
-        queries: Vec<String>,
         #[arg(long, default_value = "5")]
         count: usize,
         #[arg(long)]
-        max: Option<usize>,
-        /// Max concurrent search tabs (default: from env or 3)
-        #[arg(long)]
-        concurrency: Option<usize>,
-        /// Max concurrent follow tabs (default: from env or 3)
-        #[arg(long, name = "follow-concurrency")]
-        follow_concurrency: Option<usize>,
+        json: bool,
     },
-}
-
-#[derive(clap::Args)]
-struct FollowArgs {
-    #[command(subcommand)]
-    command: FollowCommand,
-}
-
-#[derive(clap::Subcommand)]
-enum FollowCommand {
-    /// Single URL extraction
-    Url {
+    /// Follow/extract page content (JSON object with title/content/url)
+    Follow {
         url: String,
-        #[arg(long, default_value = "article,main,[role=main]")]
-        selector: String,
-        #[arg(long, default_value = "0")]
-        offset: usize,
         #[arg(long, default_value = "15000")]
-        max: usize,
+        max_chars: usize,
+        #[arg(long)]
+        json: bool,
     },
-    /// Batch multi-page extraction
+    /// Batch search (JSON array of result arrays)
     Batch {
-        urls: Vec<String>,
-        #[arg(long, default_value = "article,main,[role=main]")]
-        selector: String,
-        #[arg(long, default_value = "0")]
-        offset: usize,
+        queries: Vec<String>,
+        #[arg(long, default_value = "5")]
+        count: usize,
+        #[arg(long)]
+        follow: bool,
         #[arg(long, default_value = "15000")]
-        max: usize,
+        max_chars: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check browser connection (JSON with status/running/stopped)
+    Status {
+        #[arg(long)]
+        json: bool,
     },
 }
 
-#[derive(clap::Args)]
-struct PdfArgs {
-    #[command(subcommand)]
-    command: PdfCommand,
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Port from `GTHINGS_CDP_PORT` env var (default 9222).
+fn port() -> u16 {
+    std::env::var("GTHINGS_CDP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9222)
 }
 
-#[derive(clap::Subcommand)]
-enum PdfCommand {
-    /// Extract text from PDF at URL
-    Url { url: String },
-    /// Extract text from local PDF file
-    File { path: std::path::PathBuf },
+/// Print a machine-readable error JSON to stderr.
+fn print_error(code: &str, detail: &str, hint: &str) {
+    let err = serde_json::json!({
+        "error": code,
+        "detail": detail,
+        "hint": hint,
+    });
+    eprintln!("{}", err);
 }
 
-#[derive(clap::Args)]
-pub struct SkillArgs {
-    #[command(subcommand)]
-    pub command: SkillCommand,
+/// Detect browser → connect → return Session.
+async fn connect() -> Result<Session, i32> {
+    let p = port();
+
+    // `detect` internally checks GTHINGS_CDP_WS_URL first (fast path),
+    // then probes the CDP port via HTTP /json/version, /json, /json/list,
+    // and finally DevToolsActivePort file scan.
+    let browser = detect(p).await.map_err(|_| {
+        print_error(
+            "BROWSER_NOT_FOUND",
+            &format!("No browser found on port {p}"),
+            "Open Dia or Chrome with --remote-debugging-port=9222",
+        );
+        1
+    })?;
+
+    tracing::info!("Connecting to browser at {}", browser.ws_url);
+
+    Session::connect(&browser.ws_url)
+        .await
+        .map_err(|e| {
+            print_error(
+                "CONNECTION_FAILED",
+                &e.to_string(),
+                "Verify WebSocket URL is accessible",
+            );
+            1
+        })
 }
 
-#[derive(clap::Subcommand)]
-pub enum SkillCommand {
-    /// Install gthings skills
-    Add {
-        /// Install skills to opencode directory (~/.config/opencode/skills/gthings-*)
-        #[arg(long)]
-        opencode: bool,
-        /// Install skills to agents directory (~/.agents/skills/gthings/)
-        #[arg(long)]
-        agents: bool,
-        /// Install to both opencode and agents
-        #[arg(long)]
-        all: bool,
-    },
+/// Map common CDP errors to machine-readable error JSON.
+fn on_cdp_error(e: &CdpError) {
+    match e {
+        CdpError::NavigationTimeout { .. } => {
+            print_error(
+                "NAVIGATION_TIMEOUT",
+                &e.to_string(),
+                "Check network connectivity or URL",
+            );
+        }
+        _ => {
+            print_error(
+                "SEARCH_FAILED",
+                &e.to_string(),
+                "Retry with different arguments",
+            );
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Entrypoint
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    let cli = Cli::parse();
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .without_time()
+        .init();
 
-    let filter = tracing_subscriber::EnvFilter::try_new(&cli.log_level)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let command = Command::parse();
+    let code = match command {
+        Command::Status { json } => cmd_status(json).await,
+        Command::Search { query, count, json } => cmd_search(&query, count, json).await,
+        Command::Follow { url, max_chars, json } => cmd_follow(&url, max_chars, json).await,
+        Command::Batch {
+            queries,
+            count,
+            follow,
+            max_chars,
+            json,
+        } => cmd_batch(queries, count, follow, max_chars, json).await,
 
-    let config = gthings_common::config::GthingsConfig::from_env();
-
-    let session_id = format!(
-        "ses_{:x}",
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-
-    // Initialize TraceWriter if --trace is provided
-    let mut trace_writer = cli
-        .trace
-        .as_ref()
-        .and_then(|path| TraceWriter::new(path).ok());
-
-    let cmd_start = std::time::Instant::now();
-    let (tool_name, tool_args) = command_metadata(&cli.command);
-
-    // Get a borrow to pass through to handlers
-    let trace = trace_writer.as_mut();
-
-    let result = match &cli.command {
-        Command::Search(args) => match &args.command {
-            SearchCommand::Query { query, count } => {
-                search_commands::handle_search_query(&config, query, *count, cli.json, trace).await
-            }
-            SearchCommand::Batch { queries, count } => {
-                search_commands::handle_search_batch(&config, queries, *count, cli.json, trace)
-                    .await
-            }
-            SearchCommand::Harvest {
-                queries,
-                count,
-                max,
-                concurrency,
-                follow_concurrency,
-            } => {
-                search_commands::handle_search_harvest(
-                    &config,
-                    queries,
-                    *count,
-                    *max,
-                    *concurrency,
-                    *follow_concurrency,
-                    cli.json,
-                    trace,
-                )
-                .await
-            }
-        },
-        Command::Follow(args) => match &args.command {
-            FollowCommand::Url {
-                url,
-                selector,
-                offset,
-                max,
-            } => {
-                follow_commands::handle_follow_url(
-                    &config, url, selector, *offset, *max, cli.json, trace,
-                )
-                .await
-            }
-            FollowCommand::Batch {
-                urls,
-                selector,
-                offset,
-                max,
-            } => {
-                follow_commands::handle_follow_batch(
-                    &config, urls, selector, *offset, *max, cli.json, trace,
-                )
-                .await
-            }
-        },
-        Command::Pdf(args) => match &args.command {
-            PdfCommand::Url { url } => pdf_commands::handle_pdf_url(&config, url, cli.json).await,
-            PdfCommand::File { path } => {
-                pdf_commands::handle_pdf_file(&config, path, cli.json).await
-            }
-        },
-        Command::Browser(args) => match &args.command {
-            BrowserCommand::Start => handle_browser_start(cli.json, &config).await,
-            BrowserCommand::Stop => handle_browser_stop(cli.json).await,
-            BrowserCommand::Status => handle_browser_status(cli.json, &config).await,
-        },
-        Command::Update => cmd_update().await,
-        Command::Skill(args) => cmd_skill(args).await,
     };
-
-    let cmd_duration_ms = cmd_start.elapsed().as_millis() as u64;
-    let exit_code = if result.is_ok() { 0 } else { 1 };
-
-    let error_msg = if exit_code != 0 {
-        result.as_ref().err().map(|e| e.to_string())
-    } else {
-        None
-    };
-    if let Some(ref mut t) = trace_writer {
-        t.step(
-            &session_id,
-            0,
-            tool_name,
-            "command",
-            None,
-            cmd_duration_ms,
-            Some(tool_args),
-            Some(serde_json::json!({"exit": exit_code})),
-            error_msg.as_deref(),
-        );
-    }
-
-    result
+    std::process::exit(code);
 }
 
-// Browser lifecycle handlers
+// ---------------------------------------------------------------------------
+// Subcommand implementations
+// ---------------------------------------------------------------------------
 
-/// Start the persistent browser.
-async fn handle_browser_start(
-    json: bool,
-    config: &gthings_common::config::GthingsConfig,
-) -> Result<(), anyhow::Error> {
-    let browser = gthings_cdp::Browser::launch(
-        config.browser_path.clone(),
-        config.profile_dir.clone(),
-        config.cdp_port,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to start browser: {e}"))?;
-    let _conn = browser
-        .connect()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect: {e}"))?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "status": "started",
-                "ws_url": browser.ws_url(),
-            })
-        );
-    } else {
-        println!("Browser started");
-        println!("WebSocket URL: {}", browser.ws_url());
-    }
-    Ok(())
-}
-
-/// Stop the persistent browser.
-async fn handle_browser_stop(json: bool) -> Result<(), anyhow::Error> {
-    let cdp_port = std::env::var("GTHINGS_CDP_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(9222);
-
-    let output = std::process::Command::new("lsof")
-        .args(["-ti", &format!(":{}", cdp_port)])
-        .output()
-        .ok();
-
-    let Some(output) = output else {
-        if json {
-            println!("{}", serde_json::json!({"status": "not_running"}));
-        } else {
-            println!("No browser found on port {} — browser is not running", cdp_port);
+/// Status: detect only, no connection needed.
+async fn cmd_status(json: bool) -> i32 {
+    match detect(port()).await {
+        Ok(browser) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "running",
+                        "ws_url": browser.ws_url,
+                        "browser": browser.browser,
+                        "version": browser.version,
+                    })
+                );
+            } else {
+                println!("Browser: {} {}", browser.browser, browser.version);
+                println!("WebSocket URL: {}", browser.ws_url);
+            }
+            0
         }
-        return Ok(());
-    };
-
-    let pids = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if pids.is_empty() {
-        if json {
-            println!("{}", serde_json::json!({"status": "not_running"}));
-        } else {
-            println!("No browser found on port {} — browser is not running", cdp_port);
-        }
-        return Ok(());
-    }
-
-    for pid_str in pids.lines() {
-        let _ = std::process::Command::new("kill").arg(pid_str).status();
-    }
-
-    if json {
-        println!("{}", serde_json::json!({"status": "stopped", "pid_count": pids.lines().count()}));
-    } else {
-        println!("Browser stopped ({} process{})", pids.lines().count(), if pids.lines().count() == 1 { "" } else { "es" });
-    }
-    Ok(())
-}
-
-/// Show browser status.
-async fn handle_browser_status(
-    json: bool,
-    config: &gthings_common::config::GthingsConfig,
-) -> Result<(), anyhow::Error> {
-    let existing = gthings_cdp::Browser::find_existing(
-        config.profile_dir.as_deref(),
-        config.cdp_port,
-    ).await;
-
-    if let Some(browser) = existing {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "running",
-                    "ws_url": browser.ws_url(),
-                })
-            );
-        } else {
-            println!("Browser is RUNNING");
-            println!("WebSocket URL: {}", browser.ws_url());
-        }
-    } else {
-        if json {
-            println!("{}", serde_json::json!({"status": "stopped"}));
-        } else {
-            println!("Browser is NOT running");
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_update() -> anyhow::Result<()> {
-    // Step 1: Update binary
-    println!("Updating gthings...");
-    let status = std::process::Command::new("cargo")
-        .args(["install", "gthings"])
-        .status()
-        .map_err(|e| anyhow::anyhow!("Failed to run cargo install: {}", e))?;
-    if !status.success() {
-        anyhow::bail!(
-            "cargo install gthings failed with exit code: {:?}",
-            status.code()
-        );
-    }
-    println!("gthings updated to latest version.");
-
-    // Step 2: Configure shell PATH
-    let shell = shell::detect_shell();
-    let cargo_bin = shell::cargo_bin_dir();
-    println!("  Shell: {:?}", shell);
-    println!("  Cargo bin: {}", cargo_bin.display());
-
-    match shell::ensure_path_in_shell_config(&shell) {
-        Ok(true) => {
-            let config_file = shell::shell_config_file(&shell)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "shell config".to_string());
-            println!("  Added cargo bin to: {}", config_file);
-            shell::print_post_init_hint(&shell, true);
-        }
-        Ok(false) => {
-            println!("  Cargo bin already in shell PATH.");
+        Err(CdpError::BrowserNotFound { .. }) => {
+            if json {
+                let output = serde_json::json!({
+                    "status": "stopped"
+                });
+                println!("{output}");
+            } else {
+                println!("Browser is NOT running");
+            }
+            0
         }
         Err(e) => {
-            eprintln!("  Warning: could not update shell config: {}", e);
+            print_error(
+                "DETECT_FAILED",
+                &e.to_string(),
+                "Check browser debugging port",
+            );
+            1
         }
     }
+}
 
-    // Step 3: Install skills to both opencode and agents
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => {
-            println!("  Warning: HOME not set, skipping skill installation.");
-            return Ok(());
+/// Search: detect → connect → create tab → search → close tab → disconnect.
+async fn cmd_search(query: &str, count: usize, json: bool) -> i32 {
+    let session = match connect().await {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+
+    let tab = match session.create_tab("about:blank").await {
+        Ok(t) => t,
+        Err(e) => {
+            print_error("TAB_CREATE_FAILED", &e.to_string(), "Check browser connection");
+            if let Err(e) = session.disconnect().await {
+                tracing::warn!("disconnect failed: {e}");
+            }
+            return 1;
         }
     };
 
-    // Install to agents
-    let agents_dest = std::path::Path::new(&home)
-        .join(".agents")
-        .join("skills")
-        .join("gthings");
-    if let Some(agents_dir) = SKILLS_DIR.get_dir("agents/gthings") {
-        copy_embedded_dir(agents_dir, &agents_dest)?;
-        let _count = count_files(agents_dir);
-        println!("  Skills installed to agents: {}", agents_dest.display());
-    }
-
-    // Install to opencode
-    let opencode_base = std::path::Path::new(&home)
-        .join(".config")
-        .join("opencode")
-        .join("skills");
-    if let Some(opencode_dir) = SKILLS_DIR.get_dir("opencode") {
-        for skill_subdir in opencode_dir.dirs() {
-            let skill_name = skill_subdir
-                .path()
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("Invalid skill directory name"))?;
-            let skill_dest = opencode_base.join(skill_name);
-            copy_embedded_dir(skill_subdir, &skill_dest)?;
+    let results = match search(&session, &tab, query, count).await {
+        Ok(r) => r,
+        Err(e) => {
+            if let Err(e) = session.close_tab(tab).await {
+                tracing::warn!("close_tab failed: {e}");
+            }
+            if let Err(e) = session.disconnect().await {
+                tracing::warn!("disconnect failed: {e}");
+            }
+            on_cdp_error(&e);
+            return 1;
         }
-        println!(
-            "  Skills installed to opencode: {}",
-            opencode_base.display()
-        );
+    };
+
+    if let Err(e) = session.close_tab(tab).await {
+        tracing::warn!("close_tab failed: {e}");
+    }
+    if let Err(e) = session.disconnect().await {
+        tracing::warn!("disconnect failed: {e}");
     }
 
-    println!("gthings update complete.");
-    Ok(())
-}
-
-async fn cmd_skill(args: &SkillArgs) -> anyhow::Result<()> {
-    match &args.command {
-        SkillCommand::Add {
-            opencode,
-            agents,
-            all,
-        } => {
-            let do_opencode = *opencode || *all;
-            let do_agents = *agents || *all;
-
-            if !do_opencode && !do_agents {
-                anyhow::bail!("Specify --opencode, --agents, or --all");
+    if json {
+        let output = serde_json::to_string(&results).unwrap_or_else(|e| {
+            tracing::error!("serialize output failed: {e}");
+            String::new()
+        });
+        println!("{}", output);
+    } else {
+        for r in &results {
+            println!("#{} {} — {}", r.position, r.title, r.url);
+            if !r.snippet.is_empty() {
+                println!("  {}", r.snippet);
             }
-
-            let home = std::env::var("HOME")
-                .map_err(|_| anyhow::anyhow!("HOME environment variable not set"))?;
-
-            if do_agents {
-                let dest = Path::new(&home)
-                    .join(".agents")
-                    .join("skills")
-                    .join("gthings");
-                if let Some(skill_dir) = SKILLS_DIR.get_dir("agents/gthings") {
-                    copy_embedded_dir(skill_dir, &dest)?;
-                    let count = count_files(skill_dir);
-                    println!(
-                        "Installed {} files to agents skill: {}",
-                        count,
-                        dest.display()
-                    );
-                } else {
-                    anyhow::bail!("Embedded agents skill directory not found");
-                }
-            }
-
-            if do_opencode {
-                let dest = Path::new(&home)
-                    .join(".config")
-                    .join("opencode")
-                    .join("skills");
-                if let Some(opencode_dir) = SKILLS_DIR.get_dir("opencode") {
-                    for skill_subdir in opencode_dir.dirs() {
-                        let skill_name = skill_subdir
-                            .path()
-                            .file_name()
-                            .ok_or_else(|| anyhow::anyhow!("Invalid skill directory name"))?;
-                        let skill_dest = dest.join(skill_name);
-                        copy_embedded_dir(skill_subdir, &skill_dest)?;
-                        let count = count_files(skill_subdir);
-                        println!(
-                            "  - Installed {} files to opencode skill: {}",
-                            count,
-                            skill_dest.display()
-                        );
-                    }
-                } else {
-                    anyhow::bail!("Embedded opencode skills directory not found");
-                }
-            }
-
-            println!("Skill installation complete.");
-            Ok(())
         }
     }
+    0
 }
 
-fn copy_embedded_dir(dir: &Dir, dest: &Path) -> anyhow::Result<()> {
-    for file in dir.files() {
-        let relative = file
-            .path()
-            .strip_prefix(dir.path())
-            .map_err(|_| anyhow::anyhow!("Failed to compute relative path"))?;
-        let dest_path = dest.join(relative);
-        if let Some(parent) = dest_path.parent() {
-            fs::create_dir_all(parent)?;
+/// Follow: detect → connect → create tab → follow → close tab → disconnect.
+async fn cmd_follow(url: &str, max_chars: usize, json: bool) -> i32 {
+    let session = match connect().await {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+
+    let tab = match session.create_tab("about:blank").await {
+        Ok(t) => t,
+        Err(e) => {
+            print_error("TAB_CREATE_FAILED", &e.to_string(), "Check browser connection");
+            if let Err(e) = session.disconnect().await {
+                tracing::warn!("disconnect failed: {e}");
+            }
+            return 1;
         }
-        fs::write(&dest_path, file.contents())?;
+    };
+
+    let result = match follow(&session, &tab, url, max_chars).await {
+        Ok(r) => r,
+        Err(e) => {
+            if let Err(e) = session.close_tab(tab).await {
+                tracing::warn!("close_tab failed: {e}");
+            }
+            if let Err(e) = session.disconnect().await {
+                tracing::warn!("disconnect failed: {e}");
+            }
+            on_cdp_error(&e);
+            return 1;
+        }
+    };
+
+    if let Err(e) = session.close_tab(tab).await {
+        tracing::warn!("close_tab failed: {e}");
     }
-    for subdir in dir.dirs() {
-        let relative = subdir
-            .path()
-            .strip_prefix(dir.path())
-            .map_err(|_| anyhow::anyhow!("Failed to compute relative path"))?;
-        let subdest = dest.join(relative);
-        fs::create_dir_all(&subdest)?;
-        copy_embedded_dir(subdir, &subdest)?;
+    if let Err(e) = session.disconnect().await {
+        tracing::warn!("disconnect failed: {e}");
     }
-    Ok(())
+
+    if json {
+        let output = serde_json::to_string(&result).unwrap_or_else(|e| {
+            tracing::error!("serialize output failed: {e}");
+            String::new()
+        });
+        println!("{}", output);
+    } else {
+        println!("Title: {}", result.title);
+        println!("URL: {}", result.url);
+        if result.truncated {
+            println!("Content (truncated to {max_chars} chars):");
+        } else {
+            println!("Content:");
+        }
+        println!("{}", result.content);
+    }
+    0
 }
 
-fn count_files(dir: &Dir) -> usize {
-    let mut count = dir.files().count();
-    for subdir in dir.dirs() {
-        count += count_files(subdir);
-    }
-    count
-}
+/// Batch: detect → connect → batch → disconnect.
+///
+/// BatchProcessor::search creates and closes tabs internally, so we only
+/// manage the session lifecycle at this level.
+async fn cmd_batch(
+    queries: Vec<String>,
+    count: usize,
+    do_follow: bool,
+    max_chars: usize,
+    json: bool,
+) -> i32 {
+    let session = match connect().await {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
 
-/// Extract command metadata for telemetry.
-fn command_metadata(cmd: &Command) -> (&'static str, serde_json::Value) {
-    match cmd {
-        Command::Search(args) => match &args.command {
-            SearchCommand::Query { query, count } => (
-                "search",
-                serde_json::json!({"query": query, "count": count}),
-            ),
-            SearchCommand::Batch { queries, count } => (
-                "search_batch",
-                serde_json::json!({"queries_count": queries.len(), "count": count}),
-            ),
-            SearchCommand::Harvest {
-                queries,
-                count,
-                max,
-                concurrency,
-                follow_concurrency,
-            } => (
-                "search_harvest",
-                serde_json::json!({
-                    "queries_count": queries.len(),
-                    "count": count,
-                    "max": max,
-                    "concurrency": concurrency,
-                    "follow_concurrency": follow_concurrency,
-                }),
-            ),
-        },
-        Command::Follow(args) => match &args.command {
-            FollowCommand::Url {
-                url,
-                selector,
-                offset: _,
-                max,
-            } => (
-                "follow",
-                serde_json::json!({"url": url, "selector": selector, "max": max}),
-            ),
-            FollowCommand::Batch {
-                urls,
-                selector: _,
-                offset: _,
-                max,
-            } => (
-                "follow_batch",
-                serde_json::json!({"urls_count": urls.len(), "max": max}),
-            ),
-        },
-        Command::Pdf(args) => match &args.command {
-            PdfCommand::Url { url } => ("pdf_url", serde_json::json!({"url": url})),
-            PdfCommand::File { path } => (
-                "pdf_file",
-                serde_json::json!({"path": format!("{}", path.display())}),
-            ),
-        },
-        Command::Browser(args) => match &args.command {
-            BrowserCommand::Start => ("browser_start", serde_json::json!({})),
-            BrowserCommand::Stop => ("browser_stop", serde_json::json!({})),
-            BrowserCommand::Status => ("browser_status", serde_json::json!({})),
-        },
-        Command::Update => ("update", serde_json::json!({})),
-        Command::Skill(args) => match &args.command {
-            SkillCommand::Add { .. } => ("skill_add", serde_json::json!({})),
-        },
-    }
-}
+    let arc_session = Arc::new(session);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let all_results =
+        match BatchProcessor::search(Arc::clone(&arc_session), &queries, count, do_follow, max_chars)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                print_error(
+                    "BATCH_FAILED",
+                    &e.to_string(),
+                    "Retry with fewer queries or longer timeout",
+                );
+                return 1;
+            }
+        };
 
-    #[test]
-    fn test_skills_dir_has_agents_gthings() {
-        let dir = SKILLS_DIR.get_dir("agents/gthings");
-        assert!(dir.is_some(), "agents/gthings dir should exist");
+    // Clean disconnect when possible (unique reference).
+    if let Ok(s) = Arc::try_unwrap(arc_session) {
+        if let Err(e) = s.disconnect().await {
+            tracing::warn!("disconnect failed: {e}");
+        }
     }
 
-    #[test]
-    fn test_skills_dir_has_opencode() {
-        let dir = SKILLS_DIR.get_dir("opencode");
-        assert!(dir.is_some(), "opencode dir should exist");
-    }
-
-    #[test]
-    fn test_agents_skill_md_exists() {
-        let dir = SKILLS_DIR.get_dir("agents/gthings").unwrap();
-        let has_skill_md = dir.files().any(|f| f.path().ends_with("SKILL.md"));
-        assert!(has_skill_md, "agents/gthings should contain SKILL.md");
-    }
-
-    #[test]
-    fn test_agents_has_reference_files() {
-        let dir = SKILLS_DIR.get_dir("agents/gthings").unwrap();
-        let count = count_files(dir);
-        assert!(
-            count >= 3,
-            "agents/gthings should have at least 3 files, got {}",
-            count
-        );
-    }
-
-    #[test]
-    fn test_opencode_has_gthings() {
-        let dir = SKILLS_DIR.get_dir("opencode").unwrap();
-        let has_gthings = dir.dirs().any(|d| d.path().ends_with("gthings"));
-        assert!(has_gthings, "opencode should contain gthings dir");
-    }
-
-    #[test]
-    fn test_opencode_has_only_gthings() {
-        let dir = SKILLS_DIR.get_dir("opencode").unwrap();
-        let skill_names: Vec<_> = dir
-            .dirs()
-            .map(|d| d.path().file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert_eq!(
-            skill_names,
-            vec!["gthings"],
-            "opencode should only contain 'gthings' skill, got: {:?}",
-            skill_names
-        );
-    }
-
-    #[test]
-    fn test_copy_embedded_dir_to_temp() {
-        use std::fs;
-        let tmp = std::env::temp_dir().join(format!("gthings_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-
-        let skill_dir = SKILLS_DIR.get_dir("agents/gthings").unwrap();
-        copy_embedded_dir(skill_dir, &tmp).unwrap();
-
-        assert!(tmp.join("SKILL.md").exists(), "SKILL.md should be copied");
-        assert!(
-            tmp.join("reference").join("commands.md").exists(),
-            "commands.md should be copied"
-        );
-        assert!(
-            tmp.join("reference").join("quality.md").exists(),
-            "quality.md should be copied"
-        );
-
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_copy_embedded_dir_count_matches() {
-        use std::fs;
-        let tmp = std::env::temp_dir().join(format!("gthings_test_cnt_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-
-        let skill_dir = SKILLS_DIR.get_dir("agents/gthings").unwrap();
-        let count_before = count_files(skill_dir);
-        copy_embedded_dir(skill_dir, &tmp).unwrap();
-
-        let count_after = count_dir_files(&tmp);
-        assert_eq!(
-            count_before, count_after,
-            "count_files should match actual copied files"
-        );
-
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    fn count_dir_files(path: &std::path::Path) -> usize {
-        let mut count = 0;
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    count += count_dir_files(&entry.path());
-                } else {
-                    count += 1;
+    if json {
+        let output = serde_json::to_string(&all_results).unwrap_or_else(|e| {
+            tracing::error!("serialize output failed: {e}");
+            String::new()
+        });
+        println!("{}", output);
+    } else {
+        for (i, results) in all_results.iter().enumerate() {
+            println!("Query #{}:", i + 1);
+            for r in results {
+                println!("  #{} {} — {}", r.position, r.title, r.url);
+                if !r.snippet.is_empty() {
+                    println!("    {}", r.snippet);
                 }
             }
         }
-        count
     }
-
-    #[test]
-    fn test_opencode_gthings_has_yaml_frontmatter() {
-        let dir = SKILLS_DIR.get_dir("opencode/gthings").unwrap();
-        let skill_md = dir.files().find(|f| f.path().ends_with("SKILL.md"));
-        assert!(skill_md.is_some(), "opencode/gthings should have SKILL.md");
-        let content = String::from_utf8_lossy(skill_md.unwrap().contents());
-        assert!(
-            content.starts_with("---"),
-            "opencode/gthings/SKILL.md should start with YAML frontmatter"
-        );
-        assert!(
-            content.contains("name: gthings"),
-            "should have name: gthings"
-        );
-        assert!(
-            content.contains("description:"),
-            "should have description field"
-        );
-    }
+    0
 }
+
+

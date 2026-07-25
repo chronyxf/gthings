@@ -1,5 +1,22 @@
 # Changelog — gthings (CLI)
 
+## 0.5.0 (2026-07-25)
+
+### Breaking Changes
+
+#### - Simplified CLI from 7+ nested subcommands to 4 flat subcommands: search, follow, batch, status
+
+- Removed PDF extraction commands (pdf url, pdf file)
+- Removed browser lifecycle commands (browser start, browser stop) — browser is detected-only now
+- Removed update command (cargo install + shell config + skill installation)
+- Removed skill management commands
+- Removed --trace flag and telemetry infrastructure
+- Removed embedded skills directory (include_dir!)
+- Removed follow_commands, search_commands, pdf_commands modules
+- Changed --max to --max-chars for follow and batch subcommands
+- --json is now per-subcommand flag (not global)
+- Added structured error JSON output (print_error helper)
+
 ## 0.4.9 (2026-07-25)
 
 ### Fixes

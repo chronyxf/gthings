@@ -121,7 +121,10 @@ pub(crate) fn cargo_bin_dir() -> PathBuf {
     if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
         PathBuf::from(cargo_home).join("bin")
     } else {
-        let home = std::env::var("HOME").expect("HOME must be set");
+        let home = std::env::var("HOME").unwrap_or_else(|_| {
+            tracing::warn!("HOME not set, using temp directory");
+            std::env::temp_dir().to_string_lossy().to_string()
+        });
         PathBuf::from(home).join(".cargo").join("bin")
     }
 }
@@ -169,7 +172,10 @@ pub(crate) fn config_has_cargo_bin_path(shell: &Shell) -> bool {
 
     let contents = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(e) => {
+            tracing::warn!("Failed to read config: {e}");
+            return false;
+        }
     };
 
     let cargo_bin_str = cargo_bin_dir().to_string_lossy().to_string();

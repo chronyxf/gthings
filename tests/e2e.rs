@@ -1,166 +1,191 @@
-// End-to-end tests for gthings agent workflows.
+//! End-to-end tests for the gthings CLI binary.
+//!
+//! Tests marked `#[ignore]` require a running Chrome instance with
+//! remote debugging enabled. Run manually with:
+//!   cargo test --test e2e -- --ignored
+//!
+//! Chrome tests use a dedicated port (29992-29994) to avoid interfering
+//! with user browsing sessions.
 
-mod common;
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
-use crate::common::*;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-// Test 1: Clean stale browser + launch fresh one
-#[test]
-fn test_cleanup_and_launch() {
-    // Kill any leftover from previous runs
-    stop_existing_browser(&gthings_bin());
+/// Locate the `gthings` binary.
+fn gthings_binary() -> PathBuf {
+    // CARGO_BIN_EXE_gthings is set when running `cargo test -p gthings`.
+    // For workspace-level `cargo test`, fall back to target/debug/gthings.
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_gthings") {
+        return PathBuf::from(path);
+    }
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("target/debug/gthings");
+    if !path.exists() {
+        path.set_extension("exe");
+    }
+    path
+}
 
-    assert!(wait_for_port(10), "Port 9222 should become free within 10s");
+/// Run `gthings` with the given args, return stdout.
+#[allow(dead_code)]
+fn run_gthings(args: &[&str]) -> String {
+    run_gthings_with_env(args, &[])
+}
 
-    // Search auto-launches the browser
-    let (json, _) = run_gthings(&["--json", "search", "query", "Rust", "--count", "1"]);
-    let results = json
-        .get("results")
-        .or_else(|| json.get("data"))
-        .and_then(|r| r.as_array());
-    assert!(results.is_some(), "Search should return results: {}", json);
-
-    let (status_json, _) = run_gthings(&["--json", "browser", "status"]);
-    assert_eq!(
-        status_json["status"], "running",
-        "Browser should be running after search, got: {}",
-        status_json
-    );
+/// Run `gthings` with custom environment variables, return stdout.
+fn run_gthings_with_env(args: &[&str], envs: &[(&str, &str)]) -> String {
+    let mut cmd = Command::new(gthings_binary());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let output = cmd.args(args).output().expect("failed to run gthings binary");
     assert!(
-        status_json["pid"].as_u64().is_some(),
-        "Browser PID should be present"
+        output.status.success(),
+        "gthings exited with code {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
     );
+    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-// Test 2: Search returns structured results
-#[test]
-fn test_search_query_returns_results() {
-    let (json, _) = run_gthings(&["--json", "search", "query", "Rust async", "--count", "2"]);
-    let results = json
-        .get("results")
-        .or_else(|| json.get("data"))
-        .and_then(|r| r.as_array());
-    match results {
-        Some(results) => {
-            assert!(!results.is_empty(), "Should have at least 1 result");
-            if let Some(first) = results.first() {
-                assert!(first.get("title").is_some(), "Result should have title");
-                assert!(first.get("url").is_some(), "Result should have url");
-            }
+/// Launch headless Chrome on the given debugging port.
+fn launch_chrome(port: u16) -> Child {
+    let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    Command::new(chrome)
+        .args([
+            "--headless",
+            &format!("--remote-debugging-port={port}"),
+            "--no-first-run",
+            "--disable-fre",
+            "--disable-search-engine-choice-screen",
+            "--user-data-dir=/tmp/gthings-e2e-chrome",
+        ])
+        .spawn()
+        .expect("failed to launch Chrome. Install Google Chrome first.")
+}
+
+/// Poll until `port` accepts TCP connections (up to `timeout`).
+fn wait_for_port(port: u16, timeout: Duration) -> bool {
+    let start = Instant::now();
+    let addr: String = format!("127.0.0.1:{port}");
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok()
+        {
+            return true;
         }
-        None => panic!("Unexpected JSON: {}", json),
+        std::thread::sleep(Duration::from_millis(200));
     }
+    false
 }
 
-// Test 3: Follow URL extracts content
-#[test]
-fn test_follow_url_extracts_content() {
-    let (json, _) = run_gthings(&[
-        "--json",
-        "follow",
-        "url",
-        "https://www.rust-lang.org",
-        "--max",
-        "5000",
-    ]);
-    let data = json.get("data").unwrap_or(&json);
-    let content_length = data
-        .get("total_length")
-        .or_else(|| data.get("returned_length"))
-        .and_then(|v| v.as_u64());
-    assert!(content_length.is_some(), "Should report content length");
-    if let Some(len) = content_length {
-        assert!(len > 100, "Content should be >100 chars, got {}", len);
-    }
+/// Gracefully stop a Chrome child process.
+fn kill_chrome(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
-// Test 4: Batch follow multiple URLs
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[test]
-fn test_follow_batch_multiple_urls() {
-    let (json, _) = run_gthings(&[
-        "--json",
-        "follow",
-        "batch",
-        "https://www.rust-lang.org",
-        "https://github.com/tokio-rs/tokio",
-        "--max",
-        "3000",
-    ]);
-    let pages = json
-        .as_array()
-        .or_else(|| json.get("pages").and_then(|p| p.as_array()))
-        .or_else(|| json.get("data").and_then(|d| d.as_array()));
-    match pages {
-        Some(pages) => {
-            assert!(!pages.is_empty(), "Should have at least 1 page");
-            for (i, page) in pages.iter().enumerate() {
-                println!("Page {}: url={:?}", i + 1, page.get("url"));
-            }
-        }
-        None => panic!("Unexpected JSON for batch: {}", json),
-    }
+fn test_status_shows_stopped_when_no_browser() {
+    let stdout = run_gthings_with_env(&["status", "--json"], &[("GTHINGS_CDP_PORT", "29999")]);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON from status");
+    assert_eq!(value["status"], "stopped", "expected stopped status");
 }
 
-// Test 5: Final cleanup
 #[test]
-fn test_cleanup_browser() {
-    let (stop_json, _) = run_gthings(&["--json", "browser", "stop"]);
+#[ignore]
+fn test_search_via_chrome() {
+    const PORT: u16 = 29992;
+    let chrome = launch_chrome(PORT);
     assert!(
-        stop_json.get("pid").or(stop_json.get("status")).is_some(),
-        "Stop should return status: {}",
-        stop_json
+        wait_for_port(PORT, Duration::from_secs(15)),
+        "Chrome did not start on port {PORT}"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    let (status_json, _) = run_gthings(&["--json", "browser", "status"]);
-    assert_eq!(
-        status_json["status"], "stopped",
-        "Browser should be stopped, got: {}",
-        status_json
+    let port_str = PORT.to_string();
+    let stdout = run_gthings_with_env(
+        &["search", "rust programming", "--count", "3", "--json"],
+        &[("GTHINGS_CDP_PORT", &port_str)],
     );
+    let results: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout).expect("valid JSON array");
+    assert_eq!(results.len(), 3, "expected 3 search results");
+    for r in &results {
+        let title = r["title"].as_str().unwrap_or("");
+        let url = r["url"].as_str().unwrap_or("");
+        assert!(!title.is_empty(), "result title should be non-empty");
+        assert!(!url.is_empty(), "result url should be non-empty");
+    }
+
+    kill_chrome(chrome);
 }
 
-// Test 6: No state file is written (stateless design)
 #[test]
-fn test_no_state_file_created() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let state_path = std::path::Path::new(&home).join(".gthings").join("browser.json");
-    assert!(!state_path.exists(), "State file should not exist (stateless design)");
-}
-
-// Test 7: dismiss_allow_debugging_dialog does not panic
-#[test]
-fn test_dismiss_dialog_no_panic() {
-    // dismiss_allow_debugging_dialog should not panic even when no dialog is shown
-    gthings_cdp::browser::dismiss_allow_debugging_dialog();
-}
-
-// Test 8: Browser detection on unused port
-#[test]
-fn test_browser_detection() {
-    // Use a non-standard port so we don't interfere with user's browser
-    let port = 29997;
-
-    // Should not find a browser on unused port
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async {
-        gthings_cdp::Browser::find_existing(None, port).await
-    });
-    assert!(result.is_none(), "Should not find browser on unused port {}", port);
-}
-
-// Test 9: Follow extracts content from example.com
-#[test]
+#[ignore]
 fn test_follow_extracts_content() {
-    let (json, _) = crate::common::run_gthings(&[
-        "--json", "follow", "url", "https://example.com",
-    ]);
-    assert!(json.get("content").is_some(), "Follow should extract content");
-    let content = json["content"].as_str().unwrap_or("");
-    assert!(!content.is_empty(), "Content should not be empty");
+    const PORT: u16 = 29993;
+    let chrome = launch_chrome(PORT);
     assert!(
-        content.contains("Example Domain") || content.contains("example"),
-        "Content should contain expected text"
+        wait_for_port(PORT, Duration::from_secs(15)),
+        "Chrome did not start on port {PORT}"
     );
+
+    let port_str = PORT.to_string();
+    let stdout = run_gthings_with_env(
+        &[
+            "follow",
+            "https://example.com",
+            "--max-chars",
+            "500",
+            "--json",
+        ],
+        &[("GTHINGS_CDP_PORT", &port_str)],
+    );
+    let result: serde_json::Value =
+        serde_json::from_str(&stdout).expect("valid JSON object");
+    let content = result["content"].as_str().unwrap_or("");
+    assert!(
+        content.contains("Example Domain"),
+        "content should contain 'Example Domain', got: {content}"
+    );
+
+    kill_chrome(chrome);
+}
+
+#[test]
+#[ignore]
+fn test_batch_search() {
+    const PORT: u16 = 29994;
+    let chrome = launch_chrome(PORT);
+    assert!(
+        wait_for_port(PORT, Duration::from_secs(15)),
+        "Chrome did not start on port {PORT}"
+    );
+
+    let port_str = PORT.to_string();
+    let stdout = run_gthings_with_env(
+        &["batch", "rust", "python", "go", "--count", "2", "--json"],
+        &[("GTHINGS_CDP_PORT", &port_str)],
+    );
+    let results: Vec<Vec<serde_json::Value>> =
+        serde_json::from_str(&stdout).expect("valid JSON array of arrays");
+    assert_eq!(results.len(), 3, "expected 3 query result sets");
+    for (i, batch) in results.iter().enumerate() {
+        assert_eq!(
+            batch.len(),
+            2,
+            "query {i}: expected 2 results, got {}",
+            batch.len()
+        );
+    }
+
+    kill_chrome(chrome);
 }

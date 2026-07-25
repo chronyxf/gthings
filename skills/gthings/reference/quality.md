@@ -1,15 +1,18 @@
 # Content Quality Gate and Section Extraction
 
-## Quality Gate
+## Status: Internal to Extraction Crate
 
-Every `follow` result includes `quality`:
-```json
-{"quality": {"score": 0.0-1.0, "is_ok": true, "reasons": [], "length": 45320}}
-```
+The quality gate and section extraction now live **inside** the `gthings_extraction` crate and are **no longer surfaced via the CLI output**. The `FollowResult` returned by `gthings follow` does NOT include `quality` or `sections` fields.
 
-### Pass Criteria (`is_ok: true`)
+However, the quality heuristics remain useful for **manual inspection** of `FollowResult.content` when you want to assess whether the extracted text is worthwhile before passing it to an LLM.
 
-Content passes when `score >= 0.5`. Score starts at 1.0 with deductions:
+---
+
+## Quality Gate (Reference for Manual Use)
+
+### Pass Criteria (score >= 0.5)
+
+Score starts at 1.0 with deductions:
 
 | Condition | Deduction | Reason |
 |-----------|-----------|--------|
@@ -23,51 +26,40 @@ Content passes when `score >= 0.5`. Score starts at 1.0 with deductions:
 | < 15 words + < 200 chars | -0.2 | `too_few_words` |
 | > 100 chars, no punctuation | -0.1 | `no_punctuation` |
 
-### Fail Criteria (`is_ok: false`)
+### Fail Indicators
 
-| reasons | Meaning | Recovery |
+| Indicator | Meaning | Recovery |
+|-----------|---------|----------|
+| `too_short` (< 80 chars) | Barely any content | Retry with larger `--max-chars` |
+| `browser_error_page` | Unreachable page | Verify URL |
+| `paywall_teaser` | Subscription required | Try alternative source |
+| `too_few_words` + `navigation_chrome` | Sign-in wall | Auth required |
+
+### Bot/Captcha/Paywall Detection Patterns
+
+| Pattern | Detects | Keywords |
 |---------|---------|----------|
-| `["too_short"]` | < 80 chars | `--selector "body" --max 30000` |
-| `["browser_error_page"]` | Unreachable | Verify URL |
-| `["paywall_teaser"]` | Subscription | Try alternative source |
-| `["too_few_words", "navigation_chrome"]` | Sign-in required | Auth required |
-| `["empty_content"]` | JS-rendered | Needs different approach |
+| Bot check | Cloudflare, DataDome, Turnstile | "checking your browser", "just a moment" |
+| Captcha | reCAPTCHA, hCaptcha | "recaptcha", "h-captcha", "cf-turnstile" |
+| Paywall | Subscription prompts | "subscribe to read", "log in to continue" |
+| Empty shell | JS-only pages | < 80 chars, "enable JavaScript" |
 
-### Bot/Captcha/Paywall Detection
+## Section Extraction (Reference)
 
-| Function | Detects | Patterns |
-|----------|---------|----------|
-| `detect_bot` | Cloudflare, DataDome, Turnstile | "checking your browser", "just a moment" |
-| `detect_captcha` | reCAPTCHA, hCaptcha | "recaptcha", "h-captcha", "cf-turnstile" |
-| `detect_paywall` | Subscription prompts | "subscribe to read", "log in to continue" |
-| `detect_empty_shell` | JS-only pages | < 80 chars, "enable JavaScript" |
+The extraction crate extracts sections from h1/h2/h3 elements but this data is not included in the CLI `FollowResult`. If you need structured sections, use the `gthings_extraction` crate directly.
 
-### Retry Logic
+### Method (for reference)
 
-`follow` auto-retries with `--selector "body" --timeout 30000` when `score < 0.3` (unconditionally) or `score < 0.5` AND reasons include `too_short`, `too_few_words`, or `navigation_chrome`.
-
-## Section Extraction
-
-Sections from h1/h2/h3 elements:
-```json
-{"sections": [{"heading": "Financial Report", "content": "..."}, {"heading": "Interest Rates", "content": "..."}]}
-```
-
-### Method
 1. Extract via `document.body.innerText` (or CSS selector)
 2. Find h1/h2/h3 via `querySelectorAll('h1,h2,h3')`
 3. Collect sibling text until next heading
-4. `content` = text between this heading and next
+4. Content between headings = section content
 
-### Empty Sections
-
-`sections: []` means no headings found. The `content` field still has full text.
-
-### Secondary Quality Check
+### Secondary Checks for `FollowResult.content`
 
 | Check | Detects | Threshold |
 |-------|---------|-----------|
 | `truncated` | Content ends mid-sentence | Last char is alphanumeric, not .!? |
-| `repetitive` | Same sentence repeated | Unique sentences < 50% |
-| `sparse` | Very few words | < 20 words |
-| `suspicious_short` | Short + redirect keywords | < 80 chars + "redirect"/"click here" |
+| Repetitive text | Same sentence repeated | Unique sentences < 50% |
+| Sparse content | Very few words | < 20 words |
+| Suspicious short | Short + redirect keywords | < 80 chars + "redirect"/"click here" |
