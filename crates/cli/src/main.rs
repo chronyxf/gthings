@@ -45,6 +45,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Update gthings to latest version and install/refresh skill files
+    Update,
     /// Extract content from any URL (auto-detects PDF, GitHub, arXiv, web)
     Extract {
         url: String,
@@ -116,6 +118,7 @@ async fn main() {
     let command = Command::parse();
     let code = match command {
         Command::Status { json } => commands::cmd_status(json).await,
+        Command::Update => commands::cmd_update().await,
         Command::Search { query, count, json } => commands::cmd_search(&query, count, json).await,
         Command::Follow {
             url,

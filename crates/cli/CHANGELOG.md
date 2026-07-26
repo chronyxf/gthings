@@ -1,4 +1,9 @@
-# Changelog — gthings (CLI)
+# Changelog
+
+## [0.6.3] - 2026-07-26
+
+### Added
+- Add `gthings update` CLI command that updates the binary via `cargo install gthings` and installs/refreshes opencode skill files to `~/.config/opencode/skills/gthings/` and agent files to `~/.config/opencode/agents/gthings/`
 
 ## 0.6.1 (2026-07-26)
 
@@ -153,3 +158,4 @@
 
 ### Removed
 - screenshot and scrape subcommands (legacy, not yet reimplemented for new architecture)
+
