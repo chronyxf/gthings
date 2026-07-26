@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "gthings"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "clap",
  "gthings-cdp",
