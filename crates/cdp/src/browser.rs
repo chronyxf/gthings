@@ -134,7 +134,11 @@ async fn probe_http_version(port: u16) -> Option<DetectedBrowser> {
         .unwrap_or("unknown");
     let version = full_browser.to_string();
     // Extract short browser name from "Chrome/130.0.0.0" style string
-    let browser = full_browser.split('/').next().unwrap_or("unknown").to_string();
+    let browser = full_browser
+        .split('/')
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
 
     Some(DetectedBrowser {
         ws_url: ws_url.to_string(),
@@ -192,13 +196,9 @@ async fn probe_devtools_active_port(port: u16) -> Option<DetectedBrowser> {
             let ws_url = format!("ws://127.0.0.1:{port}{ws_path}");
 
             // Verify port is accepting TCP connections
-            let addr: std::net::SocketAddr =
-                format!("127.0.0.1:{port}").parse().ok()?;
-            if std::net::TcpStream::connect_timeout(
-                &addr,
-                std::time::Duration::from_millis(500),
-            )
-            .is_ok()
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().ok()?;
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+                .is_ok()
             {
                 let browser_name = infer_browser_name(dir);
                 return Some(DetectedBrowser {
@@ -276,10 +276,7 @@ mod tests {
     fn test_detect_no_browser() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async { detect(29_999).await });
-        assert!(
-            result.is_err(),
-            "detect on unused port should return error"
-        );
+        assert!(result.is_err(), "detect on unused port should return error");
         match result {
             Err(CdpError::BrowserNotFound { port }) => assert_eq!(port, 29_999),
             _ => panic!("expected BrowserNotFound"),
@@ -299,7 +296,10 @@ mod tests {
         );
         assert_eq!(infer_browser_name(p("/Chromium")), "Chromium");
         assert_eq!(infer_browser_name(p("/Microsoft Edge")), "Microsoft Edge");
-        assert_eq!(infer_browser_name(p("/BraveSoftware/Brave-Browser")), "Brave");
+        assert_eq!(
+            infer_browser_name(p("/BraveSoftware/Brave-Browser")),
+            "Brave"
+        );
         assert_eq!(infer_browser_name(p("/Arc/User Data")), "Arc");
         assert_eq!(infer_browser_name(p("/Vivaldi")), "Vivaldi");
         assert_eq!(infer_browser_name(p("/com.operasoftware.Opera")), "Opera");

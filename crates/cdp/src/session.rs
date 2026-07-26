@@ -88,12 +88,8 @@ impl Session {
         let mut rx = conn.event_rx();
 
         // 3. Start navigation
-        conn.call(
-            "Page.navigate",
-            serde_json::json!({"url": url}),
-            sid,
-        )
-        .await?;
+        conn.call("Page.navigate", serde_json::json!({"url": url}), sid)
+            .await?;
 
         // 4. Wait for networkIdle using the pre-subscribed receiver
         let result = wait_for_event(
@@ -146,7 +142,7 @@ impl Session {
 
     /// Wait for a CDP event matching method + predicate.
     ///
-    /// ⚠️ Creates a NEW event subscription. Call BEFORE the action that
+    /// Warning: Creates a new event subscription. Subscribe BEFORE the action that
     /// triggers the event to avoid race conditions. For navigation, use
     /// [`navigate()`](Session::navigate) instead.
     pub async fn wait_for<F>(

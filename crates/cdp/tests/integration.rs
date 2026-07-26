@@ -23,10 +23,7 @@ fn test_error_display_variants() {
         method: "Page.navigate".into(),
         detail: "timeout".into(),
     };
-    assert_eq!(
-        format!("{err}"),
-        "CDP call Page.navigate failed: timeout"
-    );
+    assert_eq!(format!("{err}"), "CDP call Page.navigate failed: timeout");
 
     let err = CdpError::NavigationTimeout {
         url: "https://example.com".into(),
@@ -40,6 +37,9 @@ fn test_error_display_variants() {
     let err = CdpError::Json(serde_json::from_str::<()>("invalid").unwrap_err());
     assert!(format!("{err}").contains("expected"));
 
-    let err = CdpError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "file missing"));
+    let err = CdpError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "file missing",
+    ));
     assert!(format!("{err}").contains("file missing"));
 }

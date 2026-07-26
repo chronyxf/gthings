@@ -53,10 +53,7 @@ mod tests {
             method: "Page.navigate".into(),
             detail: "timeout".into(),
         };
-        assert_eq!(
-            format!("{}", err),
-            "CDP call Page.navigate failed: timeout"
-        );
+        assert_eq!(format!("{}", err), "CDP call Page.navigate failed: timeout");
     }
 
     #[test]

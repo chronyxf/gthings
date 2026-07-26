@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 #[cfg(target_os = "macos")]
 use crate::browser::dismiss_allow_debugging_dialog;
@@ -24,15 +24,15 @@ pub struct CdpEvent {
 }
 
 /// Internal bookkeeping for an in-flight CDP command.
-struct PendingCall {
+pub(crate) struct PendingCall {
     method: String,
     tx: oneshot::Sender<Result<Value>>,
 }
 
-type PendingMap = HashMap<u64, PendingCall>;
+pub(crate) type PendingMap = HashMap<u64, PendingCall>;
 
 /// Internal messages sent from `Connection::call` to the background I/O task.
-enum InternalMessage {
+pub(crate) enum InternalMessage {
     Call {
         id: u64,
         method: String,
@@ -64,9 +64,7 @@ impl Connection {
     pub async fn connect(ws_url: &str) -> Result<Self> {
         // Start connecting in background
         let ws_url_owned = ws_url.to_owned();
-        let connect_fut = tokio::spawn(async move {
-            connect_async(&ws_url_owned).await
-        });
+        let connect_fut = tokio::spawn(async move { connect_async(&ws_url_owned).await });
 
         // Wait 600ms, then dismiss the Dia dialog (if on macOS).
         // The dialog appears during the WebSocket handshake, so we must
@@ -258,9 +256,11 @@ impl Connection {
             tx,
         };
 
-        self.write.send(msg).map_err(|_| CdpError::ConnectionFailed {
-            detail: "background I/O task has terminated".into(),
-        })?;
+        self.write
+            .send(msg)
+            .map_err(|_| CdpError::ConnectionFailed {
+                detail: "background I/O task has terminated".into(),
+            })?;
 
         tokio::time::timeout(Duration::from_secs(30), rx)
             .await

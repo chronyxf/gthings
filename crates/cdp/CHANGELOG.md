@@ -1,5 +1,12 @@
 # Changelog — gthings-cdp
 
+## 0.4.15 (2026-07-26)
+
+### Changes
+
+- Change PendingCall, PendingMap, InternalMessage visibility to pub(crate)
+- Minor doc comment fixes
+
 ## 0.4.14 (2026-07-25)
 
 ### Features

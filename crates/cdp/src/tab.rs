@@ -1,7 +1,7 @@
 use crate::connection::CdpEvent;
 use crate::error::{CdpError, Result};
 use crate::session::Session;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tracing;
 
@@ -13,15 +13,11 @@ pub struct Tab {
 }
 
 impl Tab {
-    /// Create a new tab via CDP. If background=true, opens without focusing.
+    /// Create a new tab via CDP.
     pub async fn create(session: &Session, url: &str) -> Result<Self> {
         let conn = session.connection();
         let result = conn
-            .call(
-                "Target.createTarget",
-                json!({ "url": url }),
-                None,
-            )
+            .call("Target.createTarget", json!({ "url": url }), None)
             .await?;
 
         // Try to get sessionId first (standard CDP behavior)
@@ -49,9 +45,7 @@ impl Tab {
         // Missing sessionId — Dia returns targetId without sessionId.
         // Attach to the target via CDP instead of falling back to HTTP.
         if let Some(target_id) = result.get("targetId").and_then(|v| v.as_str()) {
-            tracing::warn!(
-                "Target.createTarget returned targetId without sessionId, attaching..."
-            );
+            tracing::warn!("Target.createTarget returned targetId without sessionId, attaching...");
             let attach = conn
                 .call(
                     "Target.attachToTarget",
@@ -76,9 +70,7 @@ impl Tab {
                 })?
                 .to_string();
 
-            tracing::info!(
-                "Attached to created target: {target_id} (session={session_id})",
-            );
+            tracing::info!("Attached to created target: {target_id} (session={session_id})",);
 
             return Ok(Tab {
                 session_id: Some(session_id),
@@ -130,11 +122,8 @@ impl Tab {
                         None => true,
                     };
                     // Check lifecycle name is networkIdle
-                    let name_match = evt
-                        .params
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        == Some("networkIdle");
+                    let name_match =
+                        evt.params.get("name").and_then(|v| v.as_str()) == Some("networkIdle");
                     session_match && name_match
                 },
                 timeout,
@@ -195,5 +184,3 @@ impl Tab {
         Ok(())
     }
 }
-
-
