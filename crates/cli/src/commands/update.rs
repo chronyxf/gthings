@@ -49,9 +49,14 @@ pub(crate) async fn cmd_update() -> i32 {
         return 0;
     };
 
+    let Some(home) = std::env::var("HOME").ok() else {
+        eprintln!("Warning: could not determine home directory; skill files not installed.");
+        return 0;
+    };
+
     // Destination paths
     let skill_dir = base.join("skills").join("gthings");
-    let agent_dir = base.join("agents").join("gthings");
+    let agent_dir = PathBuf::from(&home).join(".agents").join("gthings");
     let ref_dir = agent_dir.join("reference");
 
     // Create directories (ignore errors — let writes fail below for specific messages)

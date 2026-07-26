@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.4] - 2026-07-26
+
+### Fixed
+- Agent skill files now install to `~/.agents/gthings/` (was `~/.config/opencode/agents/gthings/`)
+
 ## [0.6.3] - 2026-07-26
 
 ### Added
@@ -158,4 +163,5 @@
 
 ### Removed
 - screenshot and scrape subcommands (legacy, not yet reimplemented for new architecture)
+
 
