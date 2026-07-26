@@ -1,5 +1,15 @@
 # Changelog — gthings-cdp
 
+## 0.4.16 (2026-07-26)
+
+### Changed
+- Remove redundant `use tracing;` imports from connection.rs, browser.rs, tab.rs
+- Remove stale `#[allow(dead_code)]` from connection.rs handle field
+- Collapse intermediate Vec allocation in parse_signal_flags
+- Fix stale doc comment (crate::parse_signal_flags → Session::parse_signal_flags)
+- Add check_page_signals method for in-browser quality pre-check
+- Add dispatch_message routing tests (response→oneshot, error→oneshot, event→broadcast)
+
 ## 0.4.15 (2026-07-26)
 
 ### Changes

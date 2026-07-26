@@ -7,17 +7,16 @@ license.workspace = true
 description = "CLI binary for gthings — browser-automated web research toolkit"
 
 [dependencies]
-gthings-cdp = { path = "../cdp", version = "0.4.15" }
+gthings-cdp = { path = "../cdp", version = "0.4.16" }
 gthings-search = { path = "../search" , version = "0.5.0" }
+gthings-common = { path = "../common", version = "0.3.5" }
 clap = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
-gthings-extraction = { path = "../extraction", version = "0.4.0" }
+gthings-extraction = { path = "../extraction", version = "0.5.0" }
 reqwest = { workspace = true }
-anyhow = { workspace = true }
-
 
 [lints]
 workspace = true
