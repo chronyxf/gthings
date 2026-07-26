@@ -1,5 +1,18 @@
 # Changelog — gthings-extraction
 
+## 0.4.0 (2026-07-26)
+
+### Breaking Changes
+
+- Replace pure-Rust PDF parser with pdftotext backend for robust extraction
+- Remove 4,000-line custom PDF parser (content/, font/, parser/, text.rs)
+- Add pdftotext-based PdfExtractor with quality scoring
+- New modules: article.rs, dispatch.rs, extractor.rs, jsonld.rs, web.rs
+- Restructure quality/ into modular submodules (detection, validate, types)
+- Remove monolithic html.rs, quality.rs, old pdf.rs
+- Add Extractor trait with AutoExtractor URL-type dispatch
+- Add JSON-LD metadata extraction for web pages
+
 ## 0.3.2 (2026-07-25)
 
 ### Fixes

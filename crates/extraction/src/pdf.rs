@@ -1,358 +1,443 @@
-/// PDF text extraction — pure Rust implementation.
+/// PDF metadata extraction and PdfExtractor API.
 ///
-/// Pipeline: validate magic number, find streams, decompress FlateDecode,
-/// extract parenthesized strings from content operators, join text.
-/// No external PDF library — raw bytes and regex.
-use flate2::read::ZlibDecoder;
+/// Extracts text via the `pdftotext` CLI (poppler-utils).  No pure-Rust PDF
+/// parser fallback — if pdftotext is unavailable or fails the extraction
+/// returns an `ExtractionError::Empty`.
 use regex::Regex;
-use std::io::Read;
-use std::sync::OnceLock;
+use std::io::{Read, Write};
+use std::process::Command;
+use std::time::Instant;
 
-use gthings_common::GthingsError;
+use crate::article::{
+    Article, ContentTree, ContinuationSignals, ExtractionError, ExtractionInfo, ExtractionMethod,
+    QualityScore, SourceInfo,
+};
+use crate::extractor::Extractor;
+use async_trait::async_trait;
 
-/// Raw PDF stream data extracted from a PDF object.
-struct PdfStream {
-    /// Raw bytes of the stream content (compressed or uncompressed).
-    data: Vec<u8>,
-    /// Whether this stream uses FlateDecode compression.
-    is_flate: bool,
-    /// Object header text between `obj` and `stream` (for filter detection).
-    obj_header: String,
+/// Metadata extracted from a PDF document's /Info dictionary and XMP metadata.
+#[derive(Debug, Clone, Default)]
+pub struct PdfMetadata {
+    pub author: Option<String>,
+    pub title: Option<String>,
+    pub subject: Option<String>,
+    pub creator: Option<String>,
+    pub producer: Option<String>,
+    pub creation_date: Option<String>,
+    pub mod_date: Option<String>,
 }
 
-/// PDF text extractor.
-///
-/// Provides methods for extracting text from PDF bytes, validating PDF format,
-/// and counting pages.
+/// PDF text extractor that delegates to `pdftotext`.
 ///
 /// # Examples
 ///
 /// ```ignore
 /// let pdf_bytes = std::fs::read("document.pdf").unwrap();
-/// let text = PdfExtractor::extract(&pdf_bytes).unwrap();
-/// println!("Extracted {} characters", text.len());
+/// let extractor = PdfExtractor;
+/// let article = extractor.extract_article("https://example.com/doc.pdf", &pdf_bytes).unwrap();
 /// ```
 pub struct PdfExtractor;
 
 impl PdfExtractor {
-    /// Extract text from PDF bytes.
+    /// Extract PDF content as an Article.
     ///
-    /// Returns the extracted text joined with spaces, or an error if:
-    /// - The bytes are not a valid PDF (missing `%PDF-` magic number)
-    /// - No stream objects are found
-    /// - All streams fail to decompress or yield no text
-    pub fn extract(bytes: &[u8]) -> Result<String, GthingsError> {
+    /// Tries `pdftotext` first; if it fails or is unavailable the extraction
+    /// is considered empty and quality is set to 0.
+    pub fn extract_article(&self, url: &str, bytes: &[u8]) -> Result<Article, ExtractionError> {
+        let start = Instant::now();
+
         if !Self::is_pdf(bytes) {
-            return Err(GthingsError::Parse(
-                "Not a PDF file (magic number mismatch — expected %PDF-*)".into(),
-            ));
+            return Err(ExtractionError::Parse("not a valid PDF".into()));
         }
 
-        let streams = extract_streams(bytes);
-
-        if streams.is_empty() {
-            return Err(GthingsError::Parse("No stream objects found in PDF".into()));
-        }
-
-        let mut all_text_parts: Vec<String> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
-
-        for stream in &streams {
-            let decompressed = if stream.is_flate {
-                match decompress_flate(&stream.data) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        errors.push(e);
-                        continue;
-                    }
-                }
-            } else {
-                // Check for unsupported compression filters before treating as plain
-                let header_upper = stream.obj_header.to_uppercase();
-                let unsupported = [
-                    "LZWDECODE",
-                    "ASCII85DECODE",
-                    "ASCIIHEXDECODE",
-                    "RUNLENGTHDECODE",
-                    "CCITTFAXDECODE",
-                    "CCITT FAX DECODE",
-                ];
-                if let Some(_filter) = unsupported.iter().find(|&&f| header_upper.contains(f)) {
-                    let preview_end = std::cmp::min(60, stream.obj_header.len());
-                    errors.push(format!(
-                        "Unsupported compression filter in stream: {}",
-                        &stream.obj_header[..preview_end]
-                    ));
-                    continue;
-                }
-                stream.data.clone()
-            };
-
-            let text = extract_text_from_stream(&decompressed);
-            if !text.is_empty() {
-                all_text_parts.push(text);
+        // Try pdftotext only — no pure-Rust fallback
+        let text = match Self::try_pdftotext(bytes) {
+            Some(t) => t,
+            None => {
+                return Err(ExtractionError::Empty(
+                    "pdftotext failed or not available; no fallback parser".into(),
+                ));
             }
+        };
+
+        let pages = Self::count_pages(bytes);
+
+        let total_length = text.len();
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Extract PDF metadata
+        let pdf_meta = extract_pdf_info_metadata(bytes).or_else(|| extract_pdf_xmp_metadata(bytes));
+
+        let author = pdf_meta.as_ref().and_then(|m| m.author.clone());
+        let published = pdf_meta.as_ref().and_then(|m| {
+            m.creation_date
+                .as_ref()
+                .and_then(|d| normalize_pdf_date(d))
+                .or_else(|| m.creation_date.clone())
+        });
+        let title = pdf_meta.as_ref().and_then(|m| m.title.clone());
+        let source_site = pdf_meta
+            .as_ref()
+            .and_then(|m| m.creator.clone())
+            .unwrap_or_default();
+
+        let q_score = compute_readability_score(&text, total_length);
+        let mut quality_reasons = Vec::new();
+        if total_length <= 500 {
+            quality_reasons.push("too_short".into());
         }
-
-        let result = all_text_parts.join(" ");
-        let result = result.split_whitespace().collect::<Vec<_>>().join(" ");
-
-        if result.is_empty() {
-            let detail = if errors.is_empty() {
-                "No text extracted from PDF streams (PDF may contain only images or non-text content)".into()
-            } else {
-                format!(
-                    "No text extracted. {} stream(s) had errors: {}",
-                    errors.len(),
-                    errors[0]
-                )
-            };
-            return Err(GthingsError::Parse(detail));
+        if q_score <= 0.3 && total_length > 500 {
+            quality_reasons.push("readability_artifacts".into());
         }
+        let quality = QualityScore {
+            score: crate::article::round_score(q_score),
+            is_ok: q_score >= 0.5,
+            reasons: quality_reasons,
+        };
 
-        Ok(result)
+        Ok(Article {
+            url: url.to_string(),
+            title: title.unwrap_or_default(),
+            source: SourceInfo {
+                author,
+                published,
+                site_name: source_site,
+                domain_authority: crate::article::round_score(
+                    crate::extractor::compute_domain_authority(url),
+                ),
+                language: None,
+            },
+            extraction: ExtractionInfo {
+                method: ExtractionMethod::PdfText,
+                confidence: quality.score,
+                accessed_at: chrono::Utc::now().to_rfc3339(),
+                duration_ms,
+            },
+            body: ContentTree::Pdf {
+                pages,
+                text,
+                has_toc: false,
+            },
+            signals: ContinuationSignals {
+                truncated: false,
+                total_length,
+                returned_length: total_length,
+                is_paywall: false,
+                is_bot_blocked: false,
+                is_empty_shell: total_length < 200,
+                related_urls: Vec::new(),
+            },
+            quality,
+        })
     }
 
-    /// Check if bytes are a valid PDF (starts with `%PDF-`).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use gthings_extraction::PdfExtractor;
-    /// assert!(!PdfExtractor::is_pdf(b"not a pdf"));
-    /// ```
-    pub fn is_pdf(bytes: &[u8]) -> bool {
+    /// Check if bytes start with the PDF magic number `%PDF-`.
+    fn is_pdf(bytes: &[u8]) -> bool {
         bytes.len() >= 5 && bytes[..5] == *b"%PDF-"
     }
 
-    /// Count pages in PDF by counting `/Type /Page` entries.
-    ///
-    /// This is a heuristic — accurate for well-formed PDFs.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the bytes cannot be decoded as a string.
-    pub fn count_pages(bytes: &[u8]) -> Result<usize, GthingsError> {
+    /// Count pages in PDF by counting `/Type /Page` entries (heuristic).
+    fn count_pages(bytes: &[u8]) -> usize {
         let src = String::from_utf8_lossy(bytes);
-        let re =
-            Regex::new(r"/Type\s*/Page[^s]").map_err(|e| GthingsError::Parse(e.to_string()))?;
-        Ok(re.find_iter(&src).count())
+        Regex::new(r"/Type\s*/Page[^s]")
+            .ok()
+            .map(|re| re.find_iter(&src).count())
+            .unwrap_or(0)
     }
-}
 
-/// Extract all stream objects from raw PDF bytes.
-///
-/// Detects FlateDecode filter by scanning the object header.
-fn extract_streams(bytes: &[u8]) -> Vec<PdfStream> {
-    let mut streams: Vec<PdfStream> = Vec::new();
-    let mut pos = 0;
+    /// Try extracting text via the `pdftotext` CLI tool (part of poppler-utils).
+    ///
+    /// Reads PDF bytes on stdin, writes plain text to stdout with proper word
+    /// spacing. Handles TeX-produced and other PDFs where text is positioned
+    /// entirely via the text matrix.
+    ///
+    /// Returns `None` when pdftotext is not installed, the subprocess fails,
+    /// or the output is empty.
+    fn try_pdftotext(bytes: &[u8]) -> Option<String> {
+        let mut child = Command::new("pdftotext")
+            .args(["-", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
 
-    while let Some(stream_start) = find_pattern(bytes, b"stream", pos) {
-        let mut data_start = stream_start + 6;
-        while data_start < bytes.len() && is_pdf_whitespace(bytes[data_start]) {
-            data_start += 1;
+        // Pipe PDF bytes to stdin, then close it
+        if let Some(ref mut stdin) = child.stdin {
+            let _ = stdin.write_all(bytes);
         }
 
-        match find_pattern(bytes, b"endstream", data_start) {
-            Some(end_pos) => {
-                // Trim trailing whitespace before endstream
-                let mut data_end = end_pos;
-                while data_end > data_start && is_pdf_whitespace(bytes[data_end - 1]) {
-                    data_end -= 1;
-                }
-
-                let raw_data = bytes[data_start..data_end].to_vec();
-
-                // Get object header for filter detection (FlateDecode + unsupported)
-                let obj_header = get_obj_header(bytes, stream_start);
-                let is_flate = obj_header.to_uppercase().contains("FLATEDECODE");
-
-                streams.push(PdfStream {
-                    data: raw_data,
-                    is_flate,
-                    obj_header,
-                });
-
-                pos = end_pos + 9;
-            }
-            None => break,
+        let output = child.wait_with_output().ok()?;
+        if !output.status.success() {
+            return None;
         }
+
+        let text = std::str::from_utf8(&output.stdout).ok()?;
+        let text = text.replace('\x0c', "\n"); // replace form-feeds with newlines
+        let text = text.trim().to_string();
+
+        if text.is_empty() { None } else { Some(text) }
     }
-
-    streams
 }
 
-/// Find a byte pattern starting from a given position.
-fn find_pattern(bytes: &[u8], pattern: &[u8], start: usize) -> Option<usize> {
-    if start >= bytes.len() {
-        return None;
-    }
-    bytes[start..]
-        .windows(pattern.len())
-        .position(|w| w == pattern)
-        .map(|p| start + p)
-}
-
-/// Check if a byte is PDF whitespace.
-fn is_pdf_whitespace(b: u8) -> bool {
-    b == b' ' || b == b'\n' || b == b'\r' || b == b'\t'
-}
-
-/// Get the object header text between `obj` and `stream` for filter detection.
+/// Compute readability-based quality score from extracted text.
 ///
-/// Returns empty string if no `obj` is found.
-fn get_obj_header(bytes: &[u8], stream_pos: usize) -> String {
-    let search_start = stream_pos.saturating_sub(500);
-    let before = &bytes[search_start..stream_pos];
+/// Detects letter-spacing artifacts (e.g. "P r o c e e d i n g s") that
+/// produce garbled text yet pass a pure-length heuristic.
+fn compute_readability_score(text: &str, total_length: usize) -> f64 {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let word_count = words.len();
 
-    if let Some(obj_pos) = before.windows(3).rposition(|w| w == b"obj") {
-        let header = &before[obj_pos..];
-        String::from_utf8_lossy(header).to_string()
+    if word_count == 0 {
+        return 0.3;
+    }
+
+    // Average word length
+    let total_chars: usize = words.iter().map(|w| w.len()).sum();
+    let avg_word_length = total_chars as f64 / word_count as f64;
+
+    // Percentage of single-letter "words"
+    let single_letter_count = words.iter().filter(|w| w.len() == 1).count();
+    let single_letter_pct = single_letter_count as f64 / word_count as f64;
+
+    // Letter-spacing merged into one long string (no whitespace between chars)
+    if avg_word_length > 20.0 {
+        return 0.3;
+    }
+
+    // Unmerged letter-spacing: mostly single-char "words"
+    if avg_word_length < 2.0 {
+        return 0.3;
+    }
+
+    // Too many single-letter words (indicates spacing artifacts)
+    if single_letter_pct > 0.40 {
+        return 0.3;
+    }
+
+    // Length heuristic with punctuation boost
+    if total_length > 500 {
+        // Boost to 0.9 if text contains reasonable punctuation
+        if text.contains('.') || text.contains(',') || text.contains(';') {
+            0.9
+        } else {
+            0.8
+        }
     } else {
-        String::new()
+        0.3
     }
 }
 
-/// Decompress a FlateDecode (zlib) stream.
-fn decompress_flate(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut decoder = ZlibDecoder::new(data);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("incorrect header check") {
-            "Corrupted FlateDecode stream: incorrect header check (data is not zlib-compressed)"
-                .into()
-        } else if msg.contains("invalid distance code") || msg.contains("invalid literal/length") {
-            format!("Corrupted FlateDecode stream: {msg}")
-        } else if msg.contains("unexpected end of data") {
-            "Corrupted FlateDecode stream: unexpected end of data (stream may be truncated)".into()
-        } else if msg.contains("invalid block type") || msg.contains("unknown compression method") {
-            format!("Corrupted FlateDecode stream: {msg}")
-        } else {
-            format!("FlateDecode decompression error: {msg}")
+#[async_trait]
+impl Extractor for PdfExtractor {
+    type Input = (String, Vec<u8>);
+
+    async fn extract(&self, input: (String, Vec<u8>)) -> Result<Article, ExtractionError> {
+        let (url, bytes) = input;
+        self.extract_article(&url, &bytes)
+    }
+
+    fn method(&self) -> ExtractionMethod {
+        ExtractionMethod::PdfText
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PDF metadata extraction (regex-based, no parser module dependency)
+// ---------------------------------------------------------------------------
+
+/// Parse the PDF trailer to extract the /Info reference and /Root reference.
+/// Returns (info_obj_num, info_gen_num, root_obj_num) or None.
+fn parse_pdf_trailer(bytes: &[u8]) -> Option<(u32, u32, u32)> {
+    let content = std::str::from_utf8(bytes).ok()?;
+
+    // Find "trailer" keyword — search from the end for efficiency
+    let trailer_pos = content.rfind("trailer")?;
+    let after_trailer = &content[trailer_pos..];
+
+    // Find /Info reference pattern: /Info <obj> <gen> R
+    let info_re = Regex::new(r"/Info\s+(\d+)\s+(\d+)\s+R").ok()?;
+    // Find /Root reference pattern: /Root <obj> <gen> R
+    let root_re = Regex::new(r"/Root\s+(\d+)\s+(\d+)\s+R").ok()?;
+
+    let info_caps = info_re.captures(after_trailer)?;
+    let root_caps = root_re.captures(after_trailer)?;
+
+    let info_num = info_caps[1].parse::<u32>().ok()?;
+    let info_gen = info_caps[2].parse::<u32>().ok()?;
+    let root_num = root_caps[1].parse::<u32>().ok()?;
+
+    Some((info_num, info_gen, root_num))
+}
+
+/// Parse a PDF indirect object and return its raw content as a string.
+/// Handles the pattern: `<obj> <gen> obj ... endobj`
+fn parse_pdf_object(bytes: &[u8], obj_num: u32, gen_num: u32) -> Option<String> {
+    let content = std::str::from_utf8(bytes).ok()?;
+    let pattern = format!(r"(?s){} {} obj(.*?)endobj", obj_num, gen_num);
+    let re = Regex::new(&pattern).ok()?;
+    let caps = re.captures(content)?;
+    Some(caps[1].trim().to_string())
+}
+
+/// Parse a PDF dictionary string (e.g. `/Author (Bram Moolenaar) /Title (Vim)`)
+/// Extracts values for specified keys.
+fn parse_pdf_dict_value(dict_content: &str, key: &str) -> Option<String> {
+    // Try parenthesized strings first: /Key (value)
+    let pattern = format!(r"(?s)/{}\s*\((.*?)\)", regex::escape(key));
+    let re = Regex::new(&pattern).ok()?;
+    if let Some(caps) = re.captures(dict_content) {
+        let val = caps[1].to_string();
+        // Unescape PDF string escapes
+        let val = val
+            .replace(r"\n", "\n")
+            .replace(r"\r", "\r")
+            .replace(r"\t", "\t")
+            .replace(r"\(", "(")
+            .replace(r"\)", ")")
+            .replace(r"\\", "\\");
+        return Some(val);
+    }
+
+    // Try hex strings: /Key <hex>
+    let hex_pattern = format!(r"/{}\s*<([0-9a-fA-F]*)>", regex::escape(key));
+    let hex_re = Regex::new(&hex_pattern).ok()?;
+    if let Some(caps) = hex_re.captures(dict_content) {
+        let hex = &caps[1];
+        if !hex.is_empty() {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                .collect();
+            return Some(String::from_utf8_lossy(&bytes).to_string());
         }
-    })?;
-    Ok(out)
+    }
+
+    None
 }
 
-/// Extract text from a decompressed PDF content stream.
-///
-/// Handles parenthesized text with backslash escapes and PDF text operators.
-fn extract_text_from_stream(data: &[u8]) -> String {
-    let mut results: Vec<String> = Vec::new();
-    let len = data.len();
-    let mut i = 0;
+/// Extract metadata from PDF /Info dictionary by finding the object and parsing it.
+fn extract_pdf_info_metadata(bytes: &[u8]) -> Option<PdfMetadata> {
+    let (info_num, info_gen, _root_num) = parse_pdf_trailer(bytes)?;
+    let obj_content = parse_pdf_object(bytes, info_num, info_gen)?;
 
-    // Scan bytes directly — avoid Vec<char> allocation and lossy UTF-8 conversion
-    while i < len {
-        if data[i] == b'(' {
-            let mut depth = 1;
-            let mut j = i + 1;
+    let to_opt = |val: Option<String>| val.filter(|s| !s.is_empty());
 
-            while j < len && depth > 0 {
-                if data[j] == b'\\' {
-                    j += 2; // skip escaped character
-                    continue;
-                }
-                if data[j] == b'(' {
-                    depth += 1;
-                } else if data[j] == b')' {
-                    depth -= 1;
-                }
-                j += 1;
-            }
+    Some(PdfMetadata {
+        author: to_opt(parse_pdf_dict_value(&obj_content, "Author")),
+        title: to_opt(parse_pdf_dict_value(&obj_content, "Title")),
+        subject: to_opt(parse_pdf_dict_value(&obj_content, "Subject")),
+        creator: to_opt(parse_pdf_dict_value(&obj_content, "Creator")),
+        producer: to_opt(parse_pdf_dict_value(&obj_content, "Producer")),
+        creation_date: to_opt(parse_pdf_dict_value(&obj_content, "CreationDate")),
+        mod_date: to_opt(parse_pdf_dict_value(&obj_content, "ModDate")),
+    })
+}
 
-            let inner = &data[i + 1..j - 1];
-            let unescaped = unescape_pdf_string_bytes(inner);
-            if !unescaped.is_empty() {
-                results.push(unescaped);
-            }
+/// Extract PDF creation date from XMP metadata or /Info dict.
+/// Converts PDF date format (D:20240726123456+02'00') to ISO 8601.
+fn normalize_pdf_date(date_str: &str) -> Option<String> {
+    let date_str = date_str.trim();
+    // PDF date format: D:YYYYMMDDHHmmSSOHH'mm'
+    let re = Regex::new(r"^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?").ok()?;
+    let caps = re.captures(date_str)?;
 
-            i = j;
-        } else {
-            i += 1;
+    let year = &caps[1];
+    let month = caps.get(2).map_or("01", |m| m.as_str());
+    let day = caps.get(3).map_or("01", |d| d.as_str());
+    let hour = caps.get(4).map_or("00", |h| h.as_str());
+    let min = caps.get(5).map_or("00", |m| m.as_str());
+    let sec = caps.get(6).map_or("00", |s| s.as_str());
+
+    Some(format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        year, month, day, hour, min, sec
+    ))
+}
+
+/// Find and extract XMP metadata from a PDF file.
+/// XMP is stored as a stream object referenced from the catalog's /Metadata entry.
+fn extract_pdf_xmp_metadata(bytes: &[u8]) -> Option<PdfMetadata> {
+    // Find /Metadata reference in the catalog (root) object
+    // First find the root object number from trailer
+    let (_, _, root_num) = parse_pdf_trailer(bytes)?;
+
+    // Read the root object
+    let root_content = parse_pdf_object(bytes, root_num, 0)?;
+
+    // Find /Metadata reference in root
+    let meta_re = Regex::new(r"/Metadata\s+(\d+)\s+(\d+)\s+R").ok()?;
+    let meta_caps = meta_re.captures(&root_content)?;
+    let meta_num: u32 = meta_caps[1].parse().ok()?;
+    let meta_gen: u32 = meta_caps[2].parse().ok()?;
+
+    // Read the metadata object
+    let meta_obj = parse_pdf_object(bytes, meta_num, meta_gen)?;
+
+    // Extract the stream content
+    let stream_re = Regex::new(r"(?s)stream\s(.+?)\s*endstream").ok()?;
+    let stream_caps = stream_re.captures(&meta_obj)?;
+    let stream_data = stream_caps[1].as_bytes();
+
+    // Try to decompress if FlateDecode
+    let xml_data = if meta_obj.to_uppercase().contains("FLATEDECODE") {
+        let mut decoder = flate2::read::ZlibDecoder::new(stream_data);
+        let mut buf = Vec::new();
+        decoder.read_to_end(&mut buf).ok()?;
+        buf
+    } else {
+        stream_data.to_vec()
+    };
+
+    let xml_str = std::str::from_utf8(&xml_data).ok()?;
+
+    // Extract Dublin Core metadata from XMP
+    let author = extract_xmp_field(xml_str, "creator");
+    let title = extract_xmp_field(xml_str, "title");
+    let subject = extract_xmp_field(xml_str, "description");
+    let date = extract_xmp_field(xml_str, "date");
+
+    Some(PdfMetadata {
+        author: author.filter(|s| !s.is_empty()),
+        title: title.filter(|s| !s.is_empty()),
+        subject: subject.filter(|s| !s.is_empty()),
+        creator: None,
+        producer: None,
+        creation_date: date.filter(|s| !s.is_empty()),
+        mod_date: None,
+    })
+}
+
+/// Extract a field value from XMP XML by namespace.
+/// Handles: <dc:field>value</dc:field> and <dc:field><rdf:li>value</rdf:li></dc:field>
+fn extract_xmp_field(xml: &str, field: &str) -> Option<String> {
+    // Try simple element: <dc:field>value</dc:field>
+    let simple_re = Regex::new(&format!(
+        r"<dc:{}[^>]*>([^<]+)</dc:{}>",
+        regex::escape(field),
+        regex::escape(field)
+    ))
+    .ok()?;
+    if let Some(caps) = simple_re.captures(xml) {
+        let val = caps[1].trim().to_string();
+        if !val.is_empty() {
+            return Some(val);
         }
     }
 
-    results.join(" ")
-}
-
-/// Unescape a PDF string (octal, backslash escapes, and literal newlines).
-fn unescape_pdf_string(s: &str) -> String {
-    static ESC_RE: OnceLock<Regex> = OnceLock::new();
-    let esc_re =
-        ESC_RE.get_or_init(|| Regex::new(r"\\(?:([0-7]{3})|(n)|(.))").expect("valid regex"));
-    let s = esc_re.replace_all(s, |caps: &regex::Captures| -> String {
-        if let Some(oct) = caps.get(1) {
-            let code = u32::from_str_radix(oct.as_str(), 8).unwrap_or(0);
-            return char::from_u32(code).map_or_else(|| '\u{FFFD}'.to_string(), |c| c.to_string());
+    // Try RDF container: <dc:field><rdf:li>value</rdf:li></dc:field>
+    let rdf_re = Regex::new(&format!(
+        r"<dc:{}[^>]*>\s*<rdf:li[^>]*>([^<]+)</rdf:li>\s*</dc:{}>",
+        regex::escape(field),
+        regex::escape(field)
+    ))
+    .ok()?;
+    if let Some(caps) = rdf_re.captures(xml) {
+        let val = caps[1].trim().to_string();
+        if !val.is_empty() {
+            return Some(val);
         }
-        if caps.get(2).is_some() {
-            return "\n".to_string();
-        }
-        // General escape: \X → X
-        caps.get(3)
-            .map_or(String::new(), |m| m.as_str().to_string())
-    });
-    s.trim().to_string()
-}
-
-/// Byte-level variant of `unescape_pdf_string`.
-fn unescape_pdf_string_bytes(data: &[u8]) -> String {
-    let s = std::str::from_utf8(data).unwrap_or("");
-    unescape_pdf_string(s)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_pdf() {
-        assert!(PdfExtractor::is_pdf(b"%PDF-1.4"));
-        assert!(!PdfExtractor::is_pdf(b"not a pdf"));
-        assert!(!PdfExtractor::is_pdf(b""));
-        assert!(!PdfExtractor::is_pdf(b"%PD"));
     }
 
-    #[test]
-    fn test_extract_invalid_magic() {
-        let result = PdfExtractor::extract(b"not a pdf");
-        result.unwrap_err();
-    }
-
-    #[test]
-    fn test_extract_no_streams() {
-        // A minimal "PDF" with magic number but no streams
-        let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF";
-        let result = PdfExtractor::extract(pdf);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No stream"));
-    }
-
-    #[test]
-    fn test_count_pages() {
-        let pdf =
-            b"%PDF-1.4\n1 0 obj\n<< /Type /Page >>\nendobj\n2 0 obj\n<< /Type /Page >>\nendobj";
-        let count = PdfExtractor::count_pages(pdf).unwrap();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn test_unescape_pdf_string() {
-        assert_eq!(unescape_pdf_string(r"Hello World"), "Hello World");
-        assert_eq!(unescape_pdf_string(r"\(parentheses\)"), "(parentheses)");
-        assert_eq!(unescape_pdf_string(r"\\backslash"), "\\backslash");
-        assert_eq!(unescape_pdf_string(r"\050\051"), "()"); // octal for ( and )
-        assert_eq!(unescape_pdf_string(r"line1\nline2"), "line1\nline2");
-    }
-
-    #[test]
-    fn test_extract_text_from_stream() {
-        // Simple content stream with Tj operator
-        let content = b"(Hello World) Tj\n(PDF Text) Tj";
-        let text = extract_text_from_stream(content);
-        assert!(text.contains("Hello World"));
-        assert!(text.contains("PDF Text"));
-    }
+    None
 }

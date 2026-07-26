@@ -1,72 +1,11 @@
-/// Content quality validation and bot/captcha/paywall detection.
-///
-/// Pure functions operating on extracted text content, not DOM.
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// Reason for a quality check failure.
-///
-/// Used in [`QualityResult::reasons`] to indicate why content failed
-/// the quality gate. Each variant corresponds to a single static string
-/// — no heap allocation required.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QualityReason {
-    /// Content is completely empty.
-    EmptyContent,
-    /// Content is too short to be useful (< 80 chars).
-    TooShort,
-    /// Matched a browser error page pattern (e.g. "This site can't be reached").
-    BrowserErrorPage,
-    /// Matched a connection error pattern (e.g. ERR_CONNECTION).
-    ConnectionError,
-    /// Matched a 404 Not Found pattern.
-    NotFound,
-    /// Content is whitespace-only.
-    WhitespaceOnly,
-    /// Content is a paywall teaser (e.g. "Read More »").
-    PaywallTeaser,
-    /// Content is navigation chrome (short, no natural language).
-    NavigationChrome,
-    /// Content has too few words (< 15 words in short text).
-    TooFewWords,
-    /// Content has no punctuation (suggests machine output).
-    NoPunctuation,
-}
-
-/// Result of a content quality validation.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct QualityResult {
-    /// Quality score from 0.0 to 1.0.
-    pub score: f64,
-    /// Whether the content passes the quality gate (score >= 0.5).
-    pub is_ok: bool,
-    /// List of reasons why content failed quality checks.
-    pub reasons: Vec<QualityReason>,
-    /// Length of the input text that was validated.
-    pub length: usize,
-}
-
-/// Result of a secondary quality check.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SecondaryResult {
-    /// Content ends mid-sentence without sentence-ending punctuation.
-    pub truncated: bool,
-    /// Content contains repetitive sentences (unique < 50% of total).
-    pub repetitive: bool,
-    /// Content has low word density (< 20 words).
-    pub sparse: bool,
-    /// Content is suspiciously short with redirect/loading patterns.
-    pub suspicious_short: bool,
-}
-
-/// Content quality validation — all methods are stateless.
-pub struct ContentQuality;
+use super::types::{ContentQuality, QualityReason, QualityResult, SecondaryResult};
 
 impl ContentQuality {
-    // Error page patterns (shared with detect methods)
-
-    fn error_page_reasons() -> &'static [(Regex, QualityReason)] {
+    /// Error page patterns (shared with detect methods).
+    pub(crate) fn error_page_reasons() -> &'static [(Regex, QualityReason)] {
         static PATTERNS: OnceLock<Vec<(Regex, QualityReason)>> = OnceLock::new();
         PATTERNS.get_or_init(|| {
             vec![
@@ -88,89 +27,6 @@ impl ContentQuality {
                 ),
             ]
         })
-    }
-
-    /// Validate extracted text content (length, error patterns, word count, punctuation).
-    ///
-    /// Returns a [`QualityResult`] with a score from 0.0 to 1.0. Content passes when score >= 0.5.
-    pub fn validate(text: &str) -> QualityResult {
-        let length = text.len();
-
-        if text.is_empty() {
-            return QualityResult {
-                score: 0.0,
-                is_ok: false,
-                reasons: vec![QualityReason::EmptyContent],
-                length: 0,
-            };
-        }
-
-        let slice = if text.len() > 15000 {
-            &text[..15000]
-        } else {
-            text
-        };
-        let mut reasons: Vec<QualityReason> = Vec::new();
-        let mut score = 1.0_f64;
-
-        // Too short to be useful (< 80 chars)
-        if slice.len() < 80 {
-            reasons.push(QualityReason::TooShort);
-            score -= 0.4;
-        }
-
-        // Browser error pages / empty shell (shared patterns)
-        for (pattern, reason) in Self::error_page_reasons() {
-            if pattern.is_match(slice) {
-                reasons.push(*reason);
-                score -= 0.5;
-            }
-        }
-
-        // Paywall teaser: "Read More »" as entire content
-        if slice == "Read More \u{00bb}" {
-            reasons.push(QualityReason::PaywallTeaser);
-            score -= 0.5;
-        }
-
-        // Navigation chrome: short content with no natural language (no quotes)
-        if slice.len() < 100 && !slice.contains('"') {
-            reasons.push(QualityReason::NavigationChrome);
-            score -= 0.3;
-        }
-
-        // Very few words suggests empty shell
-        let word_count = slice.split_whitespace().count();
-        if word_count < 15 && slice.len() < 200 {
-            reasons.push(QualityReason::TooFewWords);
-            score -= 0.2;
-        }
-
-        // No punctuation suggests machine output
-        if slice.len() > 100 && !regex_has_punctuation(slice) {
-            reasons.push(QualityReason::NoPunctuation);
-            score -= 0.1;
-        }
-
-        // Bonus for natural language indicators
-        if regex_has_punctuation(slice) {
-            score += 0.05;
-        }
-        if regex_has_long_words(slice) {
-            score += 0.05;
-        }
-        if regex_has_paragraphs(slice) {
-            score += 0.05;
-        }
-
-        score = score.clamp(0.0, 1.0);
-
-        QualityResult {
-            score: (score * 100.0).round() / 100.0,
-            is_ok: score >= 0.5,
-            reasons,
-            length,
-        }
     }
 
     /// Detect bot challenge pages (Cloudflare, DataDome, Turnstile, etc.).
@@ -359,21 +215,21 @@ impl ContentQuality {
 }
 
 /// Check if text contains sentence-ending punctuation.
-fn regex_has_punctuation(text: &str) -> bool {
+pub(crate) fn regex_has_punctuation(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"[.!?]").expect("valid regex"));
     re.is_match(text)
 }
 
 /// Check if text contains words with 4+ characters.
-fn regex_has_long_words(text: &str) -> bool {
+pub(crate) fn regex_has_long_words(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"\w{4,}").expect("valid regex"));
     re.is_match(text)
 }
 
 /// Check if text contains paragraph breaks (double newline).
-fn regex_has_paragraphs(text: &str) -> bool {
+pub(crate) fn regex_has_paragraphs(text: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"\n\n").expect("valid regex"));
     re.is_match(text)
@@ -382,32 +238,6 @@ fn regex_has_paragraphs(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_validate_ok() {
-        let result = ContentQuality::validate(
-            "This is a sufficiently long piece of text with natural language. \
-             It has sentences, punctuation, and enough words to pass the quality gate. \
-             This content should be considered acceptable for AI processing.",
-        );
-        assert!(result.is_ok);
-        assert!(result.score >= 0.5);
-    }
-
-    #[test]
-    fn test_validate_empty() {
-        let result = ContentQuality::validate("");
-        assert!(!result.is_ok);
-        assert_eq!(result.score, 0.0);
-        assert!(result.reasons.contains(&QualityReason::EmptyContent));
-    }
-
-    #[test]
-    fn test_validate_too_short() {
-        let result = ContentQuality::validate("Hi");
-        assert!(!result.is_ok);
-        assert!(result.reasons.contains(&QualityReason::TooShort));
-    }
 
     #[test]
     fn test_detect_bot() {

@@ -1,10 +1,18 @@
-pub mod html;
+pub mod article;
+pub mod dispatch;
+pub mod extractor;
+pub mod jsonld;
 pub mod pdf;
-/// Content extraction and quality validation crate.
-///
-/// Pure functions for content quality, PDF text extraction, and HTML extraction.
 pub mod quality;
 
-pub use html::{ExtractedContent, HtmlExtractor, Section};
+pub use article::{
+    Article, ContentTree, ContinuationSignals, ExtractionError, ExtractionInfo, ExtractionMethod,
+    QualityScore, Section, SourceInfo,
+};
+pub use dispatch::AutoExtractor;
+pub use extractor::{Extractor, SourceType};
 pub use pdf::PdfExtractor;
-pub use quality::{ContentQuality, QualityReason, QualityResult, SecondaryResult};
+pub use quality::ContentQuality;
+pub use web::WebExtractor;
+
+pub mod web;
