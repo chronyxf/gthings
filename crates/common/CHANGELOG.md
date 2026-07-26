@@ -1,5 +1,13 @@
 # Changelog — gthings-common
 
+## 0.3.4 (2026-07-26)
+
+### Removals
+
+- Remove `trace` module (TraceWriter, TraceEvent, JSONL tracing)
+- Remove SHA-256 key generation and `evict_expired` from Sha256DiskCache
+- Cache callers now pass pre-computed keys externally
+
 ## 0.3.3 (2026-07-25)
 
 ### Fixes

@@ -2,7 +2,6 @@ use std::fs;
 use std::io;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use tokio::task;
 
 use crate::error::GthingsError;
@@ -25,15 +24,6 @@ impl Sha256DiskCache {
             dir: dir.into(),
             ttl: Duration::from_secs(ttl_secs),
         }
-    }
-
-    /// Deterministic SHA-256 hex key from `"{url}|{offset}|{max}"`.
-    /// Also used as the cache file name (with `.json` extension).
-    pub fn key(&self, url: &str, offset: usize, max: usize) -> String {
-        let input = format!("{}|{}|{}", url, offset, max);
-        let mut hasher = Sha256::new();
-        hasher.update(input.as_bytes());
-        hex_encode(hasher.finalize())
     }
 
     /// Return cached content for `key`, or `None` if missing or expired.
@@ -97,62 +87,6 @@ impl Sha256DiskCache {
         .await
         .ok();
     }
-
-    /// Remove all cache entries whose age exceeds the TTL.
-    /// Returns the number of evicted entries.
-    pub async fn evict_expired(&self) -> Result<usize, GthingsError> {
-        let dir = self.dir.clone();
-        let ttl = self.ttl;
-
-        task::spawn_blocking(move || {
-            let read_dir = match fs::read_dir(&dir) {
-                Ok(r) => r,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-                Err(e) => return Err(GthingsError::Io(e)),
-            };
-
-            let mut evicted = 0usize;
-
-            for entry in read_dir {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-                let path = entry.path();
-
-                // Only .json files matching our key pattern.
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                if file_stem.len() != 64 {
-                    // Skip non-SHA-256 filenames.
-                    continue;
-                }
-
-                if is_expired(&path, ttl) && fs::remove_file(&path).is_ok() {
-                    evicted += 1;
-                }
-            }
-
-            Ok(evicted)
-        })
-        .await
-        .map_err(|e| GthingsError::Io(std::io::Error::other(e)))?
-    }
-}
-
-/// Encode bytes as a lowercase hex string.
-fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
-    const HEX_CHARS: &[u8] = b"0123456789abcdef";
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX_CHARS[(b >> 4) as usize] as char);
-        out.push(HEX_CHARS[(b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 /// Check if a cache file is older than the TTL via file mtime.
@@ -177,53 +111,14 @@ fn is_expired(path: &std::path::Path, ttl: Duration) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hex_encode_sha256() {
-        use sha2::Digest;
-        let hash = Sha256::digest(b"hello");
-        let hex = hex_encode(hash);
-        assert_eq!(
-            hex,
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
-    }
-
-    #[test]
-    fn key_matches_typescript() {
-        // TypeScript: createHash('sha256').update(`https://example.com|0|100`).digest('hex')
-        // Expected: echo -n "https://example.com|0|100" | shasum -a 256
-        let cache = Sha256DiskCache::new("/tmp/_test_cache", 3600);
-        let key = cache.key("https://example.com", 0, 100);
-        assert_eq!(
-            key,
-            "8257e20c62110aed0f61540c89ad50214dc4556b8285d0482d8ffb01d81f0a4d"
-        );
-    }
-
-    #[test]
-    fn key_deterministic() {
-        let cache = Sha256DiskCache::new("/tmp/_test_cache", 3600);
-        let k1 = cache.key("https://example.com", 0, 100);
-        let k2 = cache.key("https://example.com", 0, 100);
-        assert_eq!(k1, k2);
-    }
-
-    #[test]
-    fn key_different_inputs() {
-        let cache = Sha256DiskCache::new("/tmp/_test_cache", 3600);
-        let k1 = cache.key("https://example.com", 0, 100);
-        let k2 = cache.key("https://example.com", 10, 100);
-        assert_ne!(k1, k2);
-    }
-
     #[tokio::test]
     async fn set_get_raw_content() {
         let dir = std::env::temp_dir().join("_cache_test_set_get_raw");
         let cache = Sha256DiskCache::new(&dir, 3600);
-        let key = cache.key("https://set-get-test", 0, 100);
+        let key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let content = "raw content, not JSON wrapped";
-        cache.set(&key, content).await;
-        let retrieved = cache.get(&key).await.unwrap().expect("should be present");
+        cache.set(key, content).await;
+        let retrieved = cache.get(key).await.unwrap().expect("should be present");
         assert_eq!(retrieved, content);
         // Also verify the file on disk is exactly the raw content
         let file_path = dir.join(format!("{key}.json"));
@@ -237,10 +132,10 @@ mod tests {
     async fn get_expired_by_mtime() {
         let dir = std::env::temp_dir().join("_cache_test_get_expired");
         let cache = Sha256DiskCache::new(&dir, 0); // 0-second TTL — immediately expired
-        let key = cache.key("https://expired-test", 0, 100);
-        cache.set(&key, "will expire").await;
+        let key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        cache.set(key, "will expire").await;
         // The set just happened, but with TTL=0 it's already expired
-        let retrieved = cache.get(&key).await.unwrap();
+        let retrieved = cache.get(key).await.unwrap();
         assert!(retrieved.is_none());
         // File should have been removed
         let file_path = dir.join(format!("{key}.json"));
