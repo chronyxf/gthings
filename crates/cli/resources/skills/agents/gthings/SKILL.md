@@ -1,104 +1,110 @@
 ---
 name: gthings
-description: "Browser automation and web research CLI — search, follow, extract, PDF extraction, batch search, quality gate"
+description: "Browser automation and web research CLI — search, follow, extract, PDF, batch, harvest with quality gates"
 ---
 
 # Skill: gthings
 
-Browser automation and web research toolkit. Native Rust binary — single static binary that reuses existing Chrome/Dia browser via CDP.
+Rust CLI for AI-agent-driven web research. Reuses installed Chrome via CDP. All commands produce JSON.
 
 ## When This Skill Activates
 
-The user says any of these:
-- "search" "find" "look up" "research"
-- "gthings"
-- "web research" "browser research"
-- "pdf" "extract"
+User says: "search" "research" "look up" "find" "gthings" "web research" "harvest" "extract" "pdf"
 
 ## Core Rules
 
-1. **Use `--json`** for structured output.
-2. **Prefer `batch`** for multi-query search.
-3. **Browser is already running** — no launch needed. Use `gthings status` to verify.
-4. **Check quality score** in PDF extraction output.
+1. Always use `--json` for structured output an AI agent can parse.
+2. Prefer `harvest` for multi-query research (handles dedup/diversity/quality in one pass).
+3. Filter results by `body_status == "ok"` before using content.
+4. Check `quality.reasons` — never use content with paywall/bot_blocked/too_short.
 
 ## Commands
 
-### `gthings search <query> [--count=N]`
+### `gthings search <query> [--count N] [--json]`
 
-Single Google search via CDP browser. Returns numbered results with title, URL, snippet.
+Google SERP search. Returns results with title, url, snippet, domain_authority, provenance.
 
-```
---count  Number of results (default: 10)
---json   Output as JSON array [{title, url, snippet}]
-```
+### `gthings follow <url> [--max-chars N] [--offset N] [--json]`
 
-### `gthings follow <url> [--max-chars=N]`
+Single page extraction via CDP. Content from `document.body.innerText`. Check `quality` field.
 
-Read a page via CDP browser. Extracts visible text content.
+### `gthings extract <url> [--max-chars N] [--offset N] [--json]`
 
-```
---max-chars  Max characters to extract (default: 15000)
---json       Output as JSON {title, url, content}
-```
+HTTP-based extraction. Auto-detects web (Readability), PDF (pdftotext), arXiv (abs→pdf), GitHub (raw). Better for PDF/academic content.
 
-### `gthings batch <queries...> [--count=N] [--follow] [--max-chars=N]`
+### `gthings batch <q1> [<q2> ...] [--count N] [--follow] [--max-chars N] [--json]`
 
-Multi-query search. Each query opens a separate CDP tab.
+Multi-query search. With --follow, follows top result per query.
 
-```
---count      Results per query (default: 10)
---follow     Also follow/read top result per query
---max-chars  Max chars per follow (default: 15000)
---json       Output as JSON array of arrays
-```
+### `gthings harvest <q1> [<q2> ...] [--follow-top N] [--max-chars N] [--dedup url] [--rank composite] [--json]`
 
-### `gthings status`
+Full research pipeline: search all queries → dedup (URL normalization, fragment/tracking-param stripping) → rank (composite score: authority + snippet + diversity) → select (per-query minimum, per-host cap, junk filter) → follow → quality score.
 
-Check CDP browser connection. Returns browser name and WebSocket URL.
+Output: `{ "results": HarvestedResult[], "summary": HarvestRunSummary }`
 
-### `gthings extract <url> [--max-chars=N]`
+| Flag | Default | Description |
+|------|---------|-------------|
+| --follow-top | 8 | Max URLs to follow |
+| --max-chars | 15000 | Max chars per follow |
+| --dedup | url | Dedup strategy |
+| --rank | composite | serp_order, domain_authority, snippet_length, composite |
 
-Auto-detect and extract content from any URL. Detects PDF, GitHub source, arXiv paper, or web page automatically. Uses pdftotext for PDFs.
+### `gthings pdf url <url> [--json]` / `gthings pdf file <path> [--json]`
 
-```
---max-chars  Max characters to extract (default: 15000)
---json       Output as JSON
-```
+PDF extraction via pdftotext. Requires poppler (`brew install poppler`). Quality >= 0.90 for clean scientific text.
 
-### `gthings pdf url <url> [--json]`
+### `gthings status [--json]`
 
-Extract text from a PDF at URL using pdftotext. arXiv PDFs supported. Quality score included.
+Browser connection check.
 
-```json
-{"quality": {"score": 0.9, "is_ok": true}, "pages": 8, "body": {"Pdf": {"text": "..."}}}
-```
+## Key Output Fields for Agent Triage
 
-### `gthings pdf file <path> [--json]`
+### body_status
 
-Extract text from a local PDF file via pdftotext.
+| Value | Meaning | Agent Action |
+|-------|---------|-------------|
+| ok | Full body extracted | Use `followed_content` |
+| pdf_unextracted | PDF/arXiv, CDP can't handle | Fetch via `extract <url>` or `pdf url <url>` |
+| extract_failed | Paywall/bot/network error | Skip |
+| chrome_or_empty | Nav-only or empty page | Skip |
+| snippet_only | Not followed, SERP only | Lead only |
 
-## PDF Extraction Notes
+### quality.score
 
-- Uses `pdftotext` (poppler-utils) — install via `brew install poppler`
-- Quality score: 0.90/1.0 for clean readable text
-- Output includes full paper text with sections, references, footnotes
-- No 15k character cap — extracts complete document
+| Range | Meaning | Agent Decision |
+|-------|---------|---------------|
+| >= 0.80 | Clean text | Use directly |
+| 0.50-0.79 | Readable with issues | Use but verify claims |
+| < 0.50 | Low quality | Skip or corroborate |
 
-## Quality Score
+### quality.reasons (non-empty when low)
 
-| Score | Meaning |
-|-------|---------|
-| 0.90 | Clean, readable text with good structure |
-| 0.80 | Readable with minor artifacts |
-| 0.30 | Low quality — artifacts detected, retry with pdftotext |
-| 0.00 | Extraction failed |
+`paywall`, `bot_blocked`, `captcha`, `empty_shell`, `too_short`, `too_few_words`, `low_entropy`, `empty_content`
+
+If any of these are present, do NOT use the content as factual source.
+
+### coverage_by_query (in HarvestRunSummary)
+
+Map of query -> `{ total_hits, followed_ok, followed_failed }`. Use this to identify which topics have body coverage.
+
+### warnings
+
+`follow_budget_collapsed_to_one_site`, `no_body_for_query:<query>`, `all_snippet_only`
+
+## URL Canonicalization (applied to harvest)
+
+- Scheme+host lowercased
+- Tracking params removed: utm_*, fbclid, gclid, _ga, _gl, mc_cid, mc_eid
+- Fragment stripped for dedup keys
+- Path lowercased, trailing slash stripped
+- Query params sorted alphabetically
 
 ## Error Handling
 
-| Problem | Fix |
-|---------|-----|
-| "Cannot drop a runtime" on extract | Use `gthings pdf url` or `gthings follow` instead |
-| PDF text empty | Ensure `pdftotext` is installed (`brew install poppler`) |
-| Browser not found | Browser (Chrome/Dia) must be running with `--remote-debugging-port=9222` |
-| Empty search results | Try different wording |
+| Signal | Cause | Action |
+|--------|-------|--------|
+| BROWSER_NOT_FOUND | Chrome not running with --remote-debugging-port=9222 | Start browser |
+| CONNECTION_FAILED | CDP port wrong | Check with status |
+| body_status=chrome_or_empty | Nav-only page | Retry with extract instead of follow |
+| body_status=pdf_unextracted | PDF not extracted | Use extract or pdf command |
+| quality.score==0 with reasons | Complete failure | Skip result |

@@ -31,4 +31,3 @@ type = "PrepareRelease"
 [[workflows.steps]]
 type = "Command"
 command = "git add -A"
-

@@ -1,193 +1,169 @@
 # gthings CLI Command Reference
 
-Every command supports `--json` (global, structured JSON output) and `--trace <file>` (telemetry).
+All commands support `--json` for structured JSON output.
 
-Chrome is auto-launched on first use and stays alive (persistent on port 9222). No manual browser management needed — but use `browser start`, `browser stop`, `browser status` to control it explicitly.
-
-## Update
-
-### `gthings update`
-
-One-command update. Does everything:
-1. Upgrades gthings binary via `cargo install gthings`
-2. Detects your shell (`$SHELL`) and adds `~/.cargo/bin` to your shell config file
-3. Installs skill files to both `~/.agents/skills/gthings/` and `~/.config/opencode/skills/`
-
-Supported shells: Bash (`~/.bashrc` or `~/.bash_profile`), Zsh (`~/.zshrc`), Fish (`~/.config/fish/config.fish`).
-
-After running, restart your terminal or source your config file.
-
-
-## Search
-
-### `gthings --json search query "<query>" --count N`
-
-Single Google search.
+## search
 
 ```
---count | Number of results (default: 10)
+gthings search <query> [--count N] [--json]
 ```
 
-```json
-{
-  "meta": {"total": 5, "query": "fed rate 2026", "duration_ms": 2340},
-  "results": [
-    {"title": "Fed Holds Rates at 3.50-3.75%", "url": "https://...", "snippet": "...", "query": "fed rate 2026"}
-  ]
-}
-```
+Single Google SERP search via CDP browser.
 
-### `gthings --json search batch "q1" "q2" --count N`
-
-Multi-query search. Results deduplicated by URL.
-
-```json
-{
-  "results": [...],
-  "meta": {"total": 8, "query": "q1, q2", "duration_ms": 4100}
-}
-```
-
-### `gthings --json search harvest "q1" "q2" --count N --max M`
-
-**Two-phase pipeline**: Phase 1 searches all queries, Phase 2 follows top M results per query.
-
-```
---count | Search results per query (default: 5)
---max   | Pages to follow per query (default: count/2)
-```
-
-```json
-{
-  "search_results": [
-    {"title": "...", "url": "...", "snippet": "...", "query": "q1"}
-  ],
-  "read_pages": [
-    {"success": true, "url": "...", "content": "...", "total_length": 45320,
-     "offset": 0, "truncated": false,
-     "sections": [{"heading": "Introduction", "content": "..."}],
-     "error": null,
-     "quality": {"score": 1.0, "is_ok": true, "reasons": [], "length": 45320}}
-  ],
-  "meta": {
-    "queries": ["q1", "q2"],
-    "total_search_results": 10,
-    "unique_urls": 7,
-    "pages_followed": 5,
-    "pages_skipped": 0,
-    "duration_ms": 12500
-  }
-}
-```
-
-**Most efficient tool for multi-topic research.** One command replaces 12+ individual calls.
-
-## Follow (Page Reading)
-
-### `gthings --json follow url "<url>" --max N --selector S`
-
-Read a single page. Extracts main content via CSS selector, detects sections from h1/h2/h3.
-
-```
---max      | Max characters to extract (default: 15000)
---selector | CSS selector for main content (default: "article,main,[role=main]")
---offset   | Character offset into full text (default: 0)
-```
-
-```json
-{
-  "success": true,
-  "url": "https://example.com/article",
-  "content": "Full extracted text...",
-  "total_length": 45320,
-  "offset": 0,
-  "truncated": false,
-  "sections": [
-    {"heading": "Introduction", "content": "..."},
-    {"heading": "Results", "content": "..."}
-  ],
-  "error": null,
-  "quality": {
-    "score": 1.0,
-    "is_ok": true,
-    "reasons": [],
-    "length": 45320
-  }
-}
-```
-
-**Always check `quality.is_ok`** before processing content. If false, content may be a paywall, captcha, or error page.
-
-**If `sections` is empty**, the page doesn't use semantic headings. The `content` field still has full text.
-
-### `gthings --json follow batch "url1" "url2" "url3" --max N`
-
-Batch page reading. Each URL gets its own tab. Use for 3+ independent URLs.
-
+**Output** (`SearchResult[]`):
 ```json
 [
-  {"success": true, "url": "https://...", "content": "...", ...},
-  {"success": true, "url": "https://...", "content": "...", ...}
+  {
+    "title": "Page Title",
+    "url": "https://example.com/page",
+    "snippet": "SERP description text...",
+    "position": 1,
+    "domain_authority": 0.85,
+    "provenance": {
+      "source_url": "https://google.com/search?q=...",
+      "method": "Search",
+      "agent": "gthings/0.6.0",
+      "accessed_at": "2026-07-26T12:00:00Z",
+      "duration_ms": 1234
+    }
+  }
 ]
 ```
 
-## PDF Extraction
+## follow
 
-### `gthings --json pdf url "<url>"`
-
-Extract text from a PDF at a URL.
-
-```json
-{"source": "https://arxiv.org/pdf/2405.10119", "text": "...", "length": 45230, "pages": 6}
+```
+gthings follow <url> [--max-chars N] [--offset N] [--json]
 ```
 
-**Errors handled**:
-- HTTP 404: `"PDF URL '...' returned HTTP 404 Not Found. Verify the URL is correct."`
-- Non-PDF content: `"URL '...' returned content type 'text/html' but does not appear to be a PDF."`
-- arXiv PDFs are auto-detected. Use the abstract page URL (`arxiv.org/abs/XXXX.XXXXX`) — the /pdf/ to /abs/ rewrite is automatic.
+Single page content via CDP browser (`document.body.innerText`).
 
-### `gthings --json pdf file "<path>"`
-
-Extract text from a local PDF file.
-
+**Output** (`FollowResult`):
 ```json
-{"source": "/path/to/paper.pdf", "text": "...", "length": 45230, "pages": 6}
+{
+  "url": "https://example.com/page",
+  "title": "Page Title",
+  "content": "Full visible text content...",
+  "error": "",
+  "provenance": { "source_url": "...", "method": "Follow", "agent": "gthings/0.6.0", "accessed_at": "...", "duration_ms": 500 },
+  "pagination": { "offset": 0, "returned_len": 15000, "total_len": 45320, "truncated": true, "continuation_token": "..." }
+}
 ```
 
-PDF extraction is pure Rust — no external dependencies. Works offline.
+If `pagination.truncated == true`, fetch next chunk with `--offset N`.
 
-## Browser Lifecycle
+## extract
 
-### `gthings browser start`
-
-Start the persistent Chrome browser on port 9222. Auto-started on first use, but explicit start lets you verify.
-
-```json
-{"status": "started", "pid": 12345, "ws_url": "ws://127.0.0.1:9222/..."}
+```
+gthings extract <url> [--max-chars N] [--offset N] [--json]
 ```
 
-### `gthings browser stop`
+HTTP-based extraction with auto-detection:
+- Web URLs → Readability parser
+- PDF URLs → pdftotext
+- arXiv URLs → /pdf/ path rewrite + PDF extraction
+- GitHub URLs → raw content fetch
 
-Stop the persistent browser. Kills the Chrome process and removes the state file.
-
+**Output** (`Article`):
 ```json
-{"status": "stopped", "pid": 12345}
+{
+  "url": "https://example.com/article",
+  "title": "Article Title",
+  "source": { "author": "Author Name", "site_name": "Site", "domain_authority": 0.85 },
+  "extraction": { "method": "Readability", "confidence": 0.95, "accessed_at": "2026-07-26T12:00:00Z", "duration_ms": 800 },
+  "body": {
+    "Article": {
+      "sections": [{"heading": "Introduction", "depth": 1, "content": "Section text..."}],
+      "full_text": "Complete article text...",
+      "total_length": 12000
+    }
+  },
+  "quality": { "score": 0.95, "is_ok": true, "reasons": [], "entropy_bits_per_char": 4.2 }
+}
 ```
 
-Returns `{"status": "not_running"}` if no browser state found.
+## batch
 
-### `gthings browser status`
-
-Check if the persistent browser is running.
-
-```json
-{"status": "running", "pid": 12345, "ws_url": "ws://127.0.0.1:9222/..."}
+```
+gthings batch <q1> [<q2> ...] [--count N] [--follow] [--max-chars N] [--json]
 ```
 
-or:
+Multi-query search. Returns `SearchResult[][]` (one array per query). With `--follow`, follows top result per query.
+
+## harvest
+
+```
+gthings harvest <q1> [<q2> ...] [--follow-top N] [--max-chars N] [--dedup url] [--rank composite] [--json]
+```
+
+Full research pipeline. One command replaces search + dedup + rank + select + follow + quality.
+
+**Pipeline**: parallel search (JoinSet) → dedup (canonical URL normalization) → rank (composite or other strategy) → select (per-query minimum, per-host cap max 2, junk URL filter) → parallel follow (JoinSet, 30s timeout) → quality scoring → summary.
+
+**Output**:
+```json
+{
+  "results": [
+    {
+      "search_result": { "title": "...", "url": "...", "snippet": "...", "position": 1, "domain_authority": 0.9 },
+      "followed_content": "Full page body text... or null",
+      "body_status": "ok",
+      "url_canonical": "https://en.wikipedia.org/wiki/entropy",
+      "query": "information theory entropy",
+      "quality": { "score": 0.95, "is_ok": true, "reasons": [], "entropy_bits_per_char": 4.2 },
+      "sections": [{"heading": "Introduction", "content": "..."}],
+      "provenance": { "source_url": "https://google.com/search?q=...", "method": "Follow", ... }
+    }
+  ],
+  "summary": {
+    "total_queries": 3,
+    "total_results": 8,
+    "unique_sources_followed": 5,
+    "coverage_by_query": {
+      "query 1": { "total_hits": 1, "followed_ok": 1, "followed_failed": 0 },
+      "query 2": { "total_hits": 4, "followed_ok": 0, "followed_failed": 4 }
+    },
+    "warnings": ["no_body_for_query:query 2"]
+  }
+}
+```
+
+**BodyStatus values**: `ok` | `snippet_only` | `extract_failed` | `pdf_unextracted` | `chrome_or_empty`
+
+**Rank strategies**:
+- `serp_order` — Google's original order, interleaved round-robin across queries
+- `domain_authority` — Descending by domain authority score
+- `snippet_length` — Descending by SERP snippet length
+- `composite` (default) — `0.5 * authority + 0.3 * norm_snippet + 0.2 * diversity_bonus`
+
+## pdf
+
+```
+gthings pdf url <url> [--json]
+gthings pdf file <path> [--json]
+```
+
+PDF extraction via pdftotext. Requires poppler. Output includes full text, pages, quality score.
 
 ```json
-{"status": "stopped"}
+{
+  "url": "https://arxiv.org/pdf/2405.10119",
+  "quality": { "score": 0.90, "is_ok": true, "reasons": [], "entropy_bits_per_char": 4.5 },
+  "pages": 8,
+  "body": { "Pdf": { "text": "Full PDF text...", "pages": 8, "has_toc": true } }
+}
+```
+
+## status
+
+```
+gthings status [--json]
+```
+
+Browser connection check.
+
+```json
+{ "status": "running", "pid": 12345, "ws_url": "ws://127.0.0.1:9222/..." }
 ```
 
 ## Exit Codes
@@ -195,7 +171,5 @@ or:
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Operational error (bad URL, empty results, PDF parse failure, Chrome launch failure) |
+| 1 | Operational error (bad URL, empty results, PDF parse failure) |
 | 101+ | Panic (report as bug) |
-
-All errors produce messages on stderr with the failing URL/query included.

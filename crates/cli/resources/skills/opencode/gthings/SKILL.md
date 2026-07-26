@@ -1,104 +1,101 @@
 ---
 name: gthings
-description: "Browser automation and web research CLI — search, follow, extract, PDF extraction, batch search, quality gate"
+description: "Browser automation and web research CLI — search, follow, extract, PDF, batch, harvest with quality gates"
 ---
 
 # Skill: gthings
 
-Browser automation and web research toolkit. Native Rust binary — single static binary that reuses existing Chrome/Dia browser via CDP.
+Rust CLI for AI-agent-driven web research. Reuses installed Chrome via CDP. All commands produce JSON.
 
 ## When This Skill Activates
 
-The user says any of these:
-- "search" "find" "look up" "research"
-- "gthings"
-- "web research" "browser research"
-- "pdf" "extract"
+User says: "search" "research" "look up" "find" "gthings" "web research" "harvest" "extract" "pdf"
 
 ## Core Rules
 
-1. **Use `--json`** for structured output.
-2. **Prefer `batch`** for multi-query search.
-3. **Browser is already running** — no launch needed. Use `gthings status` to verify.
-4. **Check quality score** in PDF extraction output.
+1. Always use `--json` for structured output.
+2. Prefer `harvest` for multi-query research (handles dedup, diversity, quality in one pass).
+3. Filter results by `body_status == "ok"` before using content as factual source.
+4. Check `quality.reasons` — never use content with paywall/bot_blocked/too_short.
+5. Browser must be running with `--remote-debugging-port=9222`.
 
 ## Commands
 
-### `gthings search <query> [--count=N]`
+### `gthings search <query> [--count N] [--json]`
 
-Single Google search via CDP browser. Returns numbered results with title, URL, snippet.
+Google SERP. Returns `SearchResult[]` with title, url, snippet, domain_authority, provenance.
 
-```
---count  Number of results (default: 10)
---json   Output as JSON array [{title, url, snippet}]
-```
+### `gthings follow <url> [--max-chars N] [--offset N] [--json]`
 
-### `gthings follow <url> [--max-chars=N]`
+Page content via CDP. Returns `FollowResult` with content, quality, pagination, sections.
 
-Read a page via CDP browser. Extracts visible text content.
+### `gthings extract <url> [--max-chars N] [--offset N] [--json]`
 
-```
---max-chars  Max characters to extract (default: 15000)
---json       Output as JSON {title, url, content}
-```
+HTTP extraction. Auto-detects web (Readability), PDF (pdftotext), arXiv (abs→pdf), GitHub (raw). Better for PDFs than follow.
 
-### `gthings batch <queries...> [--count=N] [--follow] [--max-chars=N]`
+### `gthings batch <q1> [<q2> ...] [--count N] [--follow] [--max-chars N] [--json]`
 
-Multi-query search. Each query opens a separate CDP tab.
+Multi-query search. Returns `SearchResult[][]`. With --follow, follows top result per query.
 
-```
---count      Results per query (default: 10)
---follow     Also follow/read top result per query
---max-chars  Max chars per follow (default: 15000)
---json       Output as JSON array of arrays
-```
+### `gthings harvest <q1> [<q2> ...] [--follow-top N] [--max-chars N] [--dedup url] [--rank composite] [--json]`
 
-### `gthings status`
+Full research pipeline: search → dedup → rank → diverse selection → follow → quality score → summary.
 
-Check CDP browser connection. Returns browser name and WebSocket URL.
+Output: `{ "results": HarvestedResult[], "summary": HarvestRunSummary }`
 
-### `gthings extract <url> [--max-chars=N]`
+| Flag | Default | Description |
+|------|---------|-------------|
+| --follow-top | 8 | Max URLs to follow |
+| --max-chars | 15000 | Max chars per follow |
+| --dedup | url | Dedup strategy |
+| --rank | composite | serp_order, domain_authority, snippet_length, composite |
 
-Auto-detect and extract content from any URL. Detects PDF, GitHub source, arXiv paper, or web page automatically. Uses pdftotext for PDFs.
+### `gthings pdf url <url> [--json]` / `gthings pdf file <path> [--json]`
 
-```
---max-chars  Max characters to extract (default: 15000)
---json       Output as JSON
-```
+PDF via pdftotext. Requires `brew install poppler`. Quality >= 0.90 for clean text.
 
-### `gthings pdf url <url> [--json]`
+### `gthings status [--json]`
 
-Extract text from a PDF at URL using pdftotext. arXiv PDFs supported. Quality score included.
+Browser connection check.
 
-```json
-{"quality": {"score": 0.9, "is_ok": true}, "pages": 8, "body": {"Pdf": {"text": "..."}}}
-```
+## Key Output Fields for Agent Triage
 
-### `gthings pdf file <path> [--json]`
+### body_status (in harvest results)
 
-Extract text from a local PDF file via pdftotext.
+| Value | Agent Action |
+|-------|-------------|
+| ok | Use followed_content directly |
+| pdf_unextracted | Fetch via extract or pdf command |
+| extract_failed | Skip — blocked/paywall |
+| chrome_or_empty | Skip — no usable content |
+| snippet_only | Lead only, not a body |
 
-## PDF Extraction Notes
+### quality.score
 
-- Uses `pdftotext` (poppler-utils) — install via `brew install poppler`
-- Quality score: 0.90/1.0 for clean readable text
-- Output includes full paper text with sections, references, footnotes
-- No 15k character cap — extracts complete document
+| Range | Agent Decision |
+|-------|---------------|
+| >= 0.80 | Use directly |
+| 0.50-0.79 | Use but verify claims |
+| < 0.50 | Skip or corroborate |
 
-## Quality Score
+### quality.reasons to reject content
 
-| Score | Meaning |
-|-------|---------|
-| 0.90 | Clean, readable text with good structure |
-| 0.80 | Readable with minor artifacts |
-| 0.30 | Low quality — artifacts detected, retry with pdftotext |
-| 0.00 | Extraction failed |
+`paywall`, `bot_blocked`, `captcha`, `empty_shell`, `too_short`, `too_few_words`, `low_entropy`, `empty_content`
+
+### coverage_by_query (in summary)
+
+Per-query `{ total_hits, followed_ok, followed_failed }`. Shows which topics have body coverage.
+
+### warnings
+
+`follow_budget_collapsed_to_one_site`, `no_body_for_query:<q>`, `all_snippet_only`
 
 ## Error Handling
 
-| Problem | Fix |
-|---------|-----|
-| "Cannot drop a runtime" on extract | Use `gthings pdf url` or `gthings follow` instead |
-| PDF text empty | Ensure `pdftotext` is installed (`brew install poppler`) |
-| Browser not found | Browser (Chrome/Dia) must be running with `--remote-debugging-port=9222` |
-| Empty search results | Try different wording |
+| Signal | Action |
+|--------|--------|
+| BROWSER_NOT_FOUND | Start Chrome with --remote-debugging-port=9222 |
+| CONNECTION_FAILED | Check status, verify port |
+| body_status=chrome_or_empty | Retry with extract instead of follow |
+| body_status=pdf_unextracted | Use extract or pdf command |
+| quality.score==0 with reasons | Skip result |
