@@ -2,7 +2,6 @@ use crate::connection::Connection;
 use crate::error::{CdpError, Result};
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use tracing;
 
 /// Info about a running browser discovered by [`detect`].
 #[derive(Debug, Clone, serde::Serialize)]
@@ -313,30 +312,14 @@ mod tests {
             browser: "Chrome".into(),
             version: "130.0.0.0".into(),
         };
-        let json = serde_json::to_string(&db).unwrap();
-        assert!(json.contains("\"ws_url\""));
-        assert!(json.contains("\"browser\""));
-        assert!(json.contains("\"version\""));
-    }
-
-    #[test]
-    fn test_devtools_active_port_parsing() {
-        // Test the DevToolsActivePort parsing logic end-to-end
-        // by writing a temp file and calling probe_devtools_active_port.
-        let tmp = std::env::temp_dir().join("gthings-test-dtap-unit");
-        let _ = std::fs::create_dir_all(&tmp);
-
-        // Write valid DevToolsActivePort
-        let _ = std::fs::write(
-            tmp.join("DevToolsActivePort"),
-            b"29997\n/devtools/browser/test-uuid\n",
+        let json_str = serde_json::to_string(&db).unwrap();
+        // Round-trip through Value to assert specific field values
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(
+            parsed["ws_url"].as_str(),
+            Some("ws://127.0.0.1:9222/devtools/browser/abc")
         );
-
-        // We need HOME to point to the parent of our temp dir for get_profile_dirs
-        // Since we can't manipulate HOME, just verify infer_browser_name on the path
-        assert_eq!(infer_browser_name(&tmp), "unknown");
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(parsed["browser"].as_str(), Some("Chrome"));
+        assert_eq!(parsed["version"].as_str(), Some("130.0.0.0"));
     }
 }

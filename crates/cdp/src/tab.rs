@@ -3,7 +3,6 @@ use crate::error::{CdpError, Result};
 use crate::session::Session;
 use serde_json::{Value, json};
 use std::time::Duration;
-use tracing;
 
 /// Represents a browser tab/page
 #[derive(Debug, Clone)]

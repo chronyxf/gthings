@@ -11,8 +11,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 #[cfg(target_os = "macos")]
 use crate::browser::dismiss_allow_debugging_dialog;
 use tokio_tungstenite::tungstenite::Message;
-use tracing;
-
 static NEXT_CDP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A CDP event received from the browser (no "id" field, has "method" field).
@@ -49,7 +47,6 @@ pub(crate) enum InternalMessage {
 pub struct Connection {
     write: mpsc::UnboundedSender<InternalMessage>,
     events: broadcast::Sender<CdpEvent>,
-    #[allow(dead_code)]
     handle: JoinHandle<()>,
 }
 
@@ -294,43 +291,121 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use serde_json::json;
 
-    #[test]
-    fn test_cdp_response_parsing() {
-        let response = json!({"id": 1, "result": {"value": "hello"}});
-        assert_eq!(response["id"].as_u64(), Some(1));
-        assert!(response.get("error").is_none());
-        assert_eq!(response["result"]["value"].as_str(), Some("hello"));
-    }
+    // -----------------------------------------------------------------------
+    // dispatch_message routing tests
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn test_cdp_error_response() {
-        let response =
-            json!({"id": 2, "error": {"code": -32000, "message": "Cannot find context"}});
-        assert!(response.get("error").is_some());
+    fn test_dispatch_message_routes_response_to_oneshot() {
+        let mut pending: PendingMap = HashMap::new();
+        let (tx, mut rx) = oneshot::channel();
+        pending.insert(
+            1,
+            PendingCall {
+                method: "Test.method".into(),
+                tx,
+            },
+        );
+        let (event_tx, _) = broadcast::channel::<CdpEvent>(256);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(Connection::dispatch_message(
+            json!({"id": 1, "result": {"data": "hello"}}),
+            &mut pending,
+            &event_tx,
+        ));
+
+        assert!(pending.is_empty(), "pending call should be removed");
+        let received = rx.try_recv().expect("oneshot should have been sent");
+        assert!(received.is_ok(), "response should be Ok");
         assert_eq!(
-            response["error"]["message"].as_str(),
-            Some("Cannot find context")
+            received.unwrap().get("data").and_then(|v| v.as_str()),
+            Some("hello")
         );
     }
 
     #[test]
-    fn test_cdp_event_has_no_id() {
-        let event = json!({"method": "Page.frameStartedLoading", "params": {"frameId": "123"}});
-        assert!(event.get("id").is_none());
-        assert!(event.get("method").is_some());
-        assert!(event.get("params").is_some());
+    fn test_dispatch_message_routes_error_to_oneshot() {
+        let mut pending: PendingMap = HashMap::new();
+        let (tx, mut rx) = oneshot::channel();
+        pending.insert(
+            42,
+            PendingCall {
+                method: "Test.method".into(),
+                tx,
+            },
+        );
+        let (event_tx, _) = broadcast::channel::<CdpEvent>(256);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(Connection::dispatch_message(
+            json!({"id": 42, "error": {"code": -32000, "message": "Cannot find context"}}),
+            &mut pending,
+            &event_tx,
+        ));
+
+        assert!(pending.is_empty(), "pending call should be removed");
+        let received = rx.try_recv().expect("oneshot should have been sent");
+        assert!(received.is_err(), "error response should be Err");
     }
 
     #[test]
-    fn test_cdp_event_with_session_id() {
-        let event = json!({
-            "method": "Runtime.consoleAPICalled",
-            "params": {},
-            "sessionId": "session-123"
-        });
-        assert!(event.get("id").is_none());
-        assert_eq!(event["sessionId"].as_str(), Some("session-123"));
+    fn test_dispatch_message_unknown_id_ignored() {
+        let mut pending: PendingMap = HashMap::new();
+        let (event_tx, _) = broadcast::channel::<CdpEvent>(256);
+
+        // A response with an id not in pending should be silently ignored
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(Connection::dispatch_message(
+            json!({"id": 999, "result": {}}),
+            &mut pending,
+            &event_tx,
+        ));
+
+        assert!(pending.is_empty(), "pending should remain empty");
+    }
+
+    #[test]
+    fn test_dispatch_message_broadcasts_event_with_session_id() {
+        let mut pending: PendingMap = HashMap::new();
+        let (event_tx, mut event_rx) = broadcast::channel::<CdpEvent>(256);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(Connection::dispatch_message(
+            json!({"method": "Runtime.consoleAPICalled", "params": {"level": "info"}, "sessionId": "sess-1"}),
+            &mut pending,
+            &event_tx,
+        ));
+
+        assert!(pending.is_empty());
+        let evt = event_rx.try_recv().expect("event should be broadcast");
+        assert_eq!(evt.method, "Runtime.consoleAPICalled");
+        assert_eq!(
+            evt.params.get("level").and_then(|v| v.as_str()),
+            Some("info")
+        );
+        assert_eq!(evt.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn test_dispatch_message_unrecognized_message_is_noop() {
+        let mut pending: PendingMap = HashMap::new();
+        let (event_tx, mut event_rx) = broadcast::channel::<CdpEvent>(256);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(Connection::dispatch_message(
+            json!({"some": "garbage"}),
+            &mut pending,
+            &event_tx,
+        ));
+
+        assert!(pending.is_empty());
+        match event_rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Empty) => {} // expected
+            other => panic!("expected Empty, got {other:?}"),
+        }
     }
 }
