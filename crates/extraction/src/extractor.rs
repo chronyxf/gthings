@@ -1,11 +1,18 @@
+use gthings_common::pagination::ExtractParams;
+
 use crate::article::{Article, ExtractionError, ExtractionMethod};
 
 /// Every extractor implements this trait.
 /// Input varies by source, output is always Article.
+/// `params` controls offset/max_chars slicing of the extracted text.
 #[async_trait::async_trait]
 pub trait Extractor: Send + Sync {
     type Input: Send + 'static;
-    async fn extract(&self, input: Self::Input) -> Result<Article, ExtractionError>;
+    async fn extract(
+        &self,
+        input: Self::Input,
+        params: ExtractParams,
+    ) -> Result<Article, ExtractionError>;
     fn method(&self) -> ExtractionMethod;
 }
 
@@ -39,18 +46,17 @@ impl SourceType {
     }
 }
 
-/// Compute a domain authority score (0.0-1.0) based on recognized domains.
+/// Compute a domain authority score (0.0-1.0) for a hostname.
 ///
 /// Uses a curated list of academic, technical, news, and government domains.
 /// Unknown domains default to 0.5. The score helps AI agents assess source trustworthiness.
-pub(crate) fn compute_domain_authority(url: &str) -> f64 {
-    let domain = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+pub fn domain_authority(host: &str) -> f32 {
+    authority_for_domain(host) as f32
+}
+
+/// Internal helper: look up authority value for a normalized domain string.
+fn authority_for_domain(domain: &str) -> f64 {
+    let domain = domain.to_lowercase();
 
     // High-authority academic/scholarly domains
     let high: [&str; 14] = [
@@ -138,5 +144,49 @@ pub(crate) fn compute_domain_authority(url: &str) -> f64 {
         0.8
     } else {
         0.5
+    }
+}
+
+/// Compute a domain authority score (0.0-1.0) based on recognized domains.
+///
+/// Uses a curated list of academic, technical, news, and government domains.
+/// Unknown domains default to 0.5. The score helps AI agents assess source trustworthiness.
+pub(crate) fn compute_domain_authority(url: &str) -> f64 {
+    let domain = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    authority_for_domain(&domain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_domain_authority_high() {
+        assert!(domain_authority("arxiv.org") > 0.8);
+        assert!(domain_authority("www.arxiv.org") > 0.8);
+    }
+
+    #[test]
+    fn test_domain_authority_medium() {
+        assert!(domain_authority("github.com") >= 0.5);
+        assert!(domain_authority("stackoverflow.com") >= 0.5);
+    }
+
+    #[test]
+    fn test_domain_authority_unknown() {
+        let auth = domain_authority("example-unknown-site.com");
+        assert!(auth >= 0.0 && auth <= 0.5);
+    }
+
+    #[test]
+    fn test_domain_authority_empty() {
+        let auth = domain_authority("");
+        assert!(auth >= 0.0);
     }
 }

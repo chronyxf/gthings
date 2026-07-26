@@ -1,9 +1,14 @@
+use gthings_common::pagination::ExtractParams;
+use gthings_common::provenance::{ExtractionMethod as ProvenanceMethod, Provenance};
+
 use crate::ContentQuality;
 use crate::article::{
     Article, ContentTree, ContinuationSignals, ExtractionError, ExtractionInfo, ExtractionMethod,
     QualityScore, Section, SourceInfo,
 };
-use crate::extractor::{Extractor, SourceType};
+use crate::extractor::Extractor;
+#[cfg(test)]
+use crate::extractor::SourceType;
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use std::time::Instant;
@@ -29,12 +34,6 @@ impl WebExtractor {
         let meta_date = Selector::parse(r#"meta[name="date"]"#).ok();
         let meta_article_pub = Selector::parse(r#"meta[property="article:published_time"]"#).ok();
         let html_lang = Selector::parse(r#"html[lang]"#).ok();
-        let meta_description = Selector::parse(r#"meta[name="description"]"#).ok();
-        let meta_og_desc = Selector::parse(r#"meta[property="og:description"]"#).ok();
-        let meta_twitter_desc = Selector::parse(r#"meta[name="twitter:description"]"#).ok();
-        let meta_article_tag = Selector::parse(r#"meta[property="article:tag"]"#).ok();
-        let meta_article_section = Selector::parse(r#"meta[property="article:section"]"#).ok();
-        let meta_dc_creator = Selector::parse(r#"meta[name="dc.creator"]"#).ok();
 
         let title = meta_og_title
             .as_ref()
@@ -77,16 +76,6 @@ impl WebExtractor {
         // Parse JSON-LD metadata
         let (jsonld_author, jsonld_published) = Self::extract_jsonld(doc);
 
-        // Suppress unused variable warnings for selectors parsed for future use
-        let _ = (
-            meta_description,
-            meta_og_desc,
-            meta_twitter_desc,
-            meta_article_tag,
-            meta_article_section,
-            meta_dc_creator,
-        );
-
         (
             SourceInfo {
                 author: author.or(jsonld_author),
@@ -99,7 +88,7 @@ impl WebExtractor {
         )
     }
 
-    /// Extract sections from full text by finding heading markers.
+    /// Extract sections from full text by finding heading markers (flat heuristic fallback).
     fn extract_sections(text: &str) -> Vec<Section> {
         let mut sections = Vec::new();
         let current_depth = 0u8;
@@ -153,6 +142,152 @@ impl WebExtractor {
         sections
     }
 
+    /// Extract sections from an HTML document by walking the DOM heading hierarchy.
+    ///
+    /// Uses `scraper` to select h1–h6 elements in document order, determines
+    /// section body text from `full_text`, and builds a proper nested tree.
+    /// Falls back to [`extract_sections`] when no heading elements exist.
+    fn extract_sections_from_html(document: &Html, full_text: &str) -> Vec<Section> {
+        let selector = match Selector::parse("h1, h2, h3, h4, h5, h6") {
+            Ok(s) => s,
+            Err(_) => return Self::extract_sections(full_text),
+        };
+
+        // Collect heading metadata from DOM
+        let mut raw_headings: Vec<(u8, String)> = Vec::new();
+        for element in document.select(&selector) {
+            let tag = element.value().name();
+            let depth = match tag {
+                "h1" => 1,
+                "h2" => 2,
+                "h3" => 3,
+                "h4" => 4,
+                "h5" => 5,
+                "h6" => 6,
+                _ => continue,
+            };
+            let heading_text: String = element.text().collect::<Vec<_>>().concat();
+            let heading_text = heading_text.trim().to_string();
+            if heading_text.is_empty() {
+                continue;
+            }
+            raw_headings.push((depth, heading_text));
+        }
+
+        if raw_headings.is_empty() {
+            return Self::extract_sections(full_text);
+        }
+
+        // Map headings to offsets within full_text, searching incrementally
+        let mut headings: Vec<(u8, String, usize)> = Vec::new();
+        let mut search_from = 0usize;
+        for (depth, text) in &raw_headings {
+            if let Some(offset) = full_text[search_from..].find(text.as_str()) {
+                let absolute_offset = search_from + offset;
+                headings.push((*depth, text.clone(), absolute_offset));
+                search_from = absolute_offset + text.len();
+            }
+        }
+
+        if headings.is_empty() {
+            return Self::extract_sections(full_text);
+        }
+
+        // Build flat sections with body text between consecutive headings
+        let mut flat: Vec<Section> = Vec::with_capacity(headings.len());
+        for i in 0..headings.len() {
+            let (depth, ref heading, offset) = headings[i];
+            let end = if i + 1 < headings.len() {
+                headings[i + 1].2
+            } else {
+                full_text.len()
+            };
+            let length = end.saturating_sub(offset);
+            let content = full_text[offset..end].to_string();
+            flat.push(Section {
+                heading: heading.clone(),
+                depth,
+                offset,
+                length,
+                content,
+                subsections: Vec::new(),
+            });
+        }
+
+        // Nest into proper heading hierarchy
+        Self::build_section_tree(flat)
+    }
+
+    /// Convert a flat list of offset-sorted sections into a nested tree using
+    /// heading depth (HTML outline algorithm).
+    fn build_section_tree(flat: Vec<Section>) -> Vec<Section> {
+        let mut roots: Vec<Section> = Vec::new();
+        for section in flat {
+            let depth = section.depth;
+            if roots.is_empty() {
+                roots.push(section);
+            } else {
+                Self::insert_into_sections(&mut roots, section, depth);
+            }
+        }
+        roots
+    }
+
+    /// Insert `section` of given `depth` into the tree rooted at `sections`
+    /// using the HTML outline algorithm:
+    /// - Walk down the last child chain as long as depth keeps increasing
+    /// - The first section with depth < current depth becomes the parent
+    fn insert_into_sections(sections: &mut Vec<Section>, section: Section, depth: u8) {
+        // sections is guaranteed non-empty by the caller
+        let last_depth = sections
+            .last()
+            .expect("sections non-empty after checks")
+            .depth;
+
+        if last_depth < depth {
+            // Potential parent found — check if its last child is a closer parent
+            let recurse = sections
+                .last()
+                .and_then(|s| s.subsections.last())
+                .is_some_and(|child| child.depth < depth);
+
+            if recurse {
+                Self::insert_into_sections(
+                    &mut sections
+                        .last_mut()
+                        .expect("sections non-empty after checks")
+                        .subsections,
+                    section,
+                    depth,
+                );
+            } else {
+                sections
+                    .last_mut()
+                    .expect("sections non-empty after checks")
+                    .subsections
+                    .push(section);
+            }
+        } else if !sections
+            .last()
+            .expect("sections non-empty after checks")
+            .subsections
+            .is_empty()
+        {
+            // Recurse into subsections — last_child.depth >= depth so we go deeper
+            Self::insert_into_sections(
+                &mut sections
+                    .last_mut()
+                    .expect("sections non-empty after checks")
+                    .subsections,
+                section,
+                depth,
+            );
+        } else {
+            // Same level or deeper — add as sibling
+            sections.push(section);
+        }
+    }
+
     /// Score content quality based on length, structure, and patterns.
     ///
     /// Delegates to [`ContentQuality::validate`] for the core scoring, then
@@ -177,6 +312,7 @@ impl WebExtractor {
             score,
             is_ok: score >= 0.5,
             reasons,
+            entropy_bits_per_char: result.entropy_bits_per_char,
         }
     }
 
@@ -190,10 +326,12 @@ impl WebExtractor {
 impl Extractor for WebExtractor {
     type Input = String;
 
-    async fn extract(&self, url: String) -> Result<Article, ExtractionError> {
+    async fn extract(
+        &self,
+        url: String,
+        params: ExtractParams,
+    ) -> Result<Article, ExtractionError> {
         let start = Instant::now();
-        let _source_type = SourceType::from_url(&url);
-
         let resp = self
             .client
             .get(&url)
@@ -219,40 +357,68 @@ impl Extractor for WebExtractor {
 
         let (source, title) = self.extract_metadata(&doc, &url);
 
-        // Use readability's own HTTP fetch + extraction, fall back to scraper body text
-        let readability_text = match readability::extractor::scrape(&url) {
-            Ok(article) => article.text,
-            Err(_) => {
-                let body_sel = Selector::parse("body")
-                    .map_err(|_| ExtractionError::Parse("invalid body selector".into()))?;
-                doc.select(&body_sel)
-                    .next()
-                    .map(|e| e.text().collect::<Vec<_>>().join(" "))
-                    .unwrap_or_default()
+        // Use readability's local extraction on already-fetched HTML (no double fetch)
+        let full_text = {
+            let parsed_url = url::Url::parse(&url)
+                .map_err(|e| ExtractionError::Parse(format!("invalid URL: {e}")))?;
+            let mut slice: &[u8] = html.as_bytes();
+            match readability::extractor::extract(&mut slice, &parsed_url) {
+                Ok(article) => article.text,
+                Err(_) => {
+                    let body_sel = Selector::parse("body")
+                        .map_err(|_| ExtractionError::Parse("invalid body selector".into()))?;
+                    doc.select(&body_sel)
+                        .next()
+                        .map(|e| e.text().collect::<Vec<_>>().join(" "))
+                        .unwrap_or_default()
+                }
             }
         };
 
-        if readability_text.trim().is_empty() {
+        if full_text.trim().is_empty() {
             return Err(ExtractionError::Empty(
                 "readability produced no content".into(),
             ));
         }
 
-        let sections = Self::extract_sections(&readability_text);
+        let total_len = full_text.len();
 
-        let quality = Self::score_quality(&readability_text, &sections);
+        // Apply offset and max_chars slicing
+        let effective_text: String = full_text
+            .chars()
+            .skip(params.offset)
+            .take(params.max_chars)
+            .collect();
 
-        let total_length = readability_text.len();
+        let effective_len = effective_text.len();
+
+        let pagination =
+            gthings_common::pagination::build_pagination(&params, &url, total_len, effective_len);
+
+        let sections = Self::extract_sections_from_html(&doc, &effective_text);
+
+        let quality = Self::score_quality(&effective_text, &sections);
+
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let signals = ContinuationSignals {
-            truncated: false,
-            total_length,
-            returned_length: total_length,
+            truncated: pagination.truncated,
+            total_length: total_len,
+            returned_length: effective_len,
             is_paywall: quality.reasons.iter().any(|r| r == "paywall_teaser"),
             is_bot_blocked: quality.reasons.iter().any(|r| r == "bot_blocked"),
-            is_empty_shell: total_length < 200,
+            is_empty_shell: total_len < 200,
             related_urls: Vec::new(),
+        };
+
+        let now = chrono::Utc::now();
+        let provenance = Provenance {
+            source_url: url.clone(),
+            method: ProvenanceMethod::Readability,
+            agent: "gthings-web-extractor".into(),
+            accessed_at: now,
+            duration_ms,
+            derived_from: None,
         };
 
         Ok(Article {
@@ -262,16 +428,18 @@ impl Extractor for WebExtractor {
             extraction: ExtractionInfo {
                 method: ExtractionMethod::Readability,
                 confidence: quality.score,
-                accessed_at: chrono::Utc::now().to_rfc3339(),
+                accessed_at: now.to_rfc3339(),
                 duration_ms,
             },
             body: ContentTree::Article {
                 sections,
-                full_text: readability_text,
-                total_length,
+                full_text: effective_text,
+                total_length: total_len,
             },
             signals,
             quality,
+            provenance: Some(provenance),
+            pagination: Some(pagination),
         })
     }
 
@@ -329,11 +497,86 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_sections_simple() {
+    fn test_extract_sections_fallback() {
+        // Flat-text heuristic is preserved as fallback for headingless pages
         let text =
             "Introduction\nSome text\n## Methods\nDetailed methods\n### Subsection\nMore details";
         let sections = WebExtractor::extract_sections(text);
         assert!(!sections.is_empty());
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].heading, "Methods");
+        assert_eq!(sections[0].depth, 2);
+    }
+
+    #[test]
+    fn test_extract_sections_from_html_nested() {
+        let html = r#"
+<!DOCTYPE html>
+<html><body>
+<h1>Main Title</h1>
+<p>Some intro text here.</p>
+<h2>First Section</h2>
+<p>Body of first section.</p>
+<h3>Sub Section A</h3>
+<p>Deeper body.</p>
+<h2>Second Section</h2>
+<p>Last section body.</p>
+</body></html>
+"#;
+        let doc = Html::parse_document(html);
+        // Full_text is a simulated Readability-like flat text
+        let full_text = "Main Title Some intro text here. First Section Body of first section. Sub Section A Deeper body. Second Section Last section body.";
+
+        let sections = WebExtractor::extract_sections_from_html(&doc, full_text);
+        assert_eq!(sections.len(), 1, "should have one root h1 section");
+        assert_eq!(sections[0].heading, "Main Title");
+        assert_eq!(sections[0].depth, 1);
+        // The h1 section spans from "Main Title" to end of doc (since it's the root)
+        // Its subsections should include the two h2 sections
+        assert_eq!(
+            sections[0].subsections.len(),
+            2,
+            "h1 should contain two h2 subsections"
+        );
+        assert_eq!(sections[0].subsections[0].heading, "First Section");
+        assert_eq!(sections[0].subsections[0].depth, 2);
+        // First Section should have one h3 subsection
+        assert_eq!(
+            sections[0].subsections[0].subsections.len(),
+            1,
+            "h2 'First Section' should contain one h3"
+        );
+        assert_eq!(
+            sections[0].subsections[0].subsections[0].heading,
+            "Sub Section A"
+        );
+        assert_eq!(sections[0].subsections[0].subsections[0].depth, 3);
+        assert_eq!(sections[0].subsections[1].heading, "Second Section");
+    }
+
+    #[test]
+    fn test_extract_sections_from_html_headingless_fallback() {
+        // No h1-h6 elements → should fall back to flat heuristic without panicking
+        let html = r#"<html><body><p>No headings here.</p><p>Just paragraphs.</p></body></html>"#;
+        let doc = Html::parse_document(html);
+        let full_text = "No headings here. Just paragraphs.";
+        // Should not panic and return empty sections (since flat heuristic finds no headings either)
+        let sections = WebExtractor::extract_sections_from_html(&doc, full_text);
+        assert!(sections.is_empty(), "no headings → empty sections");
+    }
+
+    #[test]
+    fn test_extract_sections_from_html_sibling_h2s() {
+        // Two h2s at root level (no h1) should both appear at root
+        let html = r#"<html><body><h2>Part A</h2><p>Content A</p><h2>Part B</h2><p>Content B</p></body></html>"#;
+        let doc = Html::parse_document(html);
+        let full_text = "Part A Content A Part B Content B";
+        let sections = WebExtractor::extract_sections_from_html(&doc, full_text);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].heading, "Part A");
+        assert_eq!(sections[1].heading, "Part B");
+        assert_eq!(sections[0].subsections.len(), 0);
+        assert_eq!(sections[1].subsections.len(), 0);
     }
 
     #[test]

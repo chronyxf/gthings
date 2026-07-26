@@ -6,6 +6,9 @@ use regex::Regex;
 use std::io::Read;
 use std::time::Instant;
 
+use gthings_common::pagination::ExtractParams;
+use gthings_common::provenance::{ExtractionMethod as ProvenanceMethod, Provenance};
+
 use crate::article::{
     Article, ContentTree, ContinuationSignals, ExtractionError, ExtractionInfo, ExtractionMethod,
     QualityScore, SourceInfo,
@@ -40,7 +43,13 @@ impl PdfExtractor {
     /// Extract PDF content as an Article.
     ///
     /// Uses `pdf-extract` (bundled MuPDF) to extract text from PDF bytes.
-    pub fn extract_article(&self, url: &str, bytes: &[u8]) -> Result<Article, ExtractionError> {
+    /// `params` controls offset/max_chars slicing of the extracted text.
+    pub fn extract_article(
+        &self,
+        url: &str,
+        bytes: &[u8],
+        params: &ExtractParams,
+    ) -> Result<Article, ExtractionError> {
         let start = Instant::now();
 
         if !Self::is_pdf(bytes) {
@@ -57,9 +66,19 @@ impl PdfExtractor {
         };
 
         let pages = Self::count_pages(bytes);
-
-        let total_length = text.len();
+        let total_len = text.len();
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Apply offset and max_chars slicing
+        let effective_text: String = text
+            .chars()
+            .skip(params.offset)
+            .take(params.max_chars)
+            .collect();
+        let effective_len = effective_text.len();
+
+        let pagination =
+            gthings_common::pagination::build_pagination(params, url, total_len, effective_len);
 
         // Extract PDF metadata
         let pdf_meta = extract_pdf_info_metadata(bytes).or_else(|| extract_pdf_xmp_metadata(bytes));
@@ -77,18 +96,29 @@ impl PdfExtractor {
             .and_then(|m| m.creator.clone())
             .unwrap_or_default();
 
-        let q_score = compute_readability_score(&text, total_length);
+        let q_score = compute_readability_score(&effective_text, effective_len);
         let mut quality_reasons = Vec::new();
-        if total_length <= 500 {
+        if effective_len <= 500 {
             quality_reasons.push("too_short".into());
         }
-        if q_score <= 0.3 && total_length > 500 {
+        if q_score <= 0.3 && effective_len > 500 {
             quality_reasons.push("readability_artifacts".into());
         }
         let quality = QualityScore {
             score: crate::article::round_score(q_score),
             is_ok: q_score >= 0.5,
             reasons: quality_reasons,
+            entropy_bits_per_char: 0.0,
+        };
+
+        let now = chrono::Utc::now();
+        let provenance = Provenance {
+            source_url: url.to_string(),
+            method: ProvenanceMethod::Pdf,
+            agent: gthings_common::GTHINGS_AGENT.into(),
+            accessed_at: now,
+            duration_ms,
+            derived_from: None,
         };
 
         Ok(Article {
@@ -106,24 +136,26 @@ impl PdfExtractor {
             extraction: ExtractionInfo {
                 method: ExtractionMethod::PdfText,
                 confidence: quality.score,
-                accessed_at: chrono::Utc::now().to_rfc3339(),
+                accessed_at: now.to_rfc3339(),
                 duration_ms,
             },
             body: ContentTree::Pdf {
                 pages,
-                text,
+                text: effective_text,
                 has_toc: false,
             },
             signals: ContinuationSignals {
-                truncated: false,
-                total_length,
-                returned_length: total_length,
+                truncated: pagination.truncated,
+                total_length: total_len,
+                returned_length: effective_len,
                 is_paywall: false,
                 is_bot_blocked: false,
-                is_empty_shell: total_length < 200,
+                is_empty_shell: total_len < 200,
                 related_urls: Vec::new(),
             },
             quality,
+            provenance: Some(provenance),
+            pagination: Some(pagination),
         })
     }
 
@@ -208,9 +240,13 @@ fn compute_readability_score(text: &str, total_length: usize) -> f64 {
 impl Extractor for PdfExtractor {
     type Input = (String, Vec<u8>);
 
-    async fn extract(&self, input: (String, Vec<u8>)) -> Result<Article, ExtractionError> {
+    async fn extract(
+        &self,
+        input: (String, Vec<u8>),
+        params: ExtractParams,
+    ) -> Result<Article, ExtractionError> {
         let (url, bytes) = input;
-        self.extract_article(&url, &bytes)
+        self.extract_article(&url, &bytes, &params)
     }
 
     fn method(&self) -> ExtractionMethod {

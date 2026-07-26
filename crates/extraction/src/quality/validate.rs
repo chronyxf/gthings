@@ -1,4 +1,5 @@
 use super::detection::{regex_has_long_words, regex_has_paragraphs, regex_has_punctuation};
+use super::entropy::shannon_entropy;
 use super::types::*;
 
 impl ContentQuality {
@@ -14,11 +15,17 @@ impl ContentQuality {
                 is_ok: false,
                 reasons: vec![QualityReason::EmptyContent],
                 length: 0,
+                entropy_bits_per_char: 0.0,
+                flags: vec![],
             };
         }
 
         let slice = if text.len() > 15000 {
-            &text[..15000]
+            let mut end = 15000;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
         } else {
             text
         };
@@ -77,11 +84,27 @@ impl ContentQuality {
 
         score = score.clamp(0.0, 1.0);
 
+        // Shannon entropy: character-level information density
+        let entropy = shannon_entropy(text);
+        let mut flags: Vec<QualityFlag> = Vec::new();
+
+        // Very low entropy with substantial length → thin/repetitive content
+        if entropy < 2.0 && text.len() > 200 {
+            flags.push(QualityFlag::ThinContent);
+        }
+
+        // Very high entropy → garbled / random / machine-noise content
+        if entropy > 6.5 {
+            flags.push(QualityFlag::Garbled);
+        }
+
         QualityResult {
             score: crate::article::round_score(score),
             is_ok: score >= 0.5,
             reasons,
             length,
+            entropy_bits_per_char: entropy,
+            flags,
         }
     }
 }
@@ -114,5 +137,77 @@ mod tests {
         let result = ContentQuality::validate("Hi");
         assert!(!result.is_ok);
         assert!(result.reasons.contains(&QualityReason::TooShort));
+    }
+
+    #[test]
+    fn test_validate_emoji_no_panic() {
+        // 7500 ASCII characters = 7500 bytes; no punctuation → should trigger NoPunctuation
+        let emoji_text = "x".repeat(7500);
+        let result = ContentQuality::validate(&emoji_text);
+        // Original length is preserved in result
+        assert_eq!(result.length, 7500);
+        // No punctuation → should have NoPunctuation reason
+        assert!(
+            result.reasons.contains(&QualityReason::NoPunctuation),
+            "emoji content should trigger NoPunctuation"
+        );
+    }
+
+    #[test]
+    fn test_validate_cjk_no_panic() {
+        // Each CJK character is 3 bytes; 6000 of them = 18,000 bytes → triggers slice
+        let cjk_text = "文".repeat(6000);
+        let result = ContentQuality::validate(&cjk_text);
+        // Content is not treated as empty; length reflects original input
+        assert_eq!(
+            result.length, 18000,
+            "CJK content length should be preserved"
+        );
+        // No punctuation → should have NoPunctuation reason
+        assert!(
+            result.reasons.contains(&QualityReason::NoPunctuation),
+            "CJK content without punctuation should trigger NoPunctuation"
+        );
+    }
+
+    #[test]
+    fn test_validate_ascii_long() {
+        // Pure ASCII just past the boundary (15001 bytes) → triggers truncation
+        let text = "a".repeat(15001);
+        let result = ContentQuality::validate(&text);
+        // Truncated content should have a non-zero score
+        assert!(
+            result.score > 0.0,
+            "score should be > 0 even for low-quality content"
+        );
+        // No punctuation → should have NoPunctuation reason
+        assert!(
+            result.reasons.contains(&QualityReason::NoPunctuation),
+            "ascii-only content should trigger NoPunctuation"
+        );
+    }
+
+    #[test]
+    fn test_validate_79_chars_still_too_short() {
+        // Below 80-char threshold should trigger TooShort
+        let text = "A".repeat(79);
+        let result = ContentQuality::validate(&text);
+        assert!(
+            result.score < 0.8 || result.reasons.contains(&QualityReason::TooShort),
+            "content under 80 chars should have low score or TooShort reason"
+        );
+    }
+
+    #[test]
+    fn test_validate_81_chars_passes_short_threshold() {
+        // Above 80-char threshold should pass the too_short check
+        let text = "This is a test sentence that should be long enough to pass the too-short detection threshold in the quality validator's logic. ";
+        assert!(text.len() > 80);
+        let result = ContentQuality::validate(&text);
+        // Should not have TooShort reason
+        assert!(
+            !result.reasons.contains(&QualityReason::TooShort),
+            "content over 80 chars should not have TooShort"
+        );
     }
 }

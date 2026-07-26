@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use gthings_common::pagination::Pagination;
+use gthings_common::provenance::Provenance;
 use serde::{Deserialize, Serialize};
 
 /// The root content type returned by every extractor.
@@ -12,6 +14,10 @@ pub struct Article {
     pub body: ContentTree,
     pub signals: ContinuationSignals,
     pub quality: QualityScore,
+    /// Provenance chain: how this content was discovered/acquired.
+    pub provenance: Option<Provenance>,
+    /// Pagination state: offset, truncation, continuation token.
+    pub pagination: Option<Pagination>,
 }
 
 /// Provenance metadata about the source.
@@ -94,6 +100,11 @@ pub struct QualityScore {
     pub score: f64,  // 0.0-1.0
     pub is_ok: bool, // score >= 0.5
     pub reasons: Vec<String>,
+    /// Character-level Shannon entropy (bits/char) of extracted text.
+    /// High entropy suggests varied/garbled text; low entropy suggests
+    /// repetitive/thin content. Set to 0.0 when unavailable.
+    #[serde(default)]
+    pub entropy_bits_per_char: f32,
 }
 
 /// Errors that can occur during extraction.
@@ -269,14 +280,14 @@ pub fn format_as_markdown(article: &Article) -> String {
 
     // Signals / warnings
     if article.signals.is_empty_shell {
-        md.push_str("\n> ⚠️ **Warning:** This content appears to be an empty shell (navigation chrome only).\n");
+        md.push_str("\n> [!] **Warning:** This content appears to be an empty shell (navigation chrome only).\n");
     }
     if article.signals.is_paywall {
-        md.push_str("\n> 🔒 **Warning:** Paywall detected — content may be incomplete.\n");
+        md.push_str("\n> [LOCKED] **Warning:** Paywall detected — content may be incomplete.\n");
     }
     if article.signals.truncated {
         md.push_str(&format!(
-            "\n> ✂️ **Note:** Content truncated at {} chars (total: {}).\n",
+            "\n> [TRUNCATED] **Note:** Content truncated at {} chars (total: {}).\n",
             article.signals.returned_length, article.signals.total_length
         ));
     }

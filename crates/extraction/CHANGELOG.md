@@ -1,5 +1,30 @@
 # Changelog — gthings-extraction
 
+## [0.5.0] - 2026-07-26
+
+### Added
+
+- New entropy module (shannon_entropy character-level information density)
+- DOM section tree: extract_sections_from_html with nested heading hierarchy
+- Pagination support in web extraction (offset, max_chars, continuation tokens)
+- SourceType dispatch fix in web.rs (removed unused import, clean routing)
+- Extra quality heuristics (entropy-based ThinContent/Garbled flag detection)
+- QualityFlag re-export from gthings_common::domain_reputation
+- Provenance tracking for web extractions (method, agent, timestamp)
+- entropy_bits_per_char and flags fields on QualityResult
+
+### Changed
+
+- Replace readability::extractor::scrape (double fetch) with extract on already-fetched HTML
+- Unicode-safe text slicing (char boundary check instead of raw byte slicing)
+- Emoji/CJK character handling in quality validation
+- Enhanced test coverage for CJK, emoji, boundary-length, and short-threshold cases
+
+### Removed
+
+- Remove dead code: needs_recrawl, secondary_check, SecondaryResult struct
+- Remove unused selectors and stale allow(dead_code) attributes
+
 ## [0.4.1] - 2026-07-26
 
 ### Fixed

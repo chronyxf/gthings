@@ -10,7 +10,7 @@ pub use article::{
     QualityScore, Section, SourceInfo,
 };
 pub use dispatch::AutoExtractor;
-pub use extractor::{Extractor, SourceType};
+pub use extractor::{Extractor, SourceType, domain_authority};
 pub use pdf::PdfExtractor;
 pub use quality::ContentQuality;
 pub use web::WebExtractor;

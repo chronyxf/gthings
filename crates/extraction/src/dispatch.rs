@@ -1,3 +1,6 @@
+use gthings_common::pagination::ExtractParams;
+use gthings_common::provenance::{ExtractionMethod as ProvenanceMethod, Provenance};
+
 use crate::article::{Article, ExtractionError, ExtractionMethod};
 use crate::extractor::{Extractor, SourceType};
 use crate::pdf::PdfExtractor;
@@ -30,20 +33,28 @@ impl AutoExtractor {
     }
 
     /// Extract content from a URL, auto-detecting the source type.
-    pub async fn extract(&self, url: &str) -> Result<Article, ExtractionError> {
+    pub async fn extract(
+        &self,
+        url: &str,
+        params: ExtractParams,
+    ) -> Result<Article, ExtractionError> {
         let source_type = SourceType::from_url(url);
 
         match source_type {
-            SourceType::Arxiv => self.extract_arxiv(url).await,
-            SourceType::Pdf => self.extract_pdf(url).await,
-            SourceType::GitHub => self.extract_github(url).await,
-            SourceType::Web => self.web.extract(url.to_string()).await,
+            SourceType::Arxiv => self.extract_arxiv(url, params).await,
+            SourceType::Pdf => self.extract_pdf(url, params).await,
+            SourceType::GitHub => self.extract_github(url, params).await,
+            SourceType::Web => self.web.extract(url.to_string(), params).await,
         }
     }
 
     /// Handle arXiv URLs: download the PDF for full extraction,
     /// then merge with abstract page metadata.
-    async fn extract_arxiv(&self, url: &str) -> Result<Article, ExtractionError> {
+    async fn extract_arxiv(
+        &self,
+        url: &str,
+        params: ExtractParams,
+    ) -> Result<Article, ExtractionError> {
         // Normalize URL: ensure we have a /pdf/ URL for downloading
         let pdf_url = if url.contains("/abs/") {
             url.replace("/abs/", "/pdf/")
@@ -60,7 +71,7 @@ impl AutoExtractor {
             .to_string();
 
         // Try to download and extract the PDF
-        let pdf_result = self.extract_pdf(&pdf_url).await;
+        let pdf_result = self.extract_pdf(&pdf_url, params.clone()).await;
 
         match pdf_result {
             Ok(mut article) => {
@@ -70,7 +81,9 @@ impl AutoExtractor {
 
                 // Try to get richer metadata from abstract page
                 if article.source.author.is_none() || article.source.published.is_none() {
-                    if let Ok(abs_article) = self.web.extract(abs_url).await {
+                    if let Ok(abs_article) =
+                        self.web.extract(abs_url, ExtractParams::default()).await
+                    {
                         if article.source.author.is_none() {
                             article.source.author = abs_article.source.author;
                         }
@@ -90,7 +103,7 @@ impl AutoExtractor {
             }
             Err(_) => {
                 // Fall back to abstract page HTML extraction
-                let mut article = self.web.extract(abs_url).await?;
+                let mut article = self.web.extract(abs_url, ExtractParams::default()).await?;
                 article.extraction.method = ExtractionMethod::ArxivOai;
                 article.extraction.confidence = crate::article::round_score(article.quality.score);
                 Ok(article)
@@ -99,7 +112,11 @@ impl AutoExtractor {
     }
 
     /// Handle PDF URLs: download bytes, then extract.
-    async fn extract_pdf(&self, url: &str) -> Result<Article, ExtractionError> {
+    async fn extract_pdf(
+        &self,
+        url: &str,
+        params: ExtractParams,
+    ) -> Result<Article, ExtractionError> {
         let resp = self
             .client
             .get(url)
@@ -127,11 +144,15 @@ impl AutoExtractor {
             .map_err(|e| ExtractionError::Http(format!("pdf read: {e}")))?
             .to_vec();
 
-        self.pdf.extract((url.to_string(), bytes)).await
+        self.pdf.extract((url.to_string(), bytes), params).await
     }
 
     /// Handle GitHub URLs: rewrite to raw content URL.
-    async fn extract_github(&self, url: &str) -> Result<Article, ExtractionError> {
+    async fn extract_github(
+        &self,
+        url: &str,
+        params: ExtractParams,
+    ) -> Result<Article, ExtractionError> {
         let raw_url = url
             .replace("github.com", "raw.githubusercontent.com")
             .replace("/blob/", "/");
@@ -154,8 +175,29 @@ impl AutoExtractor {
             .map_err(|e| ExtractionError::Http(format!("github read: {e}")))?;
 
         let language = Self::detect_language(url);
-        let total_length = content.len();
+        let total_len = content.len();
         let line_count = content.lines().count();
+
+        // Apply offset and max_chars slicing
+        let effective_content: String = content
+            .chars()
+            .skip(params.offset)
+            .take(params.max_chars)
+            .collect();
+        let effective_len = effective_content.len();
+
+        let pagination =
+            gthings_common::pagination::build_pagination(&params, url, total_len, effective_len);
+
+        let now = chrono::Utc::now();
+        let provenance = Provenance {
+            source_url: url.to_string(),
+            method: ProvenanceMethod::Github,
+            agent: gthings_common::GTHINGS_AGENT.into(),
+            accessed_at: now,
+            duration_ms: 0,
+            derived_from: None,
+        };
 
         Ok(Article {
             url: url.to_string(),
@@ -170,29 +212,32 @@ impl AutoExtractor {
             extraction: crate::article::ExtractionInfo {
                 method: ExtractionMethod::RawFile,
                 confidence: crate::article::round_score(1.0),
-                accessed_at: chrono::Utc::now().to_rfc3339(),
+                accessed_at: now.to_rfc3339(),
                 duration_ms: 0,
             },
             body: crate::article::ContentTree::Code {
                 language,
-                content,
+                content: effective_content,
                 file_path: url.to_string(),
                 line_count,
             },
             signals: crate::article::ContinuationSignals {
-                truncated: false,
-                total_length,
-                returned_length: total_length,
+                truncated: pagination.truncated,
+                total_length: total_len,
+                returned_length: effective_len,
                 is_paywall: false,
                 is_bot_blocked: false,
-                is_empty_shell: total_length < 50,
+                is_empty_shell: total_len < 50,
                 related_urls: Vec::new(),
             },
             quality: crate::article::QualityScore {
                 score: crate::article::round_score(0.9),
                 is_ok: true,
                 reasons: vec![],
+                entropy_bits_per_char: 0.0,
             },
+            provenance: Some(provenance),
+            pagination: Some(pagination),
         })
     }
 
@@ -268,6 +313,30 @@ mod tests {
     fn test_detect_language_javascript() {
         assert_eq!(
             AutoExtractor::detect_language("https://github.com/user/repo/blob/main/app.js"),
+            "javascript"
+        );
+    }
+
+    #[test]
+    fn test_detect_language_case_insensitive() {
+        // Extension matching is case-sensitive; recognized lowercase extensions work
+        assert_eq!(AutoExtractor::detect_language("file.rs"), "rust");
+        assert_eq!(AutoExtractor::detect_language("file.py"), "python");
+        assert_eq!(AutoExtractor::detect_language("file.md"), "markdown");
+    }
+
+    #[test]
+    fn test_detect_language_no_extension() {
+        // Files without an extension return the filename as the "language"
+        assert_eq!(AutoExtractor::detect_language("file"), "file");
+        assert_eq!(AutoExtractor::detect_language(""), "");
+    }
+
+    #[test]
+    fn test_detect_language_with_query() {
+        // URL with query params should still detect language
+        assert_eq!(
+            AutoExtractor::detect_language("script.js?version=2"),
             "javascript"
         );
     }

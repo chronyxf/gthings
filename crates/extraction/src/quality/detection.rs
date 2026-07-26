@@ -1,7 +1,22 @@
+//! Server-side quality detection on extracted text.
+//!
+//! # In-browser pre-check (keep in sync)
+//!
+//! An equivalent (but lighter) JS snippet runs in the browser immediately
+//! after navigation via [`Session::check_page_signals`] (in `cdp/src/session.rs`).
+//! That snippet detects BotWall, Captcha, and Paywall using DOM queries
+//! before the full extraction JS runs.
+//!
+//! The pattern lists below should be kept in sync with the JS snippet
+//! (replicated in `cdp/src/session.rs`).
+//!
+//! When adding new patterns here, add corresponding DOM / text selectors
+//! to the JS snippet so the early pre-check catches them too.
+
 use regex::Regex;
 use std::sync::OnceLock;
 
-use super::types::{ContentQuality, QualityReason, QualityResult, SecondaryResult};
+use super::types::{ContentQuality, QualityReason};
 
 impl ContentQuality {
     /// Error page patterns (shared with detect methods).
@@ -104,113 +119,11 @@ impl ContentQuality {
         }
 
         // Fewer than 10 words — likely navigation chrome only
-        let words: Vec<&str> = text.split_whitespace().collect();
-        if words.len() < 10 {
+        if text.split_whitespace().count() < 10 {
             return true;
         }
 
         false
-    }
-
-    /// Whether a URL should be recrawled with different parameters.
-    pub fn needs_recrawl(result: &QualityResult) -> bool {
-        // Very low quality — definitely retry
-        if result.score < 0.3 {
-            return true;
-        }
-
-        // Borderline — retry if the reason suggests a params issue
-        if result.score < 0.5 {
-            let retryable = [
-                QualityReason::TooShort,
-                QualityReason::TooFewWords,
-                QualityReason::NavigationChrome,
-            ];
-            if result.reasons.iter().any(|r| retryable.contains(r)) {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// Secondary check on already-cleaned content (truncation, repetition, sparseness).
-    pub fn secondary_check(text: &str) -> SecondaryResult {
-        if text.is_empty() {
-            return SecondaryResult {
-                truncated: false,
-                repetitive: false,
-                sparse: true,
-                suspicious_short: false,
-            };
-        }
-
-        let mut truncated = false;
-        let mut repetitive = false;
-        let mut sparse = false;
-        let mut suspicious_short = false;
-
-        // Ends mid-sentence
-        let trimmed = text.trim();
-        if trimmed.len() > 100 {
-            let last_char = trimmed.chars().last().unwrap_or(' ');
-            let second_last = trimmed.chars().rev().nth(1).unwrap_or(' ');
-            if last_char.is_ascii_alphanumeric()
-                && !(second_last == '.'
-                    || second_last == '!'
-                    || second_last == '?'
-                    || last_char == '.'
-                    || last_char == '!'
-                    || last_char == '?')
-            {
-                truncated = true;
-            }
-        }
-
-        // Suspicious short content
-        if text.len() < 80 {
-            static SUS_RE: OnceLock<Regex> = OnceLock::new();
-            let sus_re = SUS_RE.get_or_init(|| {
-                Regex::new(
-                    "(?i)(redirect|click here|\
-                     please continue|click to continue|continue to next|\
-                     loading|please wait)",
-                )
-                .expect("valid regex")
-            });
-            if sus_re.is_match(text) {
-                suspicious_short = true;
-            }
-        }
-
-        // Sparse content
-        let words: Vec<&str> = text.split_whitespace().collect();
-        if words.len() < 20 && !text.is_empty() {
-            sparse = true;
-        }
-
-        // Repetitive content
-        let sentences: Vec<&str> = text
-            .split(['.', '!', '?'])
-            .filter(|s| s.trim().len() > 20)
-            .collect();
-
-        if sentences.len() > 3 {
-            let mut unique = std::collections::HashSet::new();
-            for s in &sentences {
-                unique.insert(s.trim().to_lowercase());
-            }
-            if unique.len() < (sentences.len() as f64 * 0.5) as usize {
-                repetitive = true;
-            }
-        }
-
-        SecondaryResult {
-            truncated,
-            repetitive,
-            sparse,
-            suspicious_short,
-        }
     }
 }
 
@@ -280,65 +193,5 @@ mod tests {
         assert!(!ContentQuality::detect_empty_shell(
             "This is a sufficiently long text with many words that should not be detected as an empty shell."
         ));
-    }
-
-    #[test]
-    fn test_needs_recrawl() {
-        let low = QualityResult {
-            score: 0.2,
-            is_ok: false,
-            reasons: vec![QualityReason::TooShort],
-            length: 10,
-        };
-        assert!(ContentQuality::needs_recrawl(&low));
-
-        let borderline = QualityResult {
-            score: 0.4,
-            is_ok: false,
-            reasons: vec![QualityReason::TooShort],
-            length: 50,
-        };
-        assert!(ContentQuality::needs_recrawl(&borderline));
-
-        let bad_reason = QualityResult {
-            score: 0.4,
-            is_ok: false,
-            reasons: vec![QualityReason::PaywallTeaser],
-            length: 50,
-        };
-        assert!(!ContentQuality::needs_recrawl(&bad_reason));
-
-        let good = QualityResult {
-            score: 0.7,
-            is_ok: true,
-            reasons: vec![],
-            length: 1000,
-        };
-        assert!(!ContentQuality::needs_recrawl(&good));
-    }
-
-    #[test]
-    fn test_secondary_check_truncated() {
-        let result = ContentQuality::secondary_check(
-            "This is a long enough sentence that does not end properly here"
-                .to_string()
-                .repeat(3)
-                .as_str(),
-        );
-        // Content greater than 100 chars, last char is alphanumeric, not ending in punctuation
-        assert!(result.truncated);
-    }
-
-    #[test]
-    fn test_secondary_check_repetitive() {
-        let text = "This is a long sentence that appears many times. This is a long sentence that appears many times. This is a long sentence that appears many times. This is a long sentence that appears many times.";
-        let result = ContentQuality::secondary_check(text);
-        assert!(result.repetitive);
-    }
-
-    #[test]
-    fn test_secondary_check_sparse() {
-        let result = ContentQuality::secondary_check("Just a few words");
-        assert!(result.sparse);
     }
 }

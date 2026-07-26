@@ -1,3 +1,9 @@
+/// Quality flag for domain-level reputation tracking.
+///
+/// Re-exported from `gthings_common` to make it available under
+/// `gthings_extraction::QualityFlag`.
+pub use gthings_common::domain_reputation::QualityFlag;
+
 /// Reason for a quality check failure.
 ///
 /// Used in [`QualityResult::reasons`] to indicate why content failed
@@ -39,19 +45,10 @@ pub struct QualityResult {
     pub reasons: Vec<QualityReason>,
     /// Length of the input text that was validated.
     pub length: usize,
-}
-
-/// Result of a secondary quality check.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SecondaryResult {
-    /// Content ends mid-sentence without sentence-ending punctuation.
-    pub truncated: bool,
-    /// Content contains repetitive sentences (unique < 50% of total).
-    pub repetitive: bool,
-    /// Content has low word density (< 20 words).
-    pub sparse: bool,
-    /// Content is suspiciously short with redirect/loading patterns.
-    pub suspicious_short: bool,
+    /// Character-level Shannon entropy (bits/char) of the extracted text.
+    pub entropy_bits_per_char: f32,
+    /// Domain-level quality flags derived from content analysis (e.g., ThinContent, Garbled).
+    pub flags: Vec<QualityFlag>,
 }
 
 /// Content quality validation — all methods are stateless.
