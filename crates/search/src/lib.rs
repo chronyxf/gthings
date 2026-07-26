@@ -12,8 +12,14 @@
 
 pub mod batch;
 pub mod follow;
+pub mod harvest;
 pub mod search;
 
 pub use batch::BatchProcessor;
 pub use follow::{FollowResult, follow};
+pub use gthings_common::domain_reputation::DomainReputation;
+pub use harvest::{
+    BatchHarvestRequest, BodyStatus, DedupStrategy, HarvestRunSummary, HarvestWarning,
+    HarvestedResult, QueryCoverage, RankStrategy, harvest,
+};
 pub use search::{SearchResult, search};

@@ -1,5 +1,17 @@
 # Changelog — gthings-search
 
+## 0.6.0 (2026-07-26)
+
+### Added
+- New harvest pipeline: search→dedup→rank→follow→quality in one command
+- BodyStatus enum: ok, pdf_unextracted, extract_failed, chrome_or_empty, snippet_only
+- HarvestRunSummary with coverage_by_query and warnings for agent triage
+- select_follow_candidates with per-query minimum, per-host cap, junk URL filter
+- quality reasons always non-empty when score low (bot_blocked, paywall, captcha, etc.)
+- Dedup_key URL normalization with fragment/tracking-param stripping
+- Direct tests for normalize_url, is_junk_url, composite rank correctness
+- Follow quality flag detection tests (bot/paywall/captcha/empty)
+
 ## 0.5.0 (2026-07-25)
 
 ### Breaking Changes

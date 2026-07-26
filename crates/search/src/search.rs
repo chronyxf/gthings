@@ -3,16 +3,25 @@
 //! Uses attribute-based selectors (`a[href]` filtered by hostname) resilient
 //! to Google class name changes.
 
-use gthings_cdp::{CdpError, Session, Tab};
-use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
-/// A single Google search result.
+use chrono::Utc;
+use gthings_cdp::{CdpError, Session, Tab};
+use gthings_common::provenance::{ExtractionMethod, Provenance};
+use serde::{Deserialize, Serialize};
+/// A single Google search result with provenance metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
     pub position: usize,
+    /// How and when this result was obtained.
+    #[serde(default)]
+    pub provenance: Provenance,
+    /// Domain authority score (0.0–1.0) for the result URL's host.
+    #[serde(default)]
+    pub domain_authority: f32,
 }
 
 /// Execute a Google search via CDP.
@@ -20,6 +29,10 @@ pub struct SearchResult {
 /// Navigates to Google SERP, waits for network idle via lifecycle events,
 /// then extracts organic results using in-browser JavaScript with
 /// attribute-based selectors.
+///
+/// If the search returns zero results, the query is **retried once** with a
+/// trailing space appended. Google sometimes penalizes bare queries; the
+/// trailing space can bypass this.
 ///
 /// # Arguments
 ///
@@ -33,6 +46,26 @@ pub async fn search(
     query: &str,
     count: usize,
 ) -> Result<Vec<SearchResult>, CdpError> {
+    let results = search_once(session, tab, query, count).await?;
+    if results.is_empty() {
+        // Retry ONCE with trailing space — Google sometimes returns zero
+        // results for bare queries that work with a trailing space.
+        let spaced = format!("{query} ");
+        search_once(session, tab, &spaced, count).await
+    } else {
+        Ok(results)
+    }
+}
+
+/// Inner search function (single attempt, no retry).
+async fn search_once(
+    session: &Session,
+    tab: &Tab,
+    query: &str,
+    count: usize,
+) -> Result<Vec<SearchResult>, CdpError> {
+    let start = Instant::now();
+
     let params: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("q", query)
         .append_pair("num", &count.to_string())
@@ -68,6 +101,23 @@ JSON.stringify(results);
 
     let result = tab.evaluate(session, &js).await?;
     let json_str = result["result"]["value"].as_str().unwrap_or("[]");
-    let items: Vec<SearchResult> = serde_json::from_str(json_str)?;
+    let mut items: Vec<SearchResult> = serde_json::from_str(json_str)?;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let now = Utc::now();
+
+    for item in &mut items {
+        let host = gthings_common::extract_host(&item.url).unwrap_or_default();
+        item.domain_authority = gthings_extraction::domain_authority(&host);
+        item.provenance = Provenance {
+            source_url: url.clone(),
+            method: ExtractionMethod::Search,
+            agent: gthings_common::GTHINGS_AGENT.into(),
+            accessed_at: now,
+            duration_ms,
+            derived_from: None,
+        };
+    }
+
     Ok(items)
 }
