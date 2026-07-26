@@ -1,11 +1,9 @@
 /// PDF metadata extraction and PdfExtractor API.
 ///
-/// Extracts text via the `pdftotext` CLI (poppler-utils).  No pure-Rust PDF
-/// parser fallback — if pdftotext is unavailable or fails the extraction
-/// returns an `ExtractionError::Empty`.
+/// Extracts text via `pdf-extract` (bundled MuPDF, no system dependencies).
+use pdf_extract::extract_text_from_mem;
 use regex::Regex;
-use std::io::{Read, Write};
-use std::process::Command;
+use std::io::Read;
 use std::time::Instant;
 
 use crate::article::{
@@ -27,7 +25,7 @@ pub struct PdfMetadata {
     pub mod_date: Option<String>,
 }
 
-/// PDF text extractor that delegates to `pdftotext`.
+/// PDF text extractor using `pdf-extract` (bundled MuPDF).
 ///
 /// # Examples
 ///
@@ -41,8 +39,7 @@ pub struct PdfExtractor;
 impl PdfExtractor {
     /// Extract PDF content as an Article.
     ///
-    /// Tries `pdftotext` first; if it fails or is unavailable the extraction
-    /// is considered empty and quality is set to 0.
+    /// Uses `pdf-extract` (bundled MuPDF) to extract text from PDF bytes.
     pub fn extract_article(&self, url: &str, bytes: &[u8]) -> Result<Article, ExtractionError> {
         let start = Instant::now();
 
@@ -50,12 +47,11 @@ impl PdfExtractor {
             return Err(ExtractionError::Parse("not a valid PDF".into()));
         }
 
-        // Try pdftotext only — no pure-Rust fallback
-        let text = match Self::try_pdftotext(bytes) {
+        let text = match Self::try_pdf_extract(bytes) {
             Some(t) => t,
             None => {
                 return Err(ExtractionError::Empty(
-                    "pdftotext failed or not available; no fallback parser".into(),
+                    "pdf-extract could not extract any text from PDF".into(),
                 ));
             }
         };
@@ -145,38 +141,18 @@ impl PdfExtractor {
             .unwrap_or(0)
     }
 
-    /// Try extracting text via the `pdftotext` CLI tool (part of poppler-utils).
+    /// PDF text extraction via `pdf-extract` (bundled MuPDF).
     ///
-    /// Reads PDF bytes on stdin, writes plain text to stdout with proper word
-    /// spacing. Handles TeX-produced and other PDFs where text is positioned
-    /// entirely via the text matrix.
-    ///
-    /// Returns `None` when pdftotext is not installed, the subprocess fails,
-    /// or the output is empty.
-    fn try_pdftotext(bytes: &[u8]) -> Option<String> {
-        let mut child = Command::new("pdftotext")
-            .args(["-", "-"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok()?;
-
-        // Pipe PDF bytes to stdin, then close it
-        if let Some(ref mut stdin) = child.stdin {
-            let _ = stdin.write_all(bytes);
+    /// Parses the PDF in memory and extracts text from all pages.
+    /// Returns `None` when the document cannot be parsed or yields no text.
+    fn try_pdf_extract(bytes: &[u8]) -> Option<String> {
+        match extract_text_from_mem(bytes) {
+            Ok(text) => {
+                let text = text.trim().to_string();
+                if text.is_empty() { None } else { Some(text) }
+            }
+            Err(_) => None,
         }
-
-        let output = child.wait_with_output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        let text = std::str::from_utf8(&output.stdout).ok()?;
-        let text = text.replace('\x0c', "\n"); // replace form-feeds with newlines
-        let text = text.trim().to_string();
-
-        if text.is_empty() { None } else { Some(text) }
     }
 }
 

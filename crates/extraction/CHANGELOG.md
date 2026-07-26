@@ -1,5 +1,11 @@
 # Changelog — gthings-extraction
 
+## [0.4.1] - 2026-07-26
+
+### Fixed
+- Replace pdftotext CLI (poppler-utils) with pdf-extract (bundled MuPDF) for PDF text extraction
+- Fix TeX font extraction failure (Computer Modern fonts in arxiv papers)
+
 ## 0.4.0 (2026-07-26)
 
 ### Breaking Changes
