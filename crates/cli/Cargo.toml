@@ -1,19 +1,22 @@
 [package]
 name = "gthings"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "CLI binary for gthings — browser-automated web research toolkit"
 
 [dependencies]
-gthings-cdp = { path = "../cdp", version = "0.4.14" }
+gthings-cdp = { path = "../cdp", version = "0.4.15" }
 gthings-search = { path = "../search" , version = "0.5.0" }
 clap = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+gthings-extraction = { path = "../extraction", version = "0.4.0" }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
 
 
 [lints]

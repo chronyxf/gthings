@@ -1,5 +1,16 @@
 # Changelog — gthings (CLI)
 
+## 0.6.0 (2026-07-26)
+
+### Breaking Changes
+
+- Replace shell-based REPL with flat CLI subcommands
+- Remove shell.rs (400 lines of shell detection/PATH management)
+- Add commands/ module with 6 subcommand handlers (batch, connect, extract, follow, search, status)
+- Simplify main.rs from 350 lines to ~100-line dispatcher
+- Add `extract` command for auto-detected URL extraction (PDF/GitHub/arXiv/web)
+- Add `pdf` subcommand with url/file targets
+
 ## 0.5.0 (2026-07-25)
 
 ### Breaking Changes
