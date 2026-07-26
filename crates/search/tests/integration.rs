@@ -3,7 +3,20 @@
 //! These tests cover type serialization, ordering, and defaults —
 //! no browser required.
 
+use gthings_common::provenance::{ExtractionMethod, Provenance};
 use gthings_search::{FollowResult, SearchResult};
+
+/// Minimal provenance value used by test helpers.
+fn test_provenance() -> Provenance {
+    Provenance {
+        source_url: "".to_string(),
+        method: ExtractionMethod::Search,
+        agent: "gthings/test".to_string(),
+        accessed_at: chrono::Utc::now(),
+        duration_ms: 0,
+        derived_from: None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SearchResult
@@ -16,6 +29,8 @@ fn test_search_result_serde() {
         url: "https://www.rust-lang.org".into(),
         snippet: "A language empowering everyone to build reliable software.".into(),
         position: 1,
+        domain_authority: 0.0,
+        provenance: test_provenance(),
     };
 
     let json = serde_json::to_string(&result).unwrap();
@@ -37,18 +52,24 @@ fn test_search_result_ordering() {
             url: "https://example.com/c".into(),
             snippet: "".into(),
             position: 3,
+            domain_authority: 0.0,
+            provenance: test_provenance(),
         },
         SearchResult {
             title: "A".into(),
             url: "https://example.com/a".into(),
             snippet: "".into(),
             position: 1,
+            domain_authority: 0.0,
+            provenance: test_provenance(),
         },
         SearchResult {
             title: "B".into(),
             url: "https://example.com/b".into(),
             snippet: "".into(),
             position: 2,
+            domain_authority: 0.0,
+            provenance: test_provenance(),
         },
     ];
 
@@ -75,23 +96,33 @@ fn test_empty_search_results() {
 
 #[test]
 fn test_follow_result_serde() {
+    use gthings_common::pagination::Pagination;
+
+    let pagination = Some(Pagination {
+        offset: 0,
+        returned_len: 49,
+        total_len: Some(49),
+        truncated: false,
+        continuation_token: None,
+    });
     let result = FollowResult {
         url: "https://example.com".into(),
         title: "Example Domain".into(),
         content: "This domain is for use in illustrative examples.".into(),
-        truncated: false,
         error: String::new(),
+        provenance: test_provenance(),
+        pagination: pagination.clone(),
     };
 
     let json = serde_json::to_string(&result).unwrap();
     assert!(json.contains("\"url\""));
     assert!(json.contains("\"title\""));
     assert!(json.contains("\"content\""));
-    assert!(json.contains("\"truncated\":false"));
+    assert!(json.contains("\"pagination\""));
 
     let parsed: FollowResult = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.url, "https://example.com");
     assert_eq!(parsed.title, "Example Domain");
-    assert!(!parsed.truncated);
+    assert_eq!(parsed.pagination, pagination);
     assert!(parsed.error.is_empty());
 }
