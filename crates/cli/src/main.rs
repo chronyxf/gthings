@@ -23,6 +23,8 @@ enum Command {
         url: String,
         #[arg(long, default_value = "15000")]
         max_chars: usize,
+        #[arg(long, default_value = "0")]
+        offset: usize,
         #[arg(long)]
         json: bool,
     },
@@ -48,8 +50,26 @@ enum Command {
         url: String,
         #[arg(long, default_value = "15000")]
         max_chars: usize,
+        #[arg(long, default_value = "0")]
+        offset: usize,
         #[arg(long)]
         json: bool,
+    },
+    /// Harvest: search → dedup → rank → follow (full research pipeline)
+    Harvest {
+        queries: Vec<String>,
+        #[arg(long, default_value = "url")]
+        dedup: String,
+        #[arg(long, default_value = "composite")]
+        rank: String,
+        #[arg(long, default_value = "8")]
+        follow_top: usize,
+        #[arg(long, default_value = "15000")]
+        max_chars: usize,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "20")]
+        warn_tabs: usize,
     },
     /// Extract text from a PDF
     Pdf {
@@ -63,12 +83,20 @@ enum PdfCommand {
     /// Extract text from PDF at URL
     Url {
         url: String,
+        #[arg(long, default_value = "15000")]
+        max_chars: usize,
+        #[arg(long, default_value = "0")]
+        offset: usize,
         #[arg(long)]
         json: bool,
     },
     /// Extract text from local PDF file
     File {
         path: std::path::PathBuf,
+        #[arg(long, default_value = "15000")]
+        max_chars: usize,
+        #[arg(long, default_value = "0")]
+        offset: usize,
         #[arg(long)]
         json: bool,
     },
@@ -92,8 +120,9 @@ async fn main() {
         Command::Follow {
             url,
             max_chars,
+            offset,
             json,
-        } => commands::cmd_follow(&url, max_chars, json).await,
+        } => commands::cmd_follow(&url, max_chars, offset, json).await,
         Command::Batch {
             queries,
             count,
@@ -101,14 +130,37 @@ async fn main() {
             max_chars,
             json,
         } => commands::cmd_batch(queries, count, follow, max_chars, json).await,
+        Command::Harvest {
+            queries,
+            dedup,
+            rank,
+            follow_top,
+            max_chars,
+            json,
+            warn_tabs,
+        } => {
+            commands::cmd_harvest(queries, dedup, rank, follow_top, max_chars, json, warn_tabs)
+                .await
+        }
         Command::Extract {
             url,
             max_chars,
+            offset,
             json,
-        } => commands::cmd_extract(&url, max_chars, json).await,
+        } => commands::cmd_extract(&url, max_chars, offset, json).await,
         Command::Pdf { command } => match command {
-            PdfCommand::Url { url, json } => commands::cmd_pdf_url(&url, json).await,
-            PdfCommand::File { path, json } => commands::cmd_pdf_file(&path, json).await,
+            PdfCommand::Url {
+                url,
+                max_chars,
+                offset,
+                json,
+            } => commands::cmd_pdf_url(&url, max_chars, offset, json).await,
+            PdfCommand::File {
+                path,
+                max_chars,
+                offset,
+                json,
+            } => commands::cmd_pdf_file(&path, max_chars, offset, json).await,
         },
     };
     std::process::exit(code);

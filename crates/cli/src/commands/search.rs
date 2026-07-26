@@ -1,7 +1,8 @@
 //! `gthings search` — search Google via CDP browser.
 
-use crate::commands::{connect, on_cdp_error, print_error};
 use gthings_search::search;
+
+use crate::commands::{connect, on_cdp_error, print_error};
 
 /// Search: detect → connect → create tab → search → close tab → disconnect.
 pub(crate) async fn cmd_search(query: &str, count: usize, json: bool) -> i32 {
@@ -54,7 +55,20 @@ pub(crate) async fn cmd_search(query: &str, count: usize, json: bool) -> i32 {
         println!("{}", output);
     } else {
         for r in &results {
-            println!("#{} {} — {}", r.position, r.title, r.url);
+            let authority = r.domain_authority;
+            let stars = if authority >= 0.9 {
+                "***"
+            } else if authority >= 0.8 {
+                "**"
+            } else if authority >= 0.7 {
+                "*"
+            } else {
+                ""
+            };
+            println!(
+                "#{} {} — {}  [{:.1}{}]",
+                r.position, r.title, r.url, authority, stars
+            );
             if !r.snippet.is_empty() {
                 println!("  {}", r.snippet);
             }

@@ -1,10 +1,12 @@
 //! `gthings follow` — navigate to a URL and extract page content via CDP.
 
-use crate::commands::{connect, on_cdp_error, print_error};
+use gthings_common::pagination::ExtractParams;
 use gthings_search::follow;
 
+use crate::commands::{connect, on_cdp_error, print_error};
+
 /// Follow: detect → connect → create tab → follow → close tab → disconnect.
-pub(crate) async fn cmd_follow(url: &str, max_chars: usize, json: bool) -> i32 {
+pub(crate) async fn cmd_follow(url: &str, max_chars: usize, offset: usize, json: bool) -> i32 {
     let session = match connect().await {
         Ok(s) => s,
         Err(c) => return c,
@@ -25,7 +27,8 @@ pub(crate) async fn cmd_follow(url: &str, max_chars: usize, json: bool) -> i32 {
         }
     };
 
-    let result = match follow(&session, &tab, url, max_chars).await {
+    let params = ExtractParams { offset, max_chars };
+    let result = match follow(&session, &tab, url, params, None).await {
         Ok(r) => r,
         Err(e) => {
             if let Err(e) = session.close_tab(tab).await {
@@ -46,6 +49,8 @@ pub(crate) async fn cmd_follow(url: &str, max_chars: usize, json: bool) -> i32 {
         tracing::warn!("disconnect failed: {e}");
     }
 
+    let truncated = result.pagination.as_ref().is_some_and(|p| p.truncated);
+
     if json {
         let output = serde_json::to_string(&result).unwrap_or_else(|e| {
             tracing::error!("serialize output failed: {e}");
@@ -55,7 +60,11 @@ pub(crate) async fn cmd_follow(url: &str, max_chars: usize, json: bool) -> i32 {
     } else {
         println!("Title: {}", result.title);
         println!("URL: {}", result.url);
-        if result.truncated {
+        println!(
+            "Provenance: {:?} via {} ({}ms)",
+            result.provenance.method, result.provenance.agent, result.provenance.duration_ms,
+        );
+        if truncated {
             println!("Content (truncated to {max_chars} chars):");
         } else {
             println!("Content:");

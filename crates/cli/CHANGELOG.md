@@ -1,5 +1,17 @@
 # Changelog — gthings (CLI)
 
+## 0.6.1 (2026-07-26)
+
+### Added
+- New harvest subcommand: full research pipeline with --follow-top, --dedup, --rank
+- Updated skill files for AI agent consumption (agents + opencode)
+
+### Changed
+- Fix import ordering (crate before external) across all command files
+- Fix enum variant paths in harvest.rs to use short form
+- Replace ⚠ emoji with [!] in warning output strings
+- Fix silent JSON serialization failure handling in extract.rs
+
 ## 0.6.0 (2026-07-26)
 
 ### Breaking Changes

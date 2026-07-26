@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
-use crate::commands::{connect, print_error};
 use gthings_search::BatchProcessor;
+
+use crate::commands::{connect, print_error};
 
 /// Batch: detect → connect → batch → disconnect.
 ///
@@ -29,6 +30,7 @@ pub(crate) async fn cmd_batch(
         count,
         do_follow,
         max_chars,
+        None,
     )
     .await
     {
@@ -60,7 +62,10 @@ pub(crate) async fn cmd_batch(
         for (i, results) in all_results.iter().enumerate() {
             println!("Query #{}:", i + 1);
             for r in results {
-                println!("  #{} {} — {}", r.position, r.title, r.url);
+                println!(
+                    "  #{} {} — {}  [{:.1}]",
+                    r.position, r.title, r.url, r.domain_authority
+                );
                 if !r.snippet.is_empty() {
                     println!("    {}", r.snippet);
                 }

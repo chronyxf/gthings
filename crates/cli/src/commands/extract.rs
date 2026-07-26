@@ -1,27 +1,32 @@
 //! `gthings extract` and `gthings pdf` — content extraction from URLs, PDFs.
 
 use crate::commands::print_error;
+use gthings_common::pagination::ExtractParams;
+use gthings_extraction::PdfExtractor;
+use gthings_extraction::article::format_as_markdown;
+use gthings_extraction::dispatch::AutoExtractor;
 
 /// Extract content from any URL using auto-detection.
-pub(crate) async fn cmd_extract(url: &str, _max_chars: usize, json: bool) -> i32 {
-    use gthings_extraction::dispatch::AutoExtractor;
-
+pub(crate) async fn cmd_extract(url: &str, max_chars: usize, offset: usize, json: bool) -> i32 {
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; gthings/0.5)")
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .expect("valid client config");
+        .expect("reqwest Client::builder() with default config should never fail");
 
     let extractor = AutoExtractor::new(client);
-    match extractor.extract(url).await {
+    let params = ExtractParams { offset, max_chars };
+    match extractor.extract(url, params).await {
         Ok(article) => {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&article).unwrap_or_default()
+                    serde_json::to_string_pretty(&article).unwrap_or_else(|e| {
+                        tracing::error!("JSON serialization failed: {e}");
+                        String::new()
+                    })
                 );
             } else {
-                use gthings_extraction::article::format_as_markdown;
                 println!("{}", format_as_markdown(&article));
             }
             0
@@ -38,14 +43,12 @@ pub(crate) async fn cmd_extract(url: &str, _max_chars: usize, json: bool) -> i32
 }
 
 /// Extract text from PDF at URL.
-pub(crate) async fn cmd_pdf_url(url: &str, json: bool) -> i32 {
-    use gthings_extraction::PdfExtractor;
-
+pub(crate) async fn cmd_pdf_url(url: &str, max_chars: usize, offset: usize, json: bool) -> i32 {
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; gthings/0.5)")
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .expect("valid client config");
+        .expect("reqwest Client::builder() with default config should never fail");
 
     let resp = match client.get(url).send().await {
         Ok(r) => r,
@@ -73,15 +76,18 @@ pub(crate) async fn cmd_pdf_url(url: &str, json: bool) -> i32 {
     };
 
     let extractor = PdfExtractor;
-    match extractor.extract_article(url, &bytes) {
+    let params = ExtractParams { offset, max_chars };
+    match extractor.extract_article(url, &bytes, &params) {
         Ok(article) => {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&article).unwrap_or_default()
+                    serde_json::to_string_pretty(&article).unwrap_or_else(|e| {
+                        tracing::error!("JSON serialization failed: {e}");
+                        String::new()
+                    })
                 );
             } else {
-                use gthings_extraction::article::format_as_markdown;
                 println!("{}", format_as_markdown(&article));
             }
             0
@@ -94,9 +100,12 @@ pub(crate) async fn cmd_pdf_url(url: &str, json: bool) -> i32 {
 }
 
 /// Extract text from local PDF file.
-pub(crate) async fn cmd_pdf_file(path: &std::path::Path, json: bool) -> i32 {
-    use gthings_extraction::PdfExtractor;
-
+pub(crate) async fn cmd_pdf_file(
+    path: &std::path::Path,
+    max_chars: usize,
+    offset: usize,
+    json: bool,
+) -> i32 {
     let bytes = match tokio::fs::read(path).await {
         Ok(b) => b,
         Err(e) => {
@@ -107,15 +116,18 @@ pub(crate) async fn cmd_pdf_file(path: &std::path::Path, json: bool) -> i32 {
 
     let url = format!("file://{}", path.display());
     let extractor = PdfExtractor;
-    match extractor.extract_article(&url, &bytes) {
+    let params = ExtractParams { offset, max_chars };
+    match extractor.extract_article(&url, &bytes, &params) {
         Ok(article) => {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&article).unwrap_or_default()
+                    serde_json::to_string_pretty(&article).unwrap_or_else(|e| {
+                        tracing::error!("JSON serialization failed: {e}");
+                        String::new()
+                    })
                 );
             } else {
-                use gthings_extraction::article::format_as_markdown;
                 println!("{}", format_as_markdown(&article));
             }
             0
