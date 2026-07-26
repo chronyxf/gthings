@@ -1,6 +1,6 @@
 # gthings
 
-Browser automation and web research toolkit. Single Rust binary, zero runtime dependencies.
+Single Rust binary, zero external dependencies.
 
 ## Architecture
 
