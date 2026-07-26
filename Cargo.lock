@@ -110,12 +110,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "async-trait"
 version = "0.1.91"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -689,9 +683,9 @@ dependencies = [
 name = "gthings"
 version = "0.6.0"
 dependencies = [
- "anyhow",
  "clap",
  "gthings-cdp",
+ "gthings-common",
  "gthings-extraction",
  "gthings-search",
  "reqwest 0.12.28",
@@ -706,6 +700,7 @@ name = "gthings-cdp"
 version = "0.4.15"
 dependencies = [
  "futures-util",
+ "gthings-common",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -719,18 +714,21 @@ dependencies = [
 name = "gthings-common"
 version = "0.3.4"
 dependencies = [
+ "base64 0.21.7",
+ "chrono",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
- "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
 name = "gthings-extraction"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -744,12 +742,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "url",
 ]
 
 [[package]]
 name = "gthings-search"
 version = "0.5.0"
 dependencies = [
+ "chrono",
  "gthings-cdp",
  "gthings-common",
  "gthings-extraction",

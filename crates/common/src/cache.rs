@@ -2,6 +2,8 @@ use std::fs;
 use std::io;
 use std::time::Duration;
 
+use base64::Engine;
+use sha2::{Digest, Sha256};
 use tokio::task;
 
 use crate::error::GthingsError;
@@ -39,7 +41,7 @@ impl Sha256DiskCache {
                 Err(e) => return Err(GthingsError::Io(e)),
             };
 
-            if is_expired(&path, ttl) {
+            if crate::is_file_expired(&path, ttl.as_secs()) {
                 let _ = fs::remove_file(&path);
                 return Ok(None);
             }
@@ -56,9 +58,6 @@ impl Sha256DiskCache {
     /// not a correctness requirement.
     pub async fn set(&self, key: &str, data: &str) {
         let final_path = self.dir.join(format!("{key}.json"));
-        let tmp_path = self
-            .dir
-            .join(format!("{key}.tmp.{}.json", std::process::id()));
         let data = data.to_string();
         let dir = self.dir.clone();
 
@@ -70,18 +69,8 @@ impl Sha256DiskCache {
                 }
             }
 
-            match fs::write(&tmp_path, &data) {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::debug!("cache: failed to write temp file: {e}");
-                    let _ = fs::remove_file(&tmp_path);
-                    return;
-                }
-            }
-
-            if let Err(e) = fs::rename(&tmp_path, &final_path) {
-                tracing::debug!("cache: failed to rename temp file: {e}");
-                let _ = fs::remove_file(&tmp_path);
+            if let Err(e) = crate::atomic_write(&final_path, &data) {
+                tracing::debug!("cache: atomic write failed: {e}");
             }
         })
         .await
@@ -89,22 +78,18 @@ impl Sha256DiskCache {
     }
 }
 
-/// Check if a cache file is older than the TTL via file mtime.
+/// Compute a composite cache key from URL, offset, and max_chars.
 ///
-/// Missing files are treated as expired. Files with inaccessible metadata
-/// are conservatively not expired (do not delete what we cannot verify).
-fn is_expired(path: &std::path::Path, ttl: Duration) -> bool {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            if let Ok(modified) = meta.modified() {
-                if let Ok(elapsed) = modified.elapsed() {
-                    return elapsed > ttl;
-                }
-            }
-            false
-        }
-        Err(_) => true,
-    }
+/// Returns a base64-encoded SHA-256 hash of `url|offset|max_chars`.
+/// This ensures that different pagination states of the same URL produce
+/// distinct cache entries.
+#[allow(dead_code)]
+pub(crate) fn cache_key(url: &str, offset: usize, max_chars: usize) -> String {
+    let mut hasher = Sha256::new();
+    let input = format!("{url}|{offset}|{max_chars}");
+    hasher.update(input.as_bytes());
+    let hash = hasher.finalize();
+    base64::engine::general_purpose::URL_SAFE.encode(hash)
 }
 
 #[cfg(test)]
@@ -126,6 +111,13 @@ mod tests {
         assert_eq!(on_disk, content);
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cache_keys_differ_on_offset() {
+        let key1 = cache_key("https://example.com", 0, 15000);
+        let key2 = cache_key("https://example.com", 15000, 15000);
+        assert_ne!(key1, key2);
     }
 
     #[tokio::test]
