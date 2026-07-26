@@ -94,6 +94,67 @@ fn test_empty_search_results() {
 // FollowResult
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// SearchResult — malformed / edge-case JSON parsing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_search_result_parse_valid() {
+    let json = r#"[
+        {"title":"Rust","url":"https://rust-lang.org","snippet":"Safe","position":1},
+        {"title":"Cargo","url":"https://crates.io","snippet":"Packages","position":2}
+    ]"#;
+    let results: Vec<SearchResult> = serde_json::from_str(json).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].title, "Rust");
+    assert_eq!(results[0].position, 1);
+    assert_eq!(results[1].title, "Cargo");
+    assert_eq!(results[1].position, 2);
+}
+
+#[test]
+fn test_search_result_parse_empty_array() {
+    let results: Vec<SearchResult> = serde_json::from_str("[]").unwrap();
+    assert!(results.is_empty());
+}
+
+#[test]
+fn test_search_result_parse_required_fields() {
+    // All required fields provided; matches the shape produced by the JS.
+    let json = r#"[
+        {"title":"Rust","url":"https://rust-lang.org","snippet":"Safe","position":1}
+    ]"#;
+    let results: Vec<SearchResult> = serde_json::from_str(json).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].title, "Rust");
+    assert_eq!(results[0].url, "https://rust-lang.org");
+    assert_eq!(results[0].snippet, "Safe");
+    assert_eq!(results[0].position, 1);
+}
+
+#[test]
+fn test_search_result_parse_malformed() {
+    let err = serde_json::from_str::<Vec<SearchResult>>("not json");
+    assert!(err.is_err());
+}
+
+#[test]
+fn test_search_result_parse_partial_object() {
+    // Should gracefully handle extra fields and partial data.
+    let json = r#"[
+        {"title":"A","url":"https://a.co","snippet":"desc","position":1,"extra":"ignored"}
+    ]"#;
+    let results: Vec<SearchResult> = serde_json::from_str(json).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].title, "A");
+    assert_eq!(results[0].position, 1);
+    assert!(results[0].domain_authority == 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// FollowResult
+// ---------------------------------------------------------------------------
+
 #[test]
 fn test_follow_result_serde() {
     use gthings_common::pagination::Pagination;

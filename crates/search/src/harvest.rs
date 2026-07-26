@@ -819,7 +819,7 @@ fn rank_results(
 
             // Count how many queries returned each normalized URL
             let mut url_query_count: HashMap<String, usize> = HashMap::new();
-            for (_query, r) in &results {
+            for (_, r) in &results {
                 let norm = normalize_url(&r.url);
                 *url_query_count.entry(norm).or_insert(0) += 1;
             }

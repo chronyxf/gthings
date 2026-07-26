@@ -77,31 +77,43 @@ async fn search_once(
 
     // In-browser JS: iterate all links, skip self-hosted, extract snippet
     // via attribute-based selectors (no brittle class-name dependency).
+    // Includes timing measurement and resilient selector fallbacks.
     let js = format!(
         r#"
+const _st = Date.now();
 const count = {};
 const links = Array.from(document.querySelectorAll('a[href]'));
 const results = [];
 for (const a of links) {{
   try {{
     const url = a.href;
-    const hostname = new URL(url).hostname;
+    let hostname;
+    try {{ hostname = new URL(url).hostname; }} catch(_) {{ continue; }}
     if (hostname === location.hostname) continue;
     const title = a.textContent.trim();
-    if (!title) continue;
-    const snippet = a.closest('div.g, div[data-hveid]')?.querySelector('.VwiC3b, [data-sncf], span.aCOpRe')?.textContent?.trim() || '';
+    if (!title || title.length < 2) continue;
+    const parent = a.closest('div.g, div[data-hveid], div[data-sokoban-container]');
+    const snippetEl = parent?.querySelector('.VwiC3b, [data-sncf], span.aCOpRe, .lEBKkf, span[style*="webkit-line-clamp"]');
+    const snippet = (snippetEl?.textContent || '').trim();
     results.push({{ title, url, snippet, position: results.length + 1 }});
     if (results.length >= count) break;
   }} catch(e) {{ continue; }}
 }}
+console.log('[gthings] search: ' + results.length + ' results in ' + (Date.now() - _st) + 'ms');
 JSON.stringify(results);
 "#,
         count
     );
 
     let result = tab.evaluate(session, &js).await?;
-    let json_str = result["result"]["value"].as_str().unwrap_or("[]");
-    let mut items: Vec<SearchResult> = serde_json::from_str(json_str)?;
+    let raw = result["result"]["value"].as_str();
+    let json_str = raw.unwrap_or("[]");
+    let mut items: Vec<SearchResult> = serde_json::from_str(json_str)
+        .map_err(|e| {
+            let preview = &json_str[..json_str.len().min(200)];
+            tracing::warn!("search: failed to parse results JSON: {e} (preview: {preview:?})");
+            CdpError::Json(e)
+        })?;
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let now = Utc::now();

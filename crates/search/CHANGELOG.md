@@ -1,4 +1,19 @@
-# Changelog — gthings-search
+# Changelog
+
+## [0.7.0] - 
+
+### Added
+- Async SPA rendering polling with await and setTimeout (non-blocking) — JS frameworks can render content while extraction waits
+- Compound content selectors: querySelector('main, article, [role="main"]') with fallback to body
+- Conditional chrome element stripping: nav/footer/header removed only when a semantic container is found
+- textContent fallback when innerText returns fewer than 80 characters (catches CSS-hidden SPA content)
+- try/catch URL parsing and title length validation in search SERP extraction
+- Additional search result selector fallbacks for varied Google SERP layouts
+- 11 new unit tests for FollowResult/ SearchResult JSON parsing and extraction JS format string validation
+
+### Fixed
+- Replaced unused _query variable with bare _ in harvest ranking loop
+- Robust JSON parse error handling with descriptive warnings in follow and search extraction
 
 ## 0.6.0 (2026-07-26)
 
@@ -105,3 +120,4 @@
 - removed #[allow(dead_code)] from unused fields
 - replaced wildcard pub use types::* with explicit re-exports
 - cleaned daemon-tainted doc comments
+
