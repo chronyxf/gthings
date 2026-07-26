@@ -1,14 +1,17 @@
-use crate::connection::{CdpEvent, Connection};
+use crate::connection::{call_async, CdpEvent, Connection};
 use crate::error::{CdpError, Result};
 use crate::tab::Tab;
 use gthings_common::domain_reputation::QualityFlag;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 /// High-level CDP session. Manages connection + tabs with event-driven lifecycle.
 pub struct Session {
     conn: Connection,
+    /// Handle to the background dialog auto-accept task, aborted on disconnect.
+    dialog_handle: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -55,7 +58,48 @@ impl Session {
     /// Connect to browser via WebSocket URL
     pub async fn connect(ws_url: &str) -> Result<Self> {
         let conn = Connection::connect(ws_url).await?;
-        Ok(Session { conn })
+        let dialog_handle = Some(Self::spawn_dialog_handler(&conn));
+        Ok(Session {
+            conn,
+            dialog_handle,
+        })
+    }
+
+    /// Spawn a background task that auto-accepts JavaScript dialogs
+    /// (`alert`, `confirm`, `prompt`, `beforeunload`) by listening for
+    /// `Page.javascriptDialogOpening` events and immediately calling
+    /// `Page.handleJavaScriptDialog` with `accept: true`.
+    fn spawn_dialog_handler(conn: &Connection) -> JoinHandle<()> {
+        let mut rx = conn.event_rx();
+        let write = conn.write_tx();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) if event.method == "Page.javascriptDialogOpening" => {
+                        tracing::debug!(
+                            "Auto-accepting dialog: type={:?}, message={:?}",
+                            event.params.get("type"),
+                            event.params.get("message"),
+                        );
+                        call_async(
+                            &write,
+                            "Page.handleJavaScriptDialog",
+                            serde_json::json!({"accept": true}),
+                            event.session_id,
+                        );
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::debug!("Dialog handler: event channel closed, stopping");
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("Dialog event receiver lagged by {n} messages");
+                        continue;
+                    }
+                }
+            }
+        })
     }
 
     /// Create a new tab/page
@@ -212,7 +256,12 @@ impl Session {
     }
 
     /// Disconnect from browser
-    pub async fn disconnect(self) -> Result<()> {
+    pub async fn disconnect(mut self) -> Result<()> {
+        // Abort the dialog handler first to drop its clone of the write channel,
+        // ensuring the I/O task can cleanly exit.
+        if let Some(h) = self.dialog_handle.take() {
+            h.abort();
+        }
         self.conn.close().await;
         Ok(())
     }

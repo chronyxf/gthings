@@ -81,21 +81,113 @@ pub async fn connect(ws_url: &str) -> Result<Connection> {
     Connection::connect(ws_url).await
 }
 
-/// Dismiss the macOS "Allow remote debugging connection?" dialog that Dia
-/// shows when a CDP connection is first attempted.
+/// Dismiss the macOS "Allow remote debugging connection?" dialog that appears
+/// as a **sheet** in Dia and other Chromium-based browsers when a CDP
+/// connection is first attempted.
 ///
-/// Sends a Return keystroke to the Dia process via `osascript`/System Events.
+/// Uses `osascript`/System Events to detect the dialog sheet and click the
+/// "Allow" button. Polls every 500 ms for up to ~10 seconds (20 attempts)
+/// since the dialog may take 1–3 seconds to appear. Logs a warning if the
+/// dialog is never found — the WebSocket handshake may still proceed.
 #[cfg(target_os = "macos")]
 pub fn dismiss_allow_debugging_dialog() {
-    let script = r#"tell application "System Events"
+    /// AppleScript that checks each known browser process for a sheet dialog
+    /// (attached to window 1) and clicks the "Allow" button if found.
+    /// Returns the browser name if dismissed, or empty string otherwise.
+    /// Each `exists` check is wrapped in `try` so that missing processes
+    /// don't abort the script.
+    const SCRIPT: &str = r#"tell application "System Events"
+        set browserName to ""
         try
-            set frontmost of process "Dia" to true
+            if exists (sheet 1 of window 1 of process "Dia") then
+                tell process "Dia" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Dia"
+            end if
         end try
-        tell process "Dia" to keystroke return
+        try
+            if browserName is "" and exists (sheet 1 of window 1 of process "Chromium") then
+                tell process "Chromium" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Chromium"
+            end if
+        end try
+        try
+            if browserName is "" and exists (sheet 1 of window 1 of process "Google Chrome") then
+                tell process "Google Chrome" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Google Chrome"
+            end if
+        end try
+        try
+            if browserName is "" and exists (sheet 1 of window 1 of process "Google Chrome Canary") then
+                tell process "Google Chrome Canary" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Google Chrome Canary"
+            end if
+        end try
+        try
+            if browserName is "" and exists (sheet 1 of window 1 of process "Microsoft Edge") then
+                tell process "Microsoft Edge" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Microsoft Edge"
+            end if
+        end try
+        try
+            if browserName is "" and exists (sheet 1 of window 1 of process "Microsoft Edge Canary") then
+                tell process "Microsoft Edge Canary" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Microsoft Edge Canary"
+            end if
+        end try
+        try
+            if browserName is "" and exists (sheet 1 of window 1 of process "Brave Browser") then
+                tell process "Brave Browser" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Brave Browser"
+            end if
+        end try
+        try
+            if browserName is "" and exists (sheet 1 of window 1 of process "Arc") then
+                tell process "Arc" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Arc"
+            end if
+        end try
+        try
+            if browserName is "" and exists (sheet 1 of window 1 of process "Vivaldi") then
+                tell process "Vivaldi" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Vivaldi"
+            end if
+        end try
+        try
+            if browserName is "" and exists (sheet 1 of window 1 of process "Opera") then
+                tell process "Opera" to click button "Allow" of sheet 1 of window 1
+                set browserName to "Opera"
+            end if
+        end try
+        return browserName
     end tell"#;
-    let _ = std::process::Command::new("osascript")
-        .args(["-e", script])
-        .output();
+
+    for attempt in 1..=20 {
+        let output = std::process::Command::new("osascript")
+            .args(["-e", SCRIPT])
+            .output();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let browser = stdout.trim();
+                if !browser.is_empty() {
+                    tracing::warn!("Dismissed remote debugging dialog for {browser} (attempt {attempt})");
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("osascript failed: {e}");
+            }
+        }
+
+        if attempt < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    tracing::warn!(
+        "Remote debugging dialog not found after 20 attempts — continuing"
+    );
 }
 
 /// Non-macOS: no-op.

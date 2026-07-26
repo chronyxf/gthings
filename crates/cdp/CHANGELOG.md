@@ -1,4 +1,15 @@
-# Changelog — gthings-cdp
+# Changelog
+
+## [0.5.0] - 
+
+### Added
+- Rewrote dismiss_allow_debugging_dialog() with proper sheet detection, "Allow" button click, 10 browser process names, and 20-retry polling loop (was catching main window instead of dialog sheet)
+- Background dialog auto-accept handler subscribing to Page.javascriptDialogOpening events — auto-dismisses alert/confirm/prompt/beforeunload
+- awaitPromise: true and timeout: 10000 to Runtime.evaluate params for async JS evaluation (required for SPA content extraction)
+
+### Changed
+- Made Connection::NEXT_CDP_ID pub(crate) and exposed write_tx() method for fire-and-forget CDP commands
+- Added call_async() helper function for background CDP calls without response waiting
 
 ## 0.4.16 (2026-07-26)
 
@@ -202,3 +213,4 @@ fix(cdp): add HTTP /json/version fallback in discover_ws_url() — detects brows
 ### Changed
 - Complete rewrite from per-command Chrome launch to persistent browser model
 - Dynamic serde_json::Value types replace generated CDP protocol (removed 24K LOC generated code)
+

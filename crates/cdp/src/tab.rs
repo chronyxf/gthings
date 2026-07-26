@@ -88,23 +88,16 @@ impl Tab {
         session.navigate(self, url).await
     }
 
-    /// Evaluate JS in tab context, return JSON result
+    /// Evaluate JS in tab context, return JSON result.
     pub async fn evaluate(&self, session: &Session, js: &str) -> Result<Value> {
         let conn = session.connection();
         let sid = self.session_id.as_deref();
-
-        let result = conn
-            .call(
-                "Runtime.evaluate",
-                json!({
-                    "expression": js,
-                    "returnByValue": true,
-                }),
-                sid,
-            )
-            .await?;
-
-        Ok(result)
+        conn.call("Runtime.evaluate", json!({
+            "expression": js,
+            "returnByValue": true,
+            "awaitPromise": true,
+            "timeout": 10000,
+        }), sid).await
     }
 
     /// Wait until page is fully loaded using lifecycle events
@@ -183,3 +176,5 @@ impl Tab {
         Ok(())
     }
 }
+
+

@@ -11,7 +11,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 #[cfg(target_os = "macos")]
 use crate::browser::dismiss_allow_debugging_dialog;
 use tokio_tungstenite::tungstenite::Message;
-static NEXT_CDP_ID: AtomicU64 = AtomicU64::new(1);
+pub(crate) static NEXT_CDP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A CDP event received from the browser (no "id" field, has "method" field).
 #[derive(Debug, Clone)]
@@ -271,9 +271,15 @@ impl Connection {
             })? // -> Result<Value, CdpError>
     }
 
-    /// Subscribe to all CDP events broadcast from the browser.
+        /// Subscribe to all CDP events broadcast from the browser.
     pub fn event_rx(&self) -> broadcast::Receiver<CdpEvent> {
         self.events.subscribe()
+    }
+
+    /// (crate-internal) Clone the write channel for fire-and-forget CDP commands
+    /// from spawned background tasks.
+    pub(crate) fn write_tx(&self) -> mpsc::UnboundedSender<InternalMessage> {
+        self.write.clone()
     }
 
     /// Disconnect cleanly. Closes the command channel and waits for the
@@ -287,6 +293,26 @@ impl Connection {
         drop(write); // Signals the background loop to exit
         let _ = handle.await;
     }
+}
+
+/// Send a CDP command without waiting for the response (fire-and-forget).
+/// Used by background tasks that don't need the result.
+pub(crate) fn call_async(
+    write: &mpsc::UnboundedSender<InternalMessage>,
+    method: &str,
+    params: Value,
+    session_id: Option<String>,
+) {
+    let id = NEXT_CDP_ID.fetch_add(1, Ordering::Relaxed);
+    let (tx, _) = oneshot::channel();
+    let msg = InternalMessage::Call {
+        id,
+        method: method.to_string(),
+        params,
+        session_id,
+        tx,
+    };
+    let _ = write.send(msg);
 }
 
 #[cfg(test)]
