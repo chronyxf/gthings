@@ -1,4 +1,9 @@
-# Changelog — gthings-extraction
+# Changelog
+
+## [0.5.1] - 
+
+### Fixed
+- Replaced unused _root_num variable with bare _ in PDF metadata extraction
 
 ## [0.5.0] - 2026-07-26
 
@@ -76,3 +81,4 @@
 ### Changed
 - Removed outdated "Ported from TypeScript" comments
 - Cleaned decorative separator comments
+

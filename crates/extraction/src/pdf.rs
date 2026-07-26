@@ -330,7 +330,7 @@ fn parse_pdf_dict_value(dict_content: &str, key: &str) -> Option<String> {
 
 /// Extract metadata from PDF /Info dictionary by finding the object and parsing it.
 fn extract_pdf_info_metadata(bytes: &[u8]) -> Option<PdfMetadata> {
-    let (info_num, info_gen, _root_num) = parse_pdf_trailer(bytes)?;
+    let (info_num, info_gen, _) = parse_pdf_trailer(bytes)?;
     let obj_content = parse_pdf_object(bytes, info_num, info_gen)?;
 
     let to_opt = |val: Option<String>| val.filter(|s| !s.is_empty());
