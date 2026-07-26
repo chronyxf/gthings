@@ -15,5 +15,5 @@ pub mod follow;
 pub mod search;
 
 pub use batch::BatchProcessor;
-pub use follow::{follow, FollowResult};
-pub use search::{search, SearchResult};
+pub use follow::{FollowResult, follow};
+pub use search::{SearchResult, search};

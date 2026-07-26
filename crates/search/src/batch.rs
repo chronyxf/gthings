@@ -68,10 +68,9 @@ impl BatchProcessor {
                 if let Ok(Ok(ref results)) = search_result {
                     if follow_results {
                         for result in results {
-                            if let Err(e) = crate::follow::follow(
-                                &session, &tab, &result.url, follow_max_chars,
-                            )
-                            .await
+                            if let Err(e) =
+                                crate::follow::follow(&session, &tab, &result.url, follow_max_chars)
+                                    .await
                             {
                                 tracing::warn!(
                                     url = %result.url,

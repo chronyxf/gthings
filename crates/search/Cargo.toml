@@ -7,9 +7,9 @@ license.workspace = true
 description = "Web search orchestration: Google CDP search, page following, batch harvest pipeline"
 
 [dependencies]
-gthings-cdp = { path = "../cdp", version = "0.4.14" }
-gthings-common = { path = "../common", version = "0.3.3" }
-gthings-extraction = { path = "../extraction" , version = "0.3.2" }
+gthings-cdp = { path = "../cdp", version = "0.4.15" }
+gthings-common = { path = "../common", version = "0.3.4" }
+gthings-extraction = { path = "../extraction" , version = "0.4.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

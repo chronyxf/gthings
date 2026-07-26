@@ -43,7 +43,10 @@ fn run_gthings_with_env(args: &[&str], envs: &[(&str, &str)]) -> String {
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let output = cmd.args(args).output().expect("failed to run gthings binary");
+    let output = cmd
+        .args(args)
+        .output()
+        .expect("failed to run gthings binary");
     assert!(
         output.status.success(),
         "gthings exited with code {:?}\nstderr: {}",
@@ -74,8 +77,7 @@ fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let start = Instant::now();
     let addr: String = format!("127.0.0.1:{port}");
     while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok()
-        {
+        if TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -115,8 +117,7 @@ fn test_search_via_chrome() {
         &["search", "rust programming", "--count", "3", "--json"],
         &[("GTHINGS_CDP_PORT", &port_str)],
     );
-    let results: Vec<serde_json::Value> =
-        serde_json::from_str(&stdout).expect("valid JSON array");
+    let results: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("valid JSON array");
     assert_eq!(results.len(), 3, "expected 3 search results");
     for r in &results {
         let title = r["title"].as_str().unwrap_or("");
@@ -149,8 +150,7 @@ fn test_follow_extracts_content() {
         ],
         &[("GTHINGS_CDP_PORT", &port_str)],
     );
-    let result: serde_json::Value =
-        serde_json::from_str(&stdout).expect("valid JSON object");
+    let result: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON object");
     let content = result["content"].as_str().unwrap_or("");
     assert!(
         content.contains("Example Domain"),
