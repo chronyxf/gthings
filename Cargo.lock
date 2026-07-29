@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "gthings"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "clap",
  "gthings-cdp",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "gthings-search"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "chrono",
  "gthings-cdp",
