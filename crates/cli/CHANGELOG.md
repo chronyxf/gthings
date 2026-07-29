@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.5] - 2026-07-29
+
+### Fixed
+- Correct agent skill install path from `~/.agents/gthings/` to `~/.agents/skills/gthings/` to match opencode spec (update.rs)
+
 ## [0.6.4] - 2026-07-26
 
 ### Fixed
