@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.1] - 2026-07-29
+
+### Added
+- CAPTCHA/Sorry page detection after Google navigation — checks URL for `/sorry/` and page title for "Accessibility"/"Learn more", returns `CdpError::CaptchaBlocked` instead of fake results (search.rs)
+
 ## [0.7.0] - 
 
 ### Added
