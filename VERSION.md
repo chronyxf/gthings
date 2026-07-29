@@ -1,111 +1,105 @@
 # Versioning Workflow
 
-Each crate in this monorepo is versioned independently. When code changes in a crate,
-knope reads the changeset markdown files, bumps Cargo.toml versions, and updates CHANGELOG.md.
+Each crate versioned independently. One crate per commit. Never batch.
 
-Different crates can have different versions at the same time.
-
-## Pipeline
-
-One crate at a time. Do not batch multiple crates into one commit.
+## Pipeline (ONE CRATE AT A TIME)
 
 ```
- 1. format/lint/build/test
- 2. changeset
- 3. changelog (knope)
- 4. commit (1 line)
- 5. publish
+ 1. changeset   — create .changeset/<name>.md
+ 2. changelog   — knope release (reads changeset, bumps version, updates CHANGELOG.md)
+ 3. commit      — git add + git commit (one line)
+ 4. publish     — cargo publish -p <crate>
 ```
 
-### 1. Format → Lint → Build → Test
+Repeat for each crate with changes. Publish order: common → extraction → cdp → search → gthings.
 
-Pre-commit hook enforces these automatically. Set `SKIP_CHECKS=1` to bypass.
-
-```bash
-cargo fmt --all
-cargo clippy --workspace
-cargo build --workspace
-cargo test --workspace
-```
-
-### 2. Changeset
-
-Create a changeset file in `.changeset/` (the configured changes directory for knope) with YAML frontmatter:
-
-```markdown
----
-"gthings-common": patch
 ---
 
-- Refactor: spawn_blocking for sync I/O in browser.rs
+## Step-by-Step
+
+### 0. Which crate?
+
+Check `git diff --stat`. Each file path tells you which crate:
+- `crates/common/` → gthings-common
+- `crates/extraction/` → gthings-extraction  
+- `crates/cdp/` → gthings-cdp
+- `crates/search/` → gthings-search
+- `crates/cli/` → gthings (the CLI binary crate)
+
+### 1. Changeset
+
+Create a file in `.changeset/`. Name: `<crate>-<description>.md`.
+
+Content format (knope 0.23, plain markdown, NO YAML frontmatter):
+
+```
+gthings-cdp: patch
+
+- Fix: description of the fix
+- Feat: description of the feature
 ```
 
-All bump types: `patch`, `minor`, `major`.
+First line = `crate-name: bump-type`. Body = bullet list.
 
-### 3. Changelog (knope)
+Bump types:
+| Bump    | When                     |
+|---------|--------------------------|
+| `patch` | Bug fixes, refactoring   |
+| `minor` | New features             |
+| `major` | Breaking changes         |
+
+### 2. Changelog (knope)
 
 ```bash
 knope release
 ```
 
-- Reads changeset files from `.changeset/`
-- Bumps versions in Cargo.toml
-- Updates dependency version constraints in dependent crates
-- Prepends entries to each crate's CHANGELOG.md
-- Deletes consumed changeset files
+This bumps Cargo.toml, updates CHANGELOG.md, deletes the changeset file.
 
-### 4. Commit
+### 3. Commit — ONE LINE ONLY
 
 ```bash
-git add crates/<crate>/ tests/ .changeset/
-git commit -m "type(crate): short description"
+git add crates/<crate>/ CHANGELOG.md Cargo.toml Cargo.lock .changeset/
+git commit -m "type(crate): description"
 ```
 
-One line, conventional commit format. Repeat steps 1-4 for each crate with changes.
+Commit message types:
+| Type  | When                |
+|-------|---------------------|
+| `fix` | Bug fixes           |
+| `feat`| New features        |
+| `refactor` | Code changes  |
+| `chore`| Build/config        |
 
-### 5. Publish
+One line. No body. Example:
+- `fix(cdp): add session_id filter to lifecycle event predicate`
+- `feat(search): add CAPTCHA/Sorry page detection`
 
-Publish in dependency order (bottom-up):
+### 4. Publish
 
 ```bash
-cargo publish -p gthings-common
-cargo publish -p gthings-extraction
 cargo publish -p gthings-cdp
-cargo publish -p gthings-search
-cargo publish -p gthings
 ```
 
-## Changeset File Format
+ALWAYS in dependency order (bottom-up):
 
-Standard knope changeset markdown:
-
-```markdown
----
-"crate-name": patch
----
-
-- Description of the change
-
-More details if needed.
+```bash
+cargo publish -p gthings-common      # 1st
+cargo publish -p gthings-extraction   # 2nd
+cargo publish -p gthings-cdp          # 3rd
+cargo publish -p gthings-search       # 4th
+cargo publish -p gthings              # 5th (cli)
 ```
 
-Frontmatter: crate name in quotes, bump type. Body: bullet list or paragraph.
-
-## Bump Types
-
-| Bump    | When                                     | Version Change |
-| ------- | ---------------------------------------- | -------------- |
-| `patch` | Bug fixes, refactoring, internal cleanup | 0.1.0 → 0.1.1 |
-| `minor` | New features, public API additions       | 0.1.0 → 0.2.0 |
-| `major` | Breaking changes                         | 0.1.0 → 1.0.0 |
+---
 
 ## Pre-publish Checklist
 
 - [ ] `cargo test --workspace` — all tests pass
 - [ ] `cargo clippy --workspace -D warnings` — zero warnings
+- [ ] `cargo login` — valid crates.io token
+- [ ] Published in dependency order (bottom-up)
 - [ ] Each Cargo.toml has `description`, `license`, `repository`, `homepage`
 - [ ] Internal `path` deps have matching `version` field
-- [ ] `cargo login` with valid crates.io token
-- [ ] Publish in dependency order (bottom-up)
 
-Note: root package `gthings-tests` has `publish = false` — never pushed. Only 5 workspace members publish.
+Note: root package `gthings-tests` has `publish = false` — never pushed.

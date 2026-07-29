@@ -2,7 +2,7 @@
 # Pre-commit hook enforcing VERSION.md workflow
 set -euo pipefail
 
-CHANGESETS_DIR=".changesets"
+CHANGESETS_DIR=".changeset"
 
 # Detect changes that require a changeset
 STAGED_FILES=$(git diff --cached --name-only)
@@ -55,13 +55,13 @@ if [ "$needs_changeset" = "1" ]; then
 
     if [ "$has_changeset" = "0" ]; then
         echo ""
-        echo "[FAIL] Commit contains code changes but no changeset found in .changesets/"
+        echo "[FAIL] Commit contains code changes but no changeset found in .changeset/"
         echo ""
         echo "Follow the VERSION.md workflow:"
         echo ""
         echo "  1. Create a changeset:"
         echo "     bash scripts/create-changeset.sh"
-        echo "     OR manually create .changesets/<name>.md"
+        echo "     OR manually create .changeset/<name>.md"
         echo ""
         echo "  2. Run consume script:"
         echo "     bash scripts/consume-changesets.sh"
