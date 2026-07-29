@@ -1,4 +1,4 @@
-use crate::connection::{call_async, CdpEvent, Connection};
+use crate::connection::{CdpEvent, Connection, call_async};
 use crate::error::{CdpError, Result};
 use crate::tab::Tab;
 use gthings_common::domain_reputation::QualityFlag;
@@ -131,6 +131,39 @@ impl Session {
         // 2. Subscribe BEFORE navigation — don't miss the networkIdle event
         let mut rx = conn.event_rx();
 
+        // 2a. Set a real desktop Chrome User-Agent to avoid "HeadlessChrome" detection
+        let _ = conn
+            .call(
+                "Network.setUserAgentOverride",
+                serde_json::json!({
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    "platform": "macOS",
+                }),
+                sid,
+            )
+            .await;
+
+        // 2b. Inject minimal stealth script that hides automation fingerprints (navigator.webdriver override)
+        // Complex JS (MimeType prototype manipulation, Chrome runtime construction, WebGL override) removed
+        // because those operations can throw errors in Chrome 150+ and block page navigation.
+        let stealth_js = r#"(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        })()"#;
+
+        let _ = conn
+            .call(
+                "Page.addScriptToEvaluateOnNewDocument",
+                serde_json::json!({
+                    "source": stealth_js,
+                }),
+                sid,
+            )
+            .await;
+
+        // Clone sid for the closure — session_id filtering prevents cross-tab event matches
+        let sid_owned = tab.session_id.clone();
+
         // 3. Start navigation
         conn.call("Page.navigate", serde_json::json!({"url": url}), sid)
             .await?;
@@ -139,7 +172,15 @@ impl Session {
         let result = wait_for_event(
             &mut rx,
             "Page.lifecycleEvent",
-            |evt| evt.params.get("name").and_then(|v| v.as_str()) == Some("networkIdle"),
+            move |evt| {
+                let session_match = match &sid_owned {
+                    Some(sid) => evt.session_id.as_deref() == Some(sid.as_str()),
+                    None => true,
+                };
+                let name_match =
+                    evt.params.get("name").and_then(|v| v.as_str()) == Some("networkIdle");
+                session_match && name_match
+            },
             Duration::from_secs(10),
         )
         .await;

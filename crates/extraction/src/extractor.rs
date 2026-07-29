@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn test_domain_authority_unknown() {
         let auth = domain_authority("example-unknown-site.com");
-        assert!(auth >= 0.0 && auth <= 0.5);
+        assert!((0.0..=0.5).contains(&auth));
     }
 
     #[test]

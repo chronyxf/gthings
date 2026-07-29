@@ -271,7 +271,7 @@ impl Connection {
             })? // -> Result<Value, CdpError>
     }
 
-        /// Subscribe to all CDP events broadcast from the browser.
+    /// Subscribe to all CDP events broadcast from the browser.
     pub fn event_rx(&self) -> broadcast::Receiver<CdpEvent> {
         self.events.subscribe()
     }

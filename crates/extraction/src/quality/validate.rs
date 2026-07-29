@@ -203,7 +203,7 @@ mod tests {
         // Above 80-char threshold should pass the too_short check
         let text = "This is a test sentence that should be long enough to pass the too-short detection threshold in the quality validator's logic. ";
         assert!(text.len() > 80);
-        let result = ContentQuality::validate(&text);
+        let result = ContentQuality::validate(text);
         // Should not have TooShort reason
         assert!(
             !result.reasons.contains(&QualityReason::TooShort),

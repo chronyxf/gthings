@@ -75,6 +75,42 @@ async fn search_once(
 
     tab.navigate(session, &url).await?;
 
+    // Check for Google CAPTCHA/Sorry block
+    {
+        let page_url = tab.evaluate(session, "window.location.href").await?;
+        let current_url = page_url
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if current_url.contains("/sorry/") || current_url.contains("google.com/sorry") {
+            tracing::warn!("Google CAPTCHA/Sorry page detected at: {current_url}");
+            return Err(CdpError::CaptchaBlocked {
+                detail: format!(
+                    "Google served CAPTCHA page instead of search results: {current_url}"
+                ),
+            });
+        }
+
+        // Also check for "Accessibility help" or "Learn more" in page title
+        let page_title = tab.evaluate(session, "document.title").await?;
+        let title = page_title
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if title.contains("Accessibility") || title.contains("Learn more") {
+            tracing::warn!("Google access-denied page detected: {title}");
+            return Err(CdpError::CaptchaBlocked {
+                detail: format!(
+                    "Google returned access-denied page '{title}' instead of search results"
+                ),
+            });
+        }
+    }
+
     // In-browser JS: iterate all links, skip self-hosted, extract snippet
     // via attribute-based selectors (no brittle class-name dependency).
     // Includes timing measurement and resilient selector fallbacks.
@@ -108,12 +144,11 @@ JSON.stringify(results);
     let result = tab.evaluate(session, &js).await?;
     let raw = result["result"]["value"].as_str();
     let json_str = raw.unwrap_or("[]");
-    let mut items: Vec<SearchResult> = serde_json::from_str(json_str)
-        .map_err(|e| {
-            let preview = &json_str[..json_str.len().min(200)];
-            tracing::warn!("search: failed to parse results JSON: {e} (preview: {preview:?})");
-            CdpError::Json(e)
-        })?;
+    let mut items: Vec<SearchResult> = serde_json::from_str(json_str).map_err(|e| {
+        let preview = &json_str[..json_str.len().min(200)];
+        tracing::warn!("search: failed to parse results JSON: {e} (preview: {preview:?})");
+        CdpError::Json(e)
+    })?;
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let now = Utc::now();

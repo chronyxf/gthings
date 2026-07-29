@@ -1,6 +1,6 @@
 [changes]
 ignore_conventional_commits = true
-changes_dir = ".changesets/"
+changes_dir = ".changeset/"
 
 [packages.gthings-common]
 versioned_files = ["crates/common/Cargo.toml"]
@@ -27,6 +27,7 @@ name = "release"
 
 [[workflows.steps]]
 type = "PrepareRelease"
+ignore_conventional_commits = true
 
 [[workflows.steps]]
 type = "Command"

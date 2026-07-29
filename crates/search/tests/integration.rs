@@ -46,7 +46,7 @@ fn test_search_result_serde() {
 
 #[test]
 fn test_search_result_ordering() {
-    let mut results = vec![
+    let mut results = [
         SearchResult {
             title: "C".into(),
             url: "https://example.com/c".into(),
@@ -135,7 +135,7 @@ fn test_search_result_parse_required_fields() {
 #[test]
 fn test_search_result_parse_malformed() {
     let err = serde_json::from_str::<Vec<SearchResult>>("not json");
-    assert!(err.is_err());
+    let _ = err.unwrap_err();
 }
 
 #[test]

@@ -161,33 +161,54 @@ pub fn dismiss_allow_debugging_dialog() {
         return browserName
     end tell"#;
 
-    for attempt in 1..=20 {
-        let output = std::process::Command::new("osascript")
-            .args(["-e", SCRIPT])
-            .output();
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let browser = stdout.trim();
-                if !browser.is_empty() {
-                    tracing::warn!("Dismissed remote debugging dialog for {browser} (attempt {attempt})");
-                    return;
-                }
+    const OSASCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_ATTEMPTS: u32 = 5;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let (tx, rx) = mpsc::channel();
+        let script = SCRIPT.to_owned();
+
+        std::thread::spawn(move || {
+            let result = std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .output();
+            let _ = tx.send(result);
+        });
+
+        let output = match rx.recv_timeout(OSASCRIPT_TIMEOUT) {
+            Ok(Ok(out)) => Some(out),
+            Ok(Err(e)) => {
+                tracing::warn!("osascript command failed: {e}");
+                None
             }
-            Err(e) => {
-                tracing::warn!("osascript failed: {e}");
+            Err(_) => {
+                tracing::warn!(
+                    "osascript timed out after {OSASCRIPT_TIMEOUT:?} (attempt {attempt})"
+                );
+                None
+            }
+        };
+
+        if let Some(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let browser = stdout.trim();
+            if !browser.is_empty() {
+                tracing::warn!(
+                    "Dismissed remote debugging dialog for {browser} (attempt {attempt})"
+                );
+                return;
             }
         }
 
-        if attempt < 20 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        if attempt < MAX_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(500));
         }
     }
 
-    tracing::warn!(
-        "Remote debugging dialog not found after 20 attempts — continuing"
-    );
+    tracing::warn!("Remote debugging dialog not found after {MAX_ATTEMPTS} attempts — continuing");
 }
 
 /// Non-macOS: no-op.

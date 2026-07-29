@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.1] - 2026-07-29
+
+### Fixed
+- Replace unbounded osascript blocking call with mpsc channel + 5s recv_timeout, preventing macOS System Events hang (browser.rs)
+- Add session_id filter to networkIdle lifecycle event predicate — prevents cross-tab event matching with many open tabs (session.rs)
+- Add stealth JS injection via `Page.addScriptToEvaluateOnNewDocument` (navigator.webdriver + languages override) and `Network.setUserAgentOverride` to avoid Google CDP detection (session.rs)
+
+### Added
+- Add `CdpError::CaptchaBlocked { detail }` variant for typed Google CAPTCHA/Sorry detection (error.rs)
+
 ## [0.5.0] - 
 
 ### Added

@@ -7,8 +7,10 @@ use tokio::process::Command;
 /// Embedded skill content — compiled into the binary at build time.
 const SKILL_MAIN: &str = include_str!("../../resources/skills/opencode/gthings/SKILL.md");
 const SKILL_AGENT: &str = include_str!("../../resources/skills/agents/gthings/SKILL.md");
-const REF_COMMANDS: &str = include_str!("../../resources/skills/agents/gthings/reference/commands.md");
-const REF_QUALITY: &str = include_str!("../../resources/skills/agents/gthings/reference/quality.md");
+const REF_COMMANDS: &str =
+    include_str!("../../resources/skills/agents/gthings/reference/commands.md");
+const REF_QUALITY: &str =
+    include_str!("../../resources/skills/agents/gthings/reference/quality.md");
 
 /// Determine the opencode config root (`~/.config/opencode`).
 fn opencode_dir() -> Option<PathBuf> {
@@ -56,7 +58,10 @@ pub(crate) async fn cmd_update() -> i32 {
 
     // Destination paths
     let skill_dir = base.join("skills").join("gthings");
-    let agent_dir = PathBuf::from(&home).join(".agents").join("gthings");
+    let agent_dir = PathBuf::from(&home)
+        .join(".agents")
+        .join("skills")
+        .join("gthings");
     let ref_dir = agent_dir.join("reference");
 
     // Create directories (ignore errors — let writes fail below for specific messages)
@@ -66,16 +71,32 @@ pub(crate) async fn cmd_update() -> i32 {
 
     // Write files, collecting individual results
     let writes: [(&str, &str, PathBuf); 4] = [
-        ("SKILL.md (opencode)", SKILL_MAIN, skill_dir.join("SKILL.md")),
+        (
+            "SKILL.md (opencode)",
+            SKILL_MAIN,
+            skill_dir.join("SKILL.md"),
+        ),
         ("SKILL.md (agent)", SKILL_AGENT, agent_dir.join("SKILL.md")),
-        ("reference/commands.md", REF_COMMANDS, ref_dir.join("commands.md")),
-        ("reference/quality.md", REF_QUALITY, ref_dir.join("quality.md")),
+        (
+            "reference/commands.md",
+            REF_COMMANDS,
+            ref_dir.join("commands.md"),
+        ),
+        (
+            "reference/quality.md",
+            REF_QUALITY,
+            ref_dir.join("quality.md"),
+        ),
     ];
 
     let mut ok = true;
     for (label, content, path) in &writes {
         if let Err(e) = fs::write(path, content) {
-            eprintln!("Warning: could not write {} to {}: {e}", label, path.display());
+            eprintln!(
+                "Warning: could not write {} to {}: {e}",
+                label,
+                path.display()
+            );
             ok = false;
         } else {
             println!("  ✓ {} → {}", label, path.display());

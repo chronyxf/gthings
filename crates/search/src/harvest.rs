@@ -1432,7 +1432,7 @@ mod tests {
             body_status: BodyStatus::ExtractFailed,
         };
 
-        let results = vec![success, failure];
+        let results = [success, failure];
         assert_eq!(
             results.len(),
             2,

@@ -14,6 +14,9 @@ pub enum CdpError {
     #[error("Navigation timeout: {url} did not load within {timeout}s")]
     NavigationTimeout { url: String, timeout: u64 },
 
+    #[error("Google CAPTCHA/Sorry block: {detail}")]
+    CaptchaBlocked { detail: String },
+
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -65,6 +68,17 @@ mod tests {
         assert_eq!(
             format!("{}", err),
             "Navigation timeout: https://example.com did not load within 30s"
+        );
+    }
+
+    #[test]
+    fn test_error_display_captcha_blocked() {
+        let err = CdpError::CaptchaBlocked {
+            detail: "Google served a CAPTCHA challenge page".into(),
+        };
+        assert_eq!(
+            format!("{}", err),
+            "Google CAPTCHA/Sorry block: Google served a CAPTCHA challenge page"
         );
     }
 }

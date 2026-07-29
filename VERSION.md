@@ -30,7 +30,7 @@ cargo test --workspace
 
 ### 2. Changeset
 
-Create a changeset file in `.changesets/` (the configured changes directory for knope) with YAML frontmatter:
+Create a changeset file in `.changeset/` (the configured changes directory for knope) with YAML frontmatter:
 
 ```markdown
 ---
@@ -48,7 +48,7 @@ All bump types: `patch`, `minor`, `major`.
 knope release
 ```
 
-- Reads changeset files from `.changesets/`
+- Reads changeset files from `.changeset/`
 - Bumps versions in Cargo.toml
 - Updates dependency version constraints in dependent crates
 - Prepends entries to each crate's CHANGELOG.md
@@ -57,7 +57,7 @@ knope release
 ### 4. Commit
 
 ```bash
-git add crates/<crate>/ tests/ .changesets/
+git add crates/<crate>/ tests/ .changeset/
 git commit -m "type(crate): short description"
 ```
 

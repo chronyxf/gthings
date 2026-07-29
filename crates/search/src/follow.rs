@@ -141,15 +141,13 @@ pub async fn follow(
 
     let result = tab.evaluate(session, &js).await?;
     let raw = result["result"]["value"].as_str();
-    let json_str = raw.unwrap_or(
-        r#"{"title":"","content":"","error":"CDP result missing value field"}"#,
-    );
-    let mut follow_result: FollowResult = serde_json::from_str(json_str)
-        .map_err(|e| {
-            let preview = &json_str[..json_str.len().min(200)];
-            tracing::warn!("follow: failed to parse extraction JSON: {e} (preview: {preview:?})");
-            CdpError::Json(e)
-        })?;
+    let json_str =
+        raw.unwrap_or(r#"{"title":"","content":"","error":"CDP result missing value field"}"#);
+    let mut follow_result: FollowResult = serde_json::from_str(json_str).map_err(|e| {
+        let preview = &json_str[..json_str.len().min(200)];
+        tracing::warn!("follow: failed to parse extraction JSON: {e} (preview: {preview:?})");
+        CdpError::Json(e)
+    })?;
     follow_result.url = url.to_string();
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -293,7 +291,7 @@ mod tests {
     fn test_follow_result_parse_malformed() {
         let json = r#"not valid json"#;
         let err = serde_json::from_str::<FollowResult>(json);
-        assert!(err.is_err());
+        let _ = err.unwrap_err();
     }
 
     #[test]
