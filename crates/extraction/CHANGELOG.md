@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.2] - 2026-07-30
+
+### Feat
+- Add ExtractionError::RateLimited variant with retry_after parsing
+- Rewrite extract_github() with intelligent URL routing for blob/tree/diff/patch/repo-root
+- Add semanticscholar.org and cell.com to high-authority domains
+- Add HTTP 429 detection in PDF fetch and web extraction
+
+### Fix
+- Fix heading depth detection in WebExtractor (remove dead current_depth variable)
+- Make extract_metadata an associated function (remove unused &self)
+
+
 ## [0.5.1] - 
 
 ### Fixed
