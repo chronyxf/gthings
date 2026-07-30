@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.4 (2026-07-30)
+
+### Fixes
+
+#### - refactor: replace expect() with proper error handling in browser.rs
+
+- refactor: add AxNode<'a> wrapper struct in ax_tree.rs
+- refactor: extract with_background_tab_impl in session.rs
+- refactor: add RunState struct, extract connect_with_dialog, retry_or_fail (connection.rs)
+- refactor: deduplicate echo server code in connection tests
+- fix: add mut to ctx, explicit lifetimes in ax_tree.rs
+- chore: add similar dep to Cargo.toml
+
 ## [0.5.3] - 2026-07-30
 
 ### Fix
@@ -44,19 +57,6 @@
 ### Changed
 - Made Connection::NEXT_CDP_ID pub(crate) and exposed write_tx() method for fire-and-forget CDP commands
 - Added call_async() helper function for background CDP calls without response waiting
-
-## 0.5.4 (2026-07-30)
-
-### Fixes
-
-#### - refactor: replace expect() with proper error handling in browser.rs
-
-- refactor: add AxNode<'a> wrapper struct in ax_tree.rs
-- refactor: extract with_background_tab_impl in session.rs
-- refactor: add RunState struct, extract connect_with_dialog, retry_or_fail (connection.rs)
-- refactor: deduplicate echo server code in connection tests
-- fix: add mut to ctx, explicit lifetimes in ax_tree.rs
-- chore: add similar dep to Cargo.toml
 
 ## 0.4.16 (2026-07-26)
 

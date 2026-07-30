@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.3 (2026-07-30)
+
+### Fixes
+
+#### - fix: scroll iterations count.max(3) for better count delivery (search.rs)
+
+- fix: collect count*2 results in JS template (search_extract.js)
+- fix: only drop truly empty snippets not <5 chars (search.rs)
+- fix: request count*2 from Google via num param (search.rs)
+- fix: remove #[allow(incompatible_msrv)] vestigial annotations
+- refactor: extract search_with_tab() helper (follow.rs)
+- refactor: extract make_error_result() helper (follow.rs)
+- refactor: extract classify_body_status(), map_join_err() (orchestrator.rs)
+- refactor: replace BTreeMap with IndexMap for insertion order (ranking.rs)
+- refactor: replace unconditional clone with scoped clone (search.rs)
+- refactor: add tracing::warn on extract_host failure (batch.rs, follow.rs)
+- refactor: use .pointer() for CDP result access (follow.rs)
+- chore: add indexmap dep to Cargo.toml
+- refactor: unify selection passes in harvest orchestrator
+- chore: remove 2039-line harvest.rs merge artifact
+
 ## [0.7.2] - 2026-07-30
 
 ### Feat
@@ -32,27 +53,6 @@
 ### Fixed
 - Replaced unused _query variable with bare _ in harvest ranking loop
 - Robust JSON parse error handling with descriptive warnings in follow and search extraction
-
-## 0.7.3 (2026-07-30)
-
-### Fixes
-
-#### - fix: scroll iterations count.max(3) for better count delivery (search.rs)
-
-- fix: collect count*2 results in JS template (search_extract.js)
-- fix: only drop truly empty snippets not <5 chars (search.rs)
-- fix: request count*2 from Google via num param (search.rs)
-- fix: remove #[allow(incompatible_msrv)] vestigial annotations
-- refactor: extract search_with_tab() helper (follow.rs)
-- refactor: extract make_error_result() helper (follow.rs)
-- refactor: extract classify_body_status(), map_join_err() (orchestrator.rs)
-- refactor: replace BTreeMap with IndexMap for insertion order (ranking.rs)
-- refactor: replace unconditional clone with scoped clone (search.rs)
-- refactor: add tracing::warn on extract_host failure (batch.rs, follow.rs)
-- refactor: use .pointer() for CDP result access (follow.rs)
-- chore: add indexmap dep to Cargo.toml
-- refactor: unify selection passes in harvest orchestrator
-- chore: remove 2039-line harvest.rs merge artifact
 
 ## 0.6.0 (2026-07-26)
 

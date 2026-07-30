@@ -1,12 +1,5 @@
 # Changelog
 
-## [0.3.6] - 2026-07-30
-
-### Chore
-- Remove dead cache_key function and unused imports
-
- — gthings-common
-
 ## 0.3.7 (2026-07-30)
 
 ### Fixes
@@ -22,6 +15,13 @@
 - refactor: add try_parse_url, strip_suffix, canonicalize_parsed_url helpers (url_normalizer.rs)
 - refactor: use psl crate for registered_domain instead of hardcoded TLD list
 - refactor: #[must_use] on all pure pub functions
+
+## [0.3.6] - 2026-07-30
+
+### Chore
+- Remove dead cache_key function and unused imports
+
+ — gthings-common
 
 ## 0.3.5 (2026-07-26)
 

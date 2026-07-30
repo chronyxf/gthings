@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.3 (2026-07-30)
+
+### Fixes
+
+#### - refactor: replace expect() with if let Some in insert_into_sections (web.rs)
+
+- refactor: replace map_err().ok() with if let Ok in jsonld.rs
+- refactor: replace eprintln!() with tracing::warn!() in jsonld.rs, pdf.rs
+- refactor: extract READ_MORE_INDICATOR const (quality/types.rs, validate.rs)
+- fix: remove unnecessary params.clone() in dispatch.rs
+- fix: simplify split().next().unwrap_or() to .next().unwrap() in dispatch.rs
+- chore: add tracing dep to Cargo.toml
+- refactor: decompose article.rs, extractor.rs, detection.rs, pdf.rs, web.rs
+
 ## [0.5.2] - 2026-07-30
 
 ### Feat
@@ -48,20 +62,6 @@
 ### Fixed
 - Replace pdftotext CLI (poppler-utils) with pdf-extract (bundled MuPDF) for PDF text extraction
 - Fix TeX font extraction failure (Computer Modern fonts in arxiv papers)
-
-## 0.5.3 (2026-07-30)
-
-### Fixes
-
-#### - refactor: replace expect() with if let Some in insert_into_sections (web.rs)
-
-- refactor: replace map_err().ok() with if let Ok in jsonld.rs
-- refactor: replace eprintln!() with tracing::warn!() in jsonld.rs, pdf.rs
-- refactor: extract READ_MORE_INDICATOR const (quality/types.rs, validate.rs)
-- fix: remove unnecessary params.clone() in dispatch.rs
-- fix: simplify split().next().unwrap_or() to .next().unwrap() in dispatch.rs
-- chore: add tracing dep to Cargo.toml
-- refactor: decompose article.rs, extractor.rs, detection.rs, pdf.rs, web.rs
 
 ## 0.4.0 (2026-07-26)
 
