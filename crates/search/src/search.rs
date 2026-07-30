@@ -3,11 +3,13 @@
 //! Uses attribute-based selectors (`a[href]` filtered by hostname) resilient
 //! to Google class name changes.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gthings_cdp::{CdpError, Session, Tab};
 use gthings_common::provenance::{ExtractionMethod, Provenance};
+use gthings_common::safe_truncate_end;
 use serde::{Deserialize, Serialize};
 /// A single Google search result with provenance metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +52,11 @@ pub async fn search(
     if results.is_empty() {
         // Retry ONCE with trailing space — Google sometimes returns zero
         // results for bare queries that work with a trailing space.
-        let spaced = format!("{query} ");
+        let spaced = if !query.ends_with(' ') {
+            format!("{query} ")
+        } else {
+            query.to_string()
+        };
         search_once(session, tab, &spaced, count).await
     } else {
         Ok(results)
@@ -58,6 +64,7 @@ pub async fn search(
 }
 
 /// Inner search function (single attempt, no retry).
+#[allow(clippy::incompatible_msrv)]
 async fn search_once(
     session: &Session,
     tab: &Tab,
@@ -68,7 +75,7 @@ async fn search_once(
 
     let params: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("q", query)
-        .append_pair("num", &count.to_string())
+        .append_pair("num", &(count * 2).max(10).to_string())
         .append_pair("hl", "en")
         .finish();
     let url = format!("https://www.google.com/search?{params}");
@@ -114,47 +121,26 @@ async fn search_once(
     // Scroll down to trigger lazy loading of more organic results.
     // Google SERP only renders ~2-3 results initially; the rest are
     // loaded dynamically when the user scrolls.
-    let scroll_iterations = (count / 2).max(1);
+    // 200ms sleep per iteration is empirically sufficient for
+    // lazy-loading Google SERP results on modern connections;
+    // originally 500ms — reduced as a simple latency optimization.
+    let scroll_iterations = count.max(3);
     for _ in 0..scroll_iterations {
         tab.evaluate(session, "window.scrollBy(0, 800)").await?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     // In-browser JS: iterate all links, skip self-hosted, extract snippet
     // via attribute-based selectors (no brittle class-name dependency).
     // Includes timing measurement and resilient selector fallbacks.
-    let js = format!(
-        r#"
-const _st = Date.now();
-const count = {};
-const links = Array.from(document.querySelectorAll('a[href]'));
-const results = [];
-for (const a of links) {{
-  try {{
-    const url = a.href;
-    let hostname;
-    try {{ hostname = new URL(url).hostname; }} catch(_) {{ continue; }}
-    if (hostname === location.hostname) continue;
-    const title = a.textContent.trim();
-    if (!title || title.length < 2) continue;
-    const parent = a.closest('div.g, div[data-hveid], div[data-sokoban-container]');
-    const snippetEl = parent?.querySelector('.VwiC3b, [data-sncf], span.aCOpRe, .lEBKkf, span[style*="webkit-line-clamp"]');
-    const snippet = (snippetEl?.textContent || '').trim();
-    results.push({{ title, url, snippet, position: results.length + 1 }});
-    if (results.length >= count) break;
-  }} catch(e) {{ continue; }}
-}}
-console.log('[gthings] search: ' + results.length + ' results in ' + (Date.now() - _st) + 'ms');
-JSON.stringify(results);
-"#,
-        count
-    );
+    let js =
+        include_str!("../templates/search_extract.js").replace("__COUNT__", &count.to_string());
 
     let result = tab.evaluate(session, &js).await?;
     let raw = result["result"]["value"].as_str();
     let json_str = raw.unwrap_or("[]");
     let mut items: Vec<SearchResult> = serde_json::from_str(json_str).map_err(|e| {
-        let preview = &json_str[..json_str.len().min(200)];
+        let preview = &json_str[..json_str.floor_char_boundary(json_str.len().min(200))];
         tracing::warn!("search: failed to parse results JSON: {e} (preview: {preview:?})");
         CdpError::Json(e)
     })?;
@@ -175,97 +161,74 @@ JSON.stringify(results);
         };
     }
 
-    // Post-process: filter junk, dedup by base URL, clean snippets, re-number, round authority
-    items.retain(|r| {
-        let lower = r.url.to_lowercase();
-        if r.url.contains("#:~:text=") {
-            return false;
-        }
-        if lower.starts_with("https://support.google.com/") {
-            return false;
-        }
-        if lower.starts_with("https://accounts.google.com/") {
-            return false;
-        }
-        if lower.starts_with("https://policies.google.com/") {
-            return false;
-        }
-        if lower.contains("doubleclick.net") {
-            return false;
-        }
-        if lower.contains("googlesyndication.com") {
-            return false;
-        }
-        if r.snippet.trim().len() < 5 {
-            return false;
-        }
-        true
-    });
-
-    // Dedup by base URL (strip fragment) - prefer main page over section links
-    let mut seen_bases: std::collections::HashSet<String> = std::collections::HashSet::new();
-    items.retain(|r| {
-        let base = r.url.split('#').next().unwrap_or(&r.url).to_string();
-        seen_bases.insert(base)
-    });
-
-    // Clean snippets: strip trailing "Read more" and "...Read more"
-    for item in &mut items {
-        let snip = item.snippet.clone();
-        item.snippet = if snip.ends_with("...Read more") {
-            safe_truncate_end(&snip, "...Read more")
-        } else if snip.ends_with("Read more") {
-            safe_truncate_end(&snip, "Read more")
-        } else {
-            snip
-        };
-    }
-
-    // Clean titles: strip inline URLs and appended domain patterns
-    for item in &mut items {
-        for prefix in &["https://", "http://"] {
-            if let Some(pos) = item.title.find(prefix) {
-                item.title = item.title[..pos].trim().to_string();
-            }
-        }
-        // Algorithmic: detect appended domain at title end (e.g. "TitleWikipedia")
-        let title_bytes = item.title.as_bytes();
-        for i in (1..item.title.len()).rev() {
-            let c = title_bytes[i] as char;
-            let p = title_bytes[i - 1] as char;
-            if c.is_uppercase() && (p.is_lowercase() || p == ')') {
-                let suffix = &item.title[i..];
-                if suffix.len() >= 3 && suffix.len() <= 25 {
-                    item.title = item.title[..i].trim().to_string();
-                    break;
-                }
-            }
-        }
-        item.title = item.title.trim().to_string();
-    }
-
-    // Re-number positions sequentially
-    for (i, item) in items.iter_mut().enumerate() {
-        item.position = i + 1;
-    }
-
-    // Round domain_authority to 2 decimal places
-    for item in &mut items {
-        item.domain_authority = (item.domain_authority * 100.0).round() / 100.0;
-    }
+    post_process_search_results(&mut items);
 
     Ok(items)
 }
 
-/// Safely truncate a suffix from the end of a string, respecting UTF-8 character boundaries.
-///
-/// Returns the remainder of the string (trimmed) if the suffix is present,
-/// or the original string unchanged if the suffix is not found.
-///
-/// Unlike byte-level slicing (`s[..s.len()-n]`), this avoids panicking on
-/// multi-byte characters such as non-breaking space (U+00A0), CJK, or emoji.
-fn safe_truncate_end(s: &str, suffix: &str) -> String {
-    s.strip_suffix(suffix)
-        .map(|trimmed| trimmed.trim().to_string())
-        .unwrap_or_else(|| s.to_string())
+/// Post-process search results: filter junk URLs, deduplicate by base URL,
+/// clean snippets/titles, re-number positions, and round authority scores.
+#[allow(clippy::incompatible_msrv)]
+fn post_process_search_results(items: &mut Vec<SearchResult>) {
+    // Filter junk, fragments, and short snippets, then dedup by base URL
+    let mut seen_bases: HashSet<String> = HashSet::new();
+    items.retain(|r| {
+        if r.url.contains("#:~:text=") {
+            return false;
+        }
+        if crate::harvest::is_junk_url(&r.url) {
+            return false;
+        }
+        if r.snippet.trim().is_empty() {
+            return false;
+        }
+        let base = r.url.split('#').next().unwrap_or(&r.url).to_string();
+        seen_bases.insert(base)
+    });
+
+    // Combine snippet cleaning, title cleaning, re-numbering, and rounding
+    for (i, item) in items.iter_mut().enumerate() {
+        // Clean snippet: strip trailing "Read more" and "...Read more"
+        let snip = &item.snippet;
+        if snip.ends_with("...Read more") {
+            item.snippet = safe_truncate_end(snip, "...Read more");
+        } else if snip.ends_with("Read more") {
+            item.snippet = safe_truncate_end(snip, "Read more");
+        }
+
+        // Clean title: strip inline URLs and appended domain patterns
+        for prefix in &["https://", "http://"] {
+            if let Some(pos) = item.title.find(prefix) {
+                let safe_pos = item.title.floor_char_boundary(pos);
+                item.title = item.title[..safe_pos].trim().to_string();
+            }
+        }
+        // Detect appended domain at title end (e.g. "TitleWikipedia")
+        // Scan forward to find the last lowercase→uppercase transition where
+        // the uppercase suffix is 3-25 chars long.
+        let mut truncate_at: Option<usize> = None;
+        for (i, c) in item.title.char_indices() {
+            if i == 0 || !c.is_uppercase() {
+                continue;
+            }
+            let prev = item.title[..i].chars().last().unwrap();
+            if !(prev.is_lowercase() || prev == ')') {
+                continue;
+            }
+            let suffix = &item.title[i..];
+            if (3..=25).contains(&suffix.len()) {
+                truncate_at = Some(i);
+            }
+        }
+        if let Some(pos) = truncate_at {
+            item.title = item.title[..pos].trim().to_string();
+        }
+        item.title = item.title.trim().to_string();
+
+        // Re-number position sequentially
+        item.position = i + 1;
+
+        // Round domain_authority to 2 decimal places
+        item.domain_authority = (item.domain_authority * 100.0).round() / 100.0;
+    }
 }

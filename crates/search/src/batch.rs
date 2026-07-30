@@ -11,7 +11,19 @@ use gthings_common::domain_reputation::DomainReputation;
 use gthings_common::pagination::ExtractParams;
 use tokio::task::JoinSet;
 
-use crate::search::SearchResult;
+use crate::SearchResult;
+use crate::follow::TimedSearchOutcome;
+
+/// Configuration for a batch search operation.
+#[derive(Clone)]
+pub struct BatchSearchConfig {
+    /// If `true`, attempt to load each result URL (best-effort).
+    pub follow_results: bool,
+    /// Max characters when following (ignored if `follow_results` is `false`).
+    pub follow_max_chars: usize,
+    /// Optional domain reputation cache.
+    pub reputation: Option<Arc<DomainReputation>>,
+}
 
 /// Batch processor for multi-query search pipelines.
 ///
@@ -41,127 +53,23 @@ impl BatchProcessor {
     /// * `session` — Shared CDP session (wrapped in [`Arc`] for concurrent access).
     /// * `queries` — List of search queries.
     /// * `count` — Results per query.
-    /// * `follow_results` — If `true`, attempt to load each result URL.
-    /// * `follow_max_chars` — Max characters when following (ignored if `follow_results` is `false`).
-    /// * `reputation` — Optional domain reputation cache.
+    /// * `config` — Batch search configuration (follow, reputation, etc.).
     pub async fn search(
         session: Arc<Session>,
         queries: &[String],
         count: usize,
-        follow_results: bool,
-        follow_max_chars: usize,
-        reputation: Option<Arc<DomainReputation>>,
+        config: BatchSearchConfig,
     ) -> Result<Vec<Vec<SearchResult>>, CdpError> {
-        let mut join_set: JoinSet<Result<Vec<SearchResult>, CdpError>> = JoinSet::new();
         let timeout = Duration::from_secs(30);
+        let mut join_set: JoinSet<Result<Vec<SearchResult>, CdpError>> = JoinSet::new();
 
         for query in queries {
             let session = Arc::clone(&session);
             let query = query.clone();
-            let rep = reputation.clone();
+            let config = config.clone();
 
-            join_set.spawn(async move {
-                // ── Early-exit check: scan results for blocked domains before creating tabs ──
-                // We still need a tab for the search itself; the per-URL check happens
-                // inside the follow call below.
-
-                // 1. Create tab outside timeout — guarantees we can close it on all paths
-                let tab = match session.create_background_tab().await {
-                    Ok(t) => t,
-                    Err(e) => return Err(e),
-                };
-
-                // 2. Search with timeout (tab is alive during this)
-                let search_result = tokio::time::timeout(
-                    timeout,
-                    crate::search::search(&session, &tab, &query, count),
-                )
-                .await;
-
-                // 3. In-browser pre-check on the search tab: detect bot-walls / captchas
-                //    before processing individual results. If the search page itself is
-                //    blocked, skip follow entirely for all results.
-                let search_tab_blocked = if let Ok(Ok(_)) = &search_result {
-                    if let Ok(flags) = session.check_page_signals(&tab).await {
-                        let blocked = flags.iter().any(|f| {
-                            matches!(
-                                f,
-                                gthings_common::domain_reputation::QualityFlag::BotWall
-                                    | gthings_common::domain_reputation::QualityFlag::Captcha
-                                    | gthings_common::domain_reputation::QualityFlag::Paywall
-                            )
-                        });
-                        if blocked {
-                            tracing::warn!(
-                                "batch: search page blocked (flags={:?}), skipping follow",
-                                flags
-                            );
-                            // Per-URL reputation is written inside follow().
-                        }
-                        blocked
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // 4. If search succeeded and follow_results is enabled, follow best-effort
-                if let Ok(Ok(ref results)) = search_result {
-                    if follow_results && !search_tab_blocked {
-                        for result in results {
-                            let host =
-                                gthings_common::extract_host(&result.url).unwrap_or_default();
-
-                            // Skip blocked domains without CDP interaction
-                            if let Some(ref rep) = rep {
-                                if !host.is_empty() && rep.is_blocked(&host).await {
-                                    tracing::debug!(
-                                        url = %result.url,
-                                        "batch: skip blocked domain"
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            let params = ExtractParams {
-                                offset: 0,
-                                max_chars: follow_max_chars,
-                            };
-                            if let Err(e) = crate::follow::follow(
-                                &session,
-                                &tab,
-                                &result.url,
-                                params,
-                                rep.as_deref(),
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    url = %result.url,
-                                    error = %e,
-                                    "batch: follow_result failed"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // 5. ALWAYS close tab — runs even on timeout or search error
-                if let Err(e) = session.close_tab(tab).await {
-                    tracing::warn!("close_tab failed: {e}");
-                }
-
-                // 6. Convert timeout error to CdpError
-                match search_result {
-                    Ok(Ok(results)) => Ok(results),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(CdpError::CdpCallFailed {
-                        method: "batch_search".into(),
-                        detail: format!("timeout for query: {query}"),
-                    }),
-                }
-            });
+            join_set
+                .spawn(async move { search_single(session, query, count, timeout, config).await });
         }
 
         let mut all_results = Vec::new();
@@ -179,4 +87,76 @@ impl BatchProcessor {
         }
         Ok(all_results)
     }
+}
+
+/// Per-query search logic used by [`BatchProcessor::search`].
+///
+/// Uses [`crate::follow::search_with_tab`] for the search phase, then
+/// optionally follows result URLs (each in a fresh tab).
+async fn search_single(
+    session: Arc<Session>,
+    query: String,
+    count: usize,
+    timeout: Duration,
+    config: BatchSearchConfig,
+) -> Result<Vec<crate::SearchResult>, CdpError> {
+    // 1. Search (tab lifecycle managed by helper)
+    let outcome = crate::follow::search_with_tab(&session, &query, count, timeout).await?;
+
+    let results = match outcome {
+        TimedSearchOutcome::Success(results) => results,
+        TimedSearchOutcome::Error(e) => return Err(e),
+        TimedSearchOutcome::Timeout => {
+            return Err(CdpError::CdpCallFailed {
+                method: "batch_search".into(),
+                detail: format!("timeout for query: {query}"),
+            });
+        }
+    };
+
+    // 2. If follow_results is enabled, follow each URL in a fresh tab
+    if config.follow_results {
+        for result in &results {
+            let host = gthings_common::extract_host(&result.url).unwrap_or_else(|| {
+                tracing::warn!("batch: failed to parse host from URL: {}", result.url);
+                String::new()
+            });
+
+            // Skip blocked domains without CDP interaction
+            if let Some(ref rep) = config.reputation {
+                if !host.is_empty() && rep.is_blocked(&host).await {
+                    tracing::debug!(url = %result.url, "batch: skip blocked domain");
+                    continue;
+                }
+            }
+
+            let params = ExtractParams {
+                offset: 0,
+                max_chars: config.follow_max_chars,
+            };
+            // Create a fresh tab for each follow
+            if let Err(e) =
+                follow_with_tab(&session, &result.url, params, config.reputation.as_deref()).await
+            {
+                tracing::warn!(url = %result.url, error = %e, "batch: follow failed");
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Follow a single URL inside a temporary tab.
+async fn follow_with_tab(
+    session: &Session,
+    url: &str,
+    params: ExtractParams,
+    reputation: Option<&DomainReputation>,
+) -> Result<(), CdpError> {
+    let tab = session.create_background_tab().await?;
+    let result = crate::follow::follow(session, &tab, url, params, reputation).await;
+    if let Err(e) = session.close_tab(tab).await {
+        tracing::warn!("close_tab failed: {e}");
+    }
+    result.map(|_| ())
 }

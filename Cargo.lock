@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "gthings-cdp"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "futures-util",
  "gthings-common",

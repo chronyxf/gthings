@@ -5,6 +5,8 @@
 
 use std::time::Instant;
 
+use std::time::Duration;
+
 use chrono::Utc;
 use gthings_cdp::{CdpError, Session, Tab};
 use gthings_common::domain_reputation::{DomainReputation, QualityFlag};
@@ -59,27 +61,20 @@ pub async fn follow(
     reputation: Option<&DomainReputation>,
 ) -> Result<FollowResult, CdpError> {
     let start = Instant::now();
-    let host = gthings_common::extract_host(url).unwrap_or_default();
+    let host = gthings_common::extract_host(url).unwrap_or_else(|| {
+        tracing::warn!("follow: failed to parse host from URL: {url}");
+        String::new()
+    });
 
     // ── Early-exit if domain reputation says blocked ──
     if let Some(rep) = reputation {
         if !host.is_empty() && rep.is_blocked(&host).await {
             let duration_ms = start.elapsed().as_millis() as u64;
-            return Ok(FollowResult {
-                url: url.to_string(),
-                title: String::new(),
-                content: String::new(),
-                error: "blocked by domain reputation (BotWall/Paywall)".into(),
-                provenance: Provenance {
-                    source_url: url.to_string(),
-                    method: ExtractionMethod::Follow,
-                    agent: gthings_common::GTHINGS_AGENT.into(),
-                    accessed_at: Utc::now(),
-                    duration_ms,
-                    derived_from: None,
-                },
-                pagination: None,
-            });
+            return Ok(make_error_result(
+                url,
+                "blocked by domain reputation (BotWall/Paywall)",
+                duration_ms,
+            ));
         }
     }
 
@@ -91,14 +86,7 @@ pub async fn follow(
     // and paywalls early. If any quality flags are found, skip the expensive
     // extraction JS and return immediately with those flags.
     if let Ok(flags) = session.check_page_signals(tab).await {
-        let has_blockers = flags.iter().any(|f| {
-            matches!(
-                f,
-                gthings_common::domain_reputation::QualityFlag::BotWall
-                    | gthings_common::domain_reputation::QualityFlag::Captcha
-                    | gthings_common::domain_reputation::QualityFlag::Paywall
-            )
-        });
+        let has_blockers = flags.iter().any(gthings_common::quality_flag_is_blocking);
         if has_blockers {
             // Write flags into reputation cache so future requests skip this domain
             if let Some(rep) = reputation {
@@ -107,21 +95,11 @@ pub async fn follow(
                 }
             }
             let duration_ms = start.elapsed().as_millis() as u64;
-            return Ok(FollowResult {
-                url: url.to_string(),
-                title: String::new(),
-                content: String::new(),
-                error: format!("early abort: blocked by {:?}", flags),
-                provenance: Provenance {
-                    source_url: url.to_string(),
-                    method: ExtractionMethod::Follow,
-                    agent: gthings_common::GTHINGS_AGENT.into(),
-                    accessed_at: Utc::now(),
-                    duration_ms,
-                    derived_from: None,
-                },
-                pagination: None,
-            });
+            return Ok(make_error_result(
+                url,
+                &format!("early abort: blocked by {:?}", flags),
+                duration_ms,
+            ));
         }
     }
 
@@ -134,40 +112,32 @@ pub async fn follow(
     // 4) Fallback from innerText to textContent when extracted text is < 80 chars
     //    (catches SPAs that render content via CSS-displayed elements).
     // 5) Wrapped in an async IIFE so CDP with awaitPromise:true waits for it.
-    let js = format!(
-        r#"(async function() {{try {{var _deadline=Date.now()+3000;while(Date.now()<_deadline){{if(document.body&&document.body.innerText&&document.body.innerText.length>100)break;await new Promise(function(r){{setTimeout(r,100);}});}}var _c=document.querySelector('main, article, [role="main"]')??document.body;if(!_c){{return JSON.stringify({{title:document.title||'',content:'',error:'No document body found'}});}}else{{var _isMain=_c!==document.body;var _cl=_c.cloneNode(true);if(_isMain){{_cl.querySelectorAll('script,style,noscript,svg,iframe,nav,footer,header').forEach(function(e){{e.remove()}});}}else{{_cl.querySelectorAll('script,style,noscript,svg,iframe').forEach(function(e){{e.remove()}});}}var _text=_cl.innerText||'';if(_text.length<80){{_text=_cl.textContent||'';_text=_text.replace(/\s+/g,' ').trim();}}var _title=document.title||'';if(_text.length<3){{return JSON.stringify({{title:_title,content:'',error:'content too short ('+_text.length+' chars)'}});}}else{{var _t=_text.substring({},{});return JSON.stringify({{title:_title,content:_t,error:''}});}}}}}}catch(e){{return JSON.stringify({{title:document.title||'',content:'',error:e.message}});}}}})()"#,
-        params.offset, params.max_chars
-    );
+    let js = include_str!("../templates/follow_extract.js")
+        .replace("__OFFSET__", &params.offset.to_string())
+        .replace("__MAX_CHARS__", &params.max_chars.to_string());
 
     let result = tab.evaluate(session, &js).await?;
-    let raw = result["result"]["value"].as_str();
-    let json_str =
-        raw.unwrap_or(r#"{"title":"","content":"","error":"CDP result missing value field"}"#);
-    let mut follow_result: FollowResult = serde_json::from_str(json_str).map_err(|e| {
-        let preview = &json_str[..json_str.len().min(200)];
-        tracing::warn!("follow: failed to parse extraction JSON: {e} (preview: {preview:?})");
-        CdpError::Json(e)
-    })?;
+    let raw = result.pointer("/result/value").and_then(|v| v.as_str());
+    let json_str = raw.unwrap_or_else(|| {
+        tracing::warn!("follow: CDP result missing /result/value field");
+        r#"{"title":"","content":"","error":"CDP result missing value field"}"#
+    });
+    let mut follow_result: FollowResult = parse_follow_json(json_str).map_err(|e| *e)?;
     follow_result.url = url.to_string();
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let content_len = follow_result.content.len();
 
-    follow_result.pagination = Some(gthings_common::pagination::build_pagination(
-        &params,
-        url,
-        content_len,
-        content_len,
-    ));
+    match gthings_common::pagination::build_pagination(&params, url, content_len, content_len) {
+        Ok(p) => follow_result.pagination = Some(p),
+        Err(e) => tracing::warn!("failed to build pagination: {e}"),
+    }
 
-    follow_result.provenance = Provenance {
-        source_url: url.to_string(),
-        method: ExtractionMethod::Follow,
-        agent: gthings_common::GTHINGS_AGENT.into(),
-        accessed_at: Utc::now(),
-        duration_ms,
-        derived_from: None,
-    };
+    let prov = &mut follow_result.provenance;
+    prov.source_url = follow_result.url.clone();
+    prov.agent = gthings_common::GTHINGS_AGENT.into();
+    prov.accessed_at = Utc::now();
+    prov.duration_ms = duration_ms;
 
     // ── Post-extraction: detect quality flags and update reputation ──
     if let Some(rep) = reputation {
@@ -185,24 +155,74 @@ pub async fn follow(
     Ok(follow_result)
 }
 
+/// Parse the JSON string returned by the in-browser extraction JS,
+/// returning a [`FollowResult`] or a boxed [`CdpError::Json`] on failure.
+#[allow(clippy::incompatible_msrv)]
+fn parse_follow_json(json_str: &str) -> Result<FollowResult, Box<CdpError>> {
+    serde_json::from_str(json_str).map_err(|e| {
+        let preview = &json_str[..json_str.floor_char_boundary(json_str.len().min(200))];
+        tracing::warn!("follow: failed to parse extraction JSON: {e} (preview: {preview:?})");
+        Box::new(CdpError::Json(e))
+    })
+}
+
 /// Run quality heuristics on extracted content and return matching flags.
 fn detect_quality_flags(content: &str) -> Vec<QualityFlag> {
-    let mut flags = Vec::new();
+    gthings_extraction::ContentQuality::detect_all(content)
+}
 
-    if gthings_extraction::ContentQuality::detect_bot(content) {
-        flags.push(QualityFlag::BotWall);
-    }
-    if gthings_extraction::ContentQuality::detect_paywall(content) {
-        flags.push(QualityFlag::Paywall);
-    }
-    if gthings_extraction::ContentQuality::detect_captcha(content) {
-        flags.push(QualityFlag::Captcha);
-    }
-    if gthings_extraction::ContentQuality::detect_empty_shell(content) {
-        flags.push(QualityFlag::EmptyShell);
-    }
+/// Outcome of a timed search inside a temporary tab.
+pub(crate) enum TimedSearchOutcome {
+    /// Search succeeded.
+    Success(Vec<crate::SearchResult>),
+    /// Search returned an error.
+    Error(CdpError),
+    /// Search timed out.
+    Timeout,
+}
 
-    flags
+/// Create a background tab, run `crate::search::search` with a per-task timeout,
+/// always close the tab, and return the outcome.
+///
+/// Errors from tab creation bubble up; tab-close failures are logged but not
+/// propagated. Timeout is returned as [`TimedSearchOutcome::Timeout`] so the
+/// caller can decide how to handle it (empty results vs. hard error).
+pub(crate) async fn search_with_tab(
+    session: &Session,
+    query: &str,
+    count: usize,
+    timeout: Duration,
+) -> Result<TimedSearchOutcome, CdpError> {
+    let tab = session.create_background_tab().await?;
+    let result =
+        tokio::time::timeout(timeout, crate::search::search(session, &tab, query, count)).await;
+    if let Err(e) = session.close_tab(tab).await {
+        tracing::warn!("failed to close tab: {e}");
+    }
+    match result {
+        Ok(Ok(results)) => Ok(TimedSearchOutcome::Success(results)),
+        Ok(Err(e)) => Ok(TimedSearchOutcome::Error(e)),
+        Err(_) => Ok(TimedSearchOutcome::Timeout),
+    }
+}
+
+/// Build a boilerplate [`FollowResult`] for early-exit error paths.
+fn make_error_result(url: &str, error: &str, duration_ms: u64) -> FollowResult {
+    FollowResult {
+        url: url.to_string(),
+        title: String::new(),
+        content: String::new(),
+        error: error.to_string(),
+        provenance: Provenance {
+            source_url: url.to_string(),
+            method: ExtractionMethod::Follow,
+            agent: gthings_common::GTHINGS_AGENT.into(),
+            accessed_at: Utc::now(),
+            duration_ms,
+            derived_from: None,
+        },
+        pagination: None,
+    }
 }
 
 #[cfg(test)]
@@ -309,16 +329,15 @@ mod tests {
     /// Verify the format string contains the new compound selector.
     #[test]
     fn test_extraction_js_has_new_selectors() {
-        let js = format!(
-            r#"(async function() {{try {{var _deadline=Date.now()+3000;while(Date.now()<_deadline){{if(document.body&&document.body.innerText&&document.body.innerText.length>100)break;await new Promise(function(r){{setTimeout(r,100);}});}}var _c=document.querySelector('main, article, [role="main"]')??document.body;if(!_c){{return JSON.stringify({{title:document.title||'',content:'',error:'No document body found'}});}}else{{var _isMain=_c!==document.body;var _cl=_c.cloneNode(true);if(_isMain){{_cl.querySelectorAll('script,style,noscript,svg,iframe,nav,footer,header').forEach(function(e){{e.remove()}});}}else{{_cl.querySelectorAll('script,style,noscript,svg,iframe').forEach(function(e){{e.remove()}});}}var _text=_cl.innerText||'';if(_text.length<80){{_text=_cl.textContent||'';_text=_text.replace(/\s+/g,' ').trim();}}var _title=document.title||'';if(_text.length<3){{return JSON.stringify({{title:_title,content:'',error:'content too short ('+_text.length+' chars)'}});}}else{{var _t=_text.substring({},{});return JSON.stringify({{title:_title,content:_t,error:''}});}}}}}}catch(e){{return JSON.stringify({{title:document.title||'',content:'',error:e.message}});}}}})()"#,
-            0usize, 5000usize
-        );
+        let js = include_str!("../templates/follow_extract.js")
+            .replace("__OFFSET__", "0")
+            .replace("__MAX_CHARS__", "5000");
         assert!(
             js.contains(r#"querySelector('main, article, [role="main"]')"#),
             "JS must use the new compound selector"
         );
         assert!(
-            js.contains("Date.now()<_deadline"),
+            js.contains("Date.now() < _deadline"),
             "JS must contain the 3-second async polling loop guard"
         );
         assert!(
@@ -326,7 +345,7 @@ mod tests {
             "JS must contain async/await in polling loop"
         );
         assert!(
-            js.contains("_text=_cl.textContent"),
+            js.contains("_text = _cl.textContent"),
             "JS must have textContent fallback"
         );
     }
@@ -335,10 +354,9 @@ mod tests {
     /// when falling back to body, nav/footer/header are preserved.
     #[test]
     fn test_extraction_js_conditional_stripping_main() {
-        let js = format!(
-            r#"(async function() {{try {{var _deadline=Date.now()+3000;while(Date.now()<_deadline){{if(document.body&&document.body.innerText&&document.body.innerText.length>100)break;await new Promise(function(r){{setTimeout(r,100);}});}}var _c=document.querySelector('main, article, [role="main"]')??document.body;if(!_c){{return JSON.stringify({{title:document.title||'',content:'',error:'No document body found'}});}}else{{var _isMain=_c!==document.body;var _cl=_c.cloneNode(true);if(_isMain){{_cl.querySelectorAll('script,style,noscript,svg,iframe,nav,footer,header').forEach(function(e){{e.remove()}});}}else{{_cl.querySelectorAll('script,style,noscript,svg,iframe').forEach(function(e){{e.remove()}});}}var _text=_cl.innerText||'';if(_text.length<80){{_text=_cl.textContent||'';_text=_text.replace(/\s+/g,' ').trim();}}var _title=document.title||'';if(_text.length<3){{return JSON.stringify({{title:_title,content:'',error:'content too short ('+_text.length+' chars)'}});}}else{{var _t=_text.substring({},{});return JSON.stringify({{title:_title,content:_t,error:''}});}}}}}}catch(e){{return JSON.stringify({{title:document.title||'',content:'',error:e.message}});}}}})()"#,
-            0usize, 5000usize
-        );
+        let js = include_str!("../templates/follow_extract.js")
+            .replace("__OFFSET__", "0")
+            .replace("__MAX_CHARS__", "5000");
         // The full JS must contain the chrome-rich stripping query
         assert!(
             js.contains("script,style,noscript,svg,iframe,nav,footer,header"),
@@ -365,16 +383,15 @@ mod tests {
     /// Verify that < 3 char content produces an error in the JS logic.
     #[test]
     fn test_extraction_js_short_content_error() {
-        let js = format!(
-            r#"(async function() {{try {{var _deadline=Date.now()+3000;while(Date.now()<_deadline){{if(document.body&&document.body.innerText&&document.body.innerText.length>100)break;await new Promise(function(r){{setTimeout(r,100);}});}}var _c=document.querySelector('main, article, [role="main"]')??document.body;if(!_c){{return JSON.stringify({{title:document.title||'',content:'',error:'No document body found'}});}}else{{var _isMain=_c!==document.body;var _cl=_c.cloneNode(true);if(_isMain){{_cl.querySelectorAll('script,style,noscript,svg,iframe,nav,footer,header').forEach(function(e){{e.remove()}});}}else{{_cl.querySelectorAll('script,style,noscript,svg,iframe').forEach(function(e){{e.remove()}});}}var _text=_cl.innerText||'';if(_text.length<80){{_text=_cl.textContent||'';_text=_text.replace(/\s+/g,' ').trim();}}var _title=document.title||'';if(_text.length<3){{return JSON.stringify({{title:_title,content:'',error:'content too short ('+_text.length+' chars)'}});}}else{{var _t=_text.substring({},{});return JSON.stringify({{title:_title,content:_t,error:''}});}}}}}}catch(e){{return JSON.stringify({{title:document.title||'',content:'',error:e.message}});}}}})()"#,
-            0usize, 5000usize
-        );
+        let js = include_str!("../templates/follow_extract.js")
+            .replace("__OFFSET__", "0")
+            .replace("__MAX_CHARS__", "5000");
         assert!(
             js.contains("content too short ("),
             "Short content must produce an error message"
         );
         assert!(
-            js.contains("_text.length<3"),
+            js.contains("_text.length < 3"),
             "The short-content threshold must be 3"
         );
     }

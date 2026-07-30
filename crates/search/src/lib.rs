@@ -15,7 +15,7 @@ pub mod follow;
 pub mod harvest;
 pub mod search;
 
-pub use batch::BatchProcessor;
+pub use batch::{BatchProcessor, BatchSearchConfig};
 pub use follow::{FollowResult, follow};
 pub use gthings_common::domain_reputation::DomainReputation;
 pub use harvest::{
