@@ -47,6 +47,14 @@ if [ "$needs_changeset" = "1" ]; then
     echo "[PASS] All pre-commit checks passed"
 fi
 
+# Allow version-bump commits (Cargo.toml + CHANGELOG.md only, no .rs changes)
+rs_changes=$(echo "$STAGED_FILES" | grep -c '\.rs$' || true)
+cargo_toml_changes=$(echo "$STAGED_FILES" | grep -c 'Cargo\.toml' || true)
+changelog_changes=$(echo "$STAGED_FILES" | grep -c 'CHANGELOG\.md' || true)
+if [ "$rs_changes" = "0" ] && [ "$cargo_toml_changes" -ge "1" ] && [ "$changelog_changes" -ge "1" ]; then
+    exit 0
+fi
+
 # Check for changesets
 if [ "$needs_changeset" = "1" ]; then
     has_changeset=0
