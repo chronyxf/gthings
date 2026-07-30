@@ -99,7 +99,10 @@ fn kill_chrome(mut child: Child) {
 fn test_status_shows_stopped_when_no_browser() {
     let stdout = run_gthings_with_env(&["status", "--json"], &[("GTHINGS_CDP_PORT", "29999")]);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON from status");
-    assert_eq!(value["status"], "stopped", "expected stopped status");
+    assert_eq!(
+        value["data"]["status"], "stopped",
+        "expected stopped status"
+    );
 }
 
 #[test]

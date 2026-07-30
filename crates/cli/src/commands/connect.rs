@@ -1,13 +1,39 @@
 //! Shared connection helpers for CLI subcommands.
 
-use gthings_cdp::{CdpError, Session, detect};
+use gthings_cdp::{Session, detect};
 
-/// Port from `GTHINGS_CDP_PORT` env var (default 9222).
-pub(crate) fn port() -> u16 {
-    std::env::var("GTHINGS_CDP_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9222)
+use crate::commands::helpers::UniversalFlags;
+
+/// Port from `--cdp-port` flag, `GTHINGS_CDP_PORT` env var, or default 9222.
+pub(crate) fn port(flags: &UniversalFlags) -> u16 {
+    flags.cdp_port
+}
+
+/// Resolve the CDP WebSocket URL.
+///
+/// Priority: `--cdp-url` flag → `GTHINGS_CDP_WS_URL` env var → detection via port.
+pub(crate) async fn resolve_ws_url(flags: &UniversalFlags) -> Result<String, i32> {
+    if let Some(url) = &flags.cdp_url {
+        return Ok(url.clone());
+    }
+
+    if let Ok(url) = std::env::var("GTHINGS_CDP_WS_URL") {
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+
+    let p = port(flags);
+    let browser = detect(p).await.map_err(|_| {
+        print_error(
+            "BROWSER_NOT_FOUND",
+            &format!("No browser found on port {p}"),
+            "Open Dia or Chrome with --remote-debugging-port=9222",
+        );
+        1
+    })?;
+
+    Ok(browser.ws_url)
 }
 
 /// Print a machine-readable error JSON to stderr.
@@ -21,24 +47,13 @@ pub(crate) fn print_error(code: &str, detail: &str, hint: &str) {
 }
 
 /// Detect browser → connect → return Session.
-pub(crate) async fn connect() -> Result<Session, i32> {
-    let p = port();
+pub(crate) async fn connect(flags: &UniversalFlags) -> Result<Session, i32> {
+    let ws_url = resolve_ws_url(flags).await?;
 
-    // `detect` internally checks GTHINGS_CDP_WS_URL first (fast path),
-    // then probes the CDP port via HTTP /json/version, /json, /json/list,
-    // and finally DevToolsActivePort file scan.
-    let browser = detect(p).await.map_err(|_| {
-        print_error(
-            "BROWSER_NOT_FOUND",
-            &format!("No browser found on port {p}"),
-            "Open Dia or Chrome with --remote-debugging-port=9222",
-        );
-        1
-    })?;
+    tracing::info!("Connecting to browser at {}", ws_url);
 
-    tracing::info!("Connecting to browser at {}", browser.ws_url);
-
-    Session::connect(&browser.ws_url).await.map_err(|e| {
+    let timeout = Some(std::time::Duration::from_secs(flags.timeout));
+    Session::connect(&ws_url, timeout).await.map_err(|e| {
         print_error(
             "CONNECTION_FAILED",
             &e.to_string(),
@@ -46,24 +61,4 @@ pub(crate) async fn connect() -> Result<Session, i32> {
         );
         1
     })
-}
-
-/// Map common CDP errors to machine-readable error JSON.
-pub(crate) fn on_cdp_error(e: &CdpError) {
-    match e {
-        CdpError::NavigationTimeout { .. } => {
-            print_error(
-                "NAVIGATION_TIMEOUT",
-                &e.to_string(),
-                "Check network connectivity or URL",
-            );
-        }
-        _ => {
-            print_error(
-                "SEARCH_FAILED",
-                &e.to_string(),
-                "Retry with different arguments",
-            );
-        }
-    }
 }

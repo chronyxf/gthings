@@ -1,4 +1,11 @@
-# Changelog — gthings-common
+# Changelog
+
+## [0.3.6] - 2026-07-30
+
+### Chore
+- Remove dead cache_key function and unused imports
+
+ — gthings-common
 
 ## 0.3.5 (2026-07-26)
 

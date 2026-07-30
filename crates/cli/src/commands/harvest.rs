@@ -1,26 +1,26 @@
-//! `gthings harvest` — full research pipeline: search → dedup → rank → follow.
+//! Harvest pipeline (dispatched via `search --strategy harvest`).
+//!
+//! Full research pipeline: search → dedup → rank → select → follow → quality score.
 
 use std::sync::Arc;
 
 use gthings_common::domain_reputation::DomainReputation;
 use gthings_common::pagination::ExtractParams;
-use gthings_search::harvest::{
-    BatchHarvestRequest, DedupStrategy, HarvestWarning, RankStrategy, harvest,
-};
+use gthings_search::harvest::{BatchHarvestRequest, DedupStrategy, RankStrategy, harvest};
 
-use crate::commands::{connect, print_error};
+use crate::commands::{UniversalFlags, connect, emit_output};
 
 /// Harvest: detect → connect → harvest → disconnect → output.
 pub(crate) async fn cmd_harvest(
+    flags: &UniversalFlags,
     queries: Vec<String>,
     dedup: String,
     rank: String,
     follow_top: usize,
     max_chars: usize,
-    json: bool,
     warn_tabs: usize,
 ) -> i32 {
-    let session = match connect().await {
+    let session = match connect(flags).await {
         Ok(s) => s,
         Err(c) => return c,
     };
@@ -28,10 +28,15 @@ pub(crate) async fn cmd_harvest(
     let dedup_strategy = match dedup.as_str() {
         "url" => DedupStrategy::UrlOnly,
         _ => {
-            print_error(
-                "INVALID_DEDUP",
-                &format!("Unknown dedup strategy: {dedup}"),
-                "Use --dedup=url",
+            emit_output(
+                None,
+                Some((
+                    "INVALID_DEDUP",
+                    &format!("Unknown dedup strategy: {dedup}"),
+                    "Use --dedup=url",
+                )),
+                flags.resolved_output(),
+                flags.query.as_deref(),
             );
             return 1;
         }
@@ -43,10 +48,15 @@ pub(crate) async fn cmd_harvest(
         "snippet" => RankStrategy::SnippetLength,
         "composite" => RankStrategy::Composite,
         _ => {
-            print_error(
-                "INVALID_RANK",
-                &format!("Unknown rank strategy: {rank}"),
-                "Use --rank=serp|authority|snippet|composite",
+            emit_output(
+                None,
+                Some((
+                    "INVALID_RANK",
+                    &format!("Unknown rank strategy: {rank}"),
+                    "Use --rank=serp|authority|snippet|composite",
+                )),
+                flags.resolved_output(),
+                flags.query.as_deref(),
             );
             return 1;
         }
@@ -84,10 +94,15 @@ pub(crate) async fn cmd_harvest(
     let (results, summary) = match harvest(Arc::clone(&arc_session), req).await {
         Ok(r) => r,
         Err(e) => {
-            print_error(
-                "HARVEST_FAILED",
-                &e.to_string(),
-                "Check browser connection and network",
+            emit_output(
+                None,
+                Some((
+                    "HARVEST_FAILED",
+                    &e.to_string(),
+                    "Check browser connection and network",
+                )),
+                flags.resolved_output(),
+                flags.query.as_deref(),
             );
             if let Ok(s) = Arc::try_unwrap(arc_session) {
                 if let Err(e) = s.disconnect().await {
@@ -104,69 +119,16 @@ pub(crate) async fn cmd_harvest(
         }
     }
 
-    if json {
-        let output = serde_json::to_string_pretty(&serde_json::json!({
-            "results": results,
-            "summary": summary,
-        }))
-        .unwrap_or_else(|e| {
-            tracing::error!("serialize output failed: {e}");
-            String::new()
-        });
-        println!("{output}");
-    } else {
-        // Print summary
-        println!("=== Harvest Summary ===");
-        println!(
-            "Queries: {} | Results: {} | Unique sources: {}",
-            summary.total_queries, summary.total_results, summary.unique_sources_followed
-        );
-        for (q, cov) in &summary.coverage_by_query {
-            println!(
-                "  [{q}] total={} ok={} failed={}",
-                cov.total_hits, cov.followed_ok, cov.followed_failed
-            );
-        }
-        for w in &summary.warnings {
-            match w {
-                HarvestWarning::FollowBudgetCollapsedToOneSite => {
-                    println!("  [!] Warning: Follow budget collapsed to one site");
-                }
-                HarvestWarning::NoBodyForQuery(q) => {
-                    println!("  [!] Warning: No body content for query '{q}'");
-                }
-                HarvestWarning::AllSnippetOnly => {
-                    println!("  [!] Warning: All results are snippet-only");
-                }
-            }
-        }
-        println!();
-
-        // Print each result
-        for (i, r) in results.iter().enumerate() {
-            println!(
-                "#{} {} — {}  [{:.1}]",
-                i + 1,
-                r.search_result.title,
-                r.search_result.url,
-                r.search_result.domain_authority
-            );
-            if !r.search_result.snippet.is_empty() {
-                println!("  {}", r.search_result.snippet);
-            }
-            if let Some(ref content) = r.followed_content {
-                let preview: String = content.chars().take(200).collect();
-                println!("  Content: {preview}...");
-            }
-            if let Some(ref q) = r.quality {
-                println!(
-                    "  Quality: {:.2}/1.0 — {}",
-                    q.score,
-                    if q.is_ok { "ok" } else { "low" }
-                );
-            }
-        }
-    }
+    let value = serde_json::json!({
+        "results": results,
+        "summary": summary,
+    });
+    emit_output(
+        Some(value),
+        None,
+        flags.resolved_output(),
+        flags.query.as_deref(),
+    );
 
     0
 }

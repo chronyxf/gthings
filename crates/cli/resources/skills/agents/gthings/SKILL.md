@@ -1,6 +1,6 @@
 ---
 name: gthings
-description: "Browser automation and web research CLI — search, follow, extract, PDF, batch, harvest with quality gates"
+description: "Browser automation and web research CLI — search, extract, PDF, AX, status, update with quality gates"
 ---
 
 # Skill: gthings
@@ -9,53 +9,57 @@ Rust CLI for AI-agent-driven web research. Reuses installed Chrome via CDP. All 
 
 ## When This Skill Activates
 
-User says: "search" "research" "look up" "find" "gthings" "web research" "harvest" "extract" "pdf"
+User says: "search" "research" "look up" "find" "gthings" "web research" "extract" "pdf" "ax"
 
 ## Core Rules
 
-1. Always use `--json` for structured output an AI agent can parse.
-2. Prefer `harvest` for multi-query research (handles dedup/diversity/quality in one pass).
+1. Always use `--output json` for structured output (or `--json` as backward-compat alias).
+2. Prefer `search --strategy harvest` for multi-query research (handles dedup/diversity/quality in one pass).
 3. Filter results by `body_status == "ok"` before using content.
 4. Check `quality.reasons` — never use content with paywall/bot_blocked/too_short.
 
+## Universal Flags (every command)
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <FORMAT>` | Output format: text, json, nd-json (default: text) |
+| `-q, --query <JMES>` | JMESPath filter on JSON output |
+| `--cdp-port <PORT>` | CDP port (default: 9222) |
+| `--cdp-url <URL>` | CDP WebSocket URL (overrides port) |
+| `--timeout <SECS>` | Timeout for CDP/extraction (default: 30) |
+| `-v` | Verbose (-v -v debug, -v -v -v trace) |
+| `-q, --quiet` | Suppress non-error output |
+| `--json` | Backward-compat alias for `--output json` |
+
 ## Commands
 
-### `gthings search <query> [--count N] [--json]`
+### `gthings search <queries...> [--count N] [--strategy simple|parallel|harvest] [--extract-results] [--max-chars N] [--dedup STR] [--rank STR] [--follow-top N] [--warn-tabs N]`
 
-Google SERP search. Returns results with title, url, snippet, domain_authority, provenance.
+Google SERP search with strategy-based processing. Returns `SearchResult[]` (simple), `SearchResult[][]` (parallel), or `HarvestedResult[]` with summary (harvest). Default strategy: simple.
 
-### `gthings follow <url> [--max-chars N] [--offset N] [--json]`
+### `gthings extract <url> [--max-chars N] [--offset N]`
 
-Single page extraction via CDP. Content from `document.body.innerText`. Check `quality` field.
+HTTP-based extraction. Auto-detects web (Readability), PDF (pdftotext), arXiv (abs→pdf), GitHub (raw). Returns `Article` with quality score.
 
-### `gthings extract <url> [--max-chars N] [--offset N] [--json]`
+### `gthings ax <url> [--max-nodes N]`
 
-HTTP-based extraction. Auto-detects web (Readability), PDF (pdftotext), arXiv (abs→pdf), GitHub (raw). Better for PDF/academic content.
+Fetch compressed accessibility tree via CDP. Returns AX tree nodes (default max 500). Useful for structured page analysis without full render.
 
-### `gthings batch <q1> [<q2> ...] [--count N] [--follow] [--max-chars N] [--json]`
+### `gthings pdf-url <url> [--max-chars N] [--offset N]`
 
-Multi-query search. With --follow, follows top result per query.
+PDF extraction via pdftotext from URL. Requires poppler (`brew install poppler`). Quality >= 0.90 for clean scientific text.
 
-### `gthings harvest <q1> [<q2> ...] [--follow-top N] [--max-chars N] [--dedup url] [--rank composite] [--json]`
+### `gthings pdf-file <path> [--max-chars N] [--offset N]`
 
-Full research pipeline: search all queries → dedup (URL normalization, fragment/tracking-param stripping) → rank (composite score: authority + snippet + diversity) → select (per-query minimum, per-host cap, junk filter) → follow → quality score.
+PDF extraction from local file.
 
-Output: `{ "results": HarvestedResult[], "summary": HarvestRunSummary }`
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| --follow-top | 8 | Max URLs to follow |
-| --max-chars | 15000 | Max chars per follow |
-| --dedup | url | Dedup strategy |
-| --rank | composite | serp_order, domain_authority, snippet_length, composite |
-
-### `gthings pdf url <url> [--json]` / `gthings pdf file <path> [--json]`
-
-PDF extraction via pdftotext. Requires poppler (`brew install poppler`). Quality >= 0.90 for clean scientific text.
-
-### `gthings status [--json]`
+### `gthings status`
 
 Browser connection check.
+
+### `gthings update`
+
+Update gthings to latest version.
 
 ## Key Output Fields for Agent Triage
 
@@ -64,7 +68,7 @@ Browser connection check.
 | Value | Meaning | Agent Action |
 |-------|---------|-------------|
 | ok | Full body extracted | Use `followed_content` |
-| pdf_unextracted | PDF/arXiv, CDP can't handle | Fetch via `extract <url>` or `pdf url <url>` |
+| pdf_unextracted | PDF/arXiv, CDP can't handle | Fetch via `extract <url>` or `pdf-url <url>` |
 | extract_failed | Paywall/bot/network error | Skip |
 | chrome_or_empty | Nav-only or empty page | Skip |
 | snippet_only | Not followed, SERP only | Lead only |
@@ -83,7 +87,7 @@ Browser connection check.
 
 If any of these are present, do NOT use the content as factual source.
 
-### coverage_by_query (in HarvestRunSummary)
+### coverage_by_query (in harvest summary)
 
 Map of query -> `{ total_hits, followed_ok, followed_failed }`. Use this to identify which topics have body coverage.
 
@@ -105,6 +109,6 @@ Map of query -> `{ total_hits, followed_ok, followed_failed }`. Use this to iden
 |--------|-------|--------|
 | BROWSER_NOT_FOUND | Chrome not running with --remote-debugging-port=9222 | Start browser |
 | CONNECTION_FAILED | CDP port wrong | Check with status |
-| body_status=chrome_or_empty | Nav-only page | Retry with extract instead of follow |
-| body_status=pdf_unextracted | PDF not extracted | Use extract or pdf command |
+| body_status=chrome_or_empty | Nav-only page | Retry with extract instead |
+| body_status=pdf_unextracted | PDF not extracted | Use extract or pdf-url |
 | quality.score==0 with reasons | Complete failure | Skip result |

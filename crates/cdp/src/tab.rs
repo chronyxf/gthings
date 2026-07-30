@@ -13,11 +13,16 @@ pub struct Tab {
 
 impl Tab {
     /// Create a new tab via CDP.
-    pub async fn create(session: &Session, url: &str) -> Result<Self> {
+    ///
+    /// If `background` is `true`, the tab is created with `background: true`,
+    /// meaning it will not steal focus and can operate invisibly.
+    pub async fn create(session: &Session, url: &str, background: bool) -> Result<Self> {
         let conn = session.connection();
-        let result = conn
-            .call("Target.createTarget", json!({ "url": url }), None)
-            .await?;
+        let mut params = json!({ "url": url });
+        if background {
+            params["background"] = json!(true);
+        }
+        let result = conn.call("Target.createTarget", params, None).await?;
 
         // Try to get sessionId first (standard CDP behavior)
         if let Some(session_id) = result.get("sessionId").and_then(|v| v.as_str()) {
@@ -81,6 +86,13 @@ impl Tab {
             method: "Target.createTarget".into(),
             detail: "could not create tab: no targetId or sessionId in response".into(),
         })
+    }
+
+    /// Create a background tab (no window focus steal) at `about:blank`.
+    ///
+    /// Equivalent to `Tab::create(session, "about:blank", true)`.
+    pub async fn create_background(session: &Session) -> Result<Self> {
+        Self::create(session, "about:blank", true).await
     }
 
     /// Navigate to URL and wait for fully loaded. Delegates to Session::navigate.

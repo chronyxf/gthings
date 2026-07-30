@@ -3,7 +3,7 @@
 //! Uses attribute-based selectors (`a[href]` filtered by hostname) resilient
 //! to Google class name changes.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gthings_cdp::{CdpError, Session, Tab};
@@ -17,7 +17,7 @@ pub struct SearchResult {
     pub snippet: String,
     pub position: usize,
     /// How and when this result was obtained.
-    #[serde(default)]
+    #[serde(default, skip)]
     pub provenance: Provenance,
     /// Domain authority score (0.0–1.0) for the result URL's host.
     #[serde(default)]
@@ -111,6 +111,15 @@ async fn search_once(
         }
     }
 
+    // Scroll down to trigger lazy loading of more organic results.
+    // Google SERP only renders ~2-3 results initially; the rest are
+    // loaded dynamically when the user scrolls.
+    let scroll_iterations = (count / 2).max(1);
+    for _ in 0..scroll_iterations {
+        tab.evaluate(session, "window.scrollBy(0, 800)").await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     // In-browser JS: iterate all links, skip self-hosted, extract snippet
     // via attribute-based selectors (no brittle class-name dependency).
     // Includes timing measurement and resilient selector fallbacks.
@@ -166,5 +175,97 @@ JSON.stringify(results);
         };
     }
 
+    // Post-process: filter junk, dedup by base URL, clean snippets, re-number, round authority
+    items.retain(|r| {
+        let lower = r.url.to_lowercase();
+        if r.url.contains("#:~:text=") {
+            return false;
+        }
+        if lower.starts_with("https://support.google.com/") {
+            return false;
+        }
+        if lower.starts_with("https://accounts.google.com/") {
+            return false;
+        }
+        if lower.starts_with("https://policies.google.com/") {
+            return false;
+        }
+        if lower.contains("doubleclick.net") {
+            return false;
+        }
+        if lower.contains("googlesyndication.com") {
+            return false;
+        }
+        if r.snippet.trim().len() < 5 {
+            return false;
+        }
+        true
+    });
+
+    // Dedup by base URL (strip fragment) - prefer main page over section links
+    let mut seen_bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    items.retain(|r| {
+        let base = r.url.split('#').next().unwrap_or(&r.url).to_string();
+        seen_bases.insert(base)
+    });
+
+    // Clean snippets: strip trailing "Read more" and "...Read more"
+    for item in &mut items {
+        let snip = item.snippet.clone();
+        item.snippet = if snip.ends_with("...Read more") {
+            safe_truncate_end(&snip, "...Read more")
+        } else if snip.ends_with("Read more") {
+            safe_truncate_end(&snip, "Read more")
+        } else {
+            snip
+        };
+    }
+
+    // Clean titles: strip inline URLs and appended domain patterns
+    for item in &mut items {
+        for prefix in &["https://", "http://"] {
+            if let Some(pos) = item.title.find(prefix) {
+                item.title = item.title[..pos].trim().to_string();
+            }
+        }
+        // Algorithmic: detect appended domain at title end (e.g. "TitleWikipedia")
+        let title_bytes = item.title.as_bytes();
+        for i in (1..item.title.len()).rev() {
+            let c = title_bytes[i] as char;
+            let p = title_bytes[i - 1] as char;
+            if c.is_uppercase() && (p.is_lowercase() || p == ')') {
+                let suffix = &item.title[i..];
+                if suffix.len() >= 3 && suffix.len() <= 25 {
+                    item.title = item.title[..i].trim().to_string();
+                    break;
+                }
+            }
+        }
+        item.title = item.title.trim().to_string();
+    }
+
+    // Re-number positions sequentially
+    for (i, item) in items.iter_mut().enumerate() {
+        item.position = i + 1;
+    }
+
+    // Round domain_authority to 2 decimal places
+    for item in &mut items {
+        item.domain_authority = (item.domain_authority * 100.0).round() / 100.0;
+    }
+
     Ok(items)
+}
+
+/// Safely truncate a suffix from the end of a string, respecting UTF-8 character boundaries.
+///
+/// Returns the remainder of the string (trimmed) if the suffix is present,
+/// or the original string unchanged if the suffix is not found.
+///
+/// Unlike byte-level slicing (`s[..s.len()-n]`), this avoids panicking on
+/// multi-byte characters such as non-breaking space (U+00A0), CJK, or emoji.
+fn safe_truncate_end(s: &str, suffix: &str) -> String {
+    s.strip_suffix(suffix)
+        .map(|trimmed| trimmed.trim().to_string())
+        .unwrap_or_else(|| s.to_string())
 }

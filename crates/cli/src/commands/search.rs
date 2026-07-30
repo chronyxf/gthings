@@ -1,78 +1,71 @@
-//! `gthings search` — search Google via CDP browser.
+//! `gthings search` — Google search via CDP.
+//!
+//! Uses isolated background tab pattern: each search creates its own tab,
+//! preventing cross-process blocking when concurrent searches run.
 
 use gthings_search::search;
 
-use crate::commands::{connect, on_cdp_error, print_error};
+use crate::commands::{UniversalFlags, connect, emit_output};
 
-/// Search: detect → connect → create tab → search → close tab → disconnect.
-pub(crate) async fn cmd_search(query: &str, count: usize, json: bool) -> i32 {
-    let session = match connect().await {
+/// Search: detect → connect → isolated search → disconnect → output.
+pub(crate) async fn cmd_search(flags: &UniversalFlags, term: &str, count: usize) -> i32 {
+    if term.trim().is_empty() {
+        emit_output(
+            None,
+            Some((
+                "EMPTY_QUERY",
+                "Search term cannot be empty",
+                "Provide at least one non-empty search term",
+            )),
+            flags.resolved_output(),
+            flags.query.as_deref(),
+        );
+        return 1;
+    }
+    let session = match connect(flags).await {
         Ok(s) => s,
         Err(c) => return c,
     };
 
-    let tab = match session.create_tab("about:blank").await {
-        Ok(t) => t,
-        Err(e) => {
-            print_error(
-                "TAB_CREATE_FAILED",
-                &e.to_string(),
-                "Check browser connection",
-            );
-            if let Err(e) = session.disconnect().await {
-                tracing::warn!("disconnect failed: {e}");
-            }
-            return 1;
-        }
-    };
-
-    let results = match search(&session, &tab, query, count).await {
+    let term = term.to_string();
+    let query_for_output = term.clone();
+    let result = match session
+        .with_isolated_tab(|session, tab| {
+            Box::pin(async move { search(session, tab, &term, count).await })
+        })
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
-            if let Err(e) = session.close_tab(tab).await {
-                tracing::warn!("close_tab failed: {e}");
-            }
-            if let Err(e) = session.disconnect().await {
-                tracing::warn!("disconnect failed: {e}");
-            }
-            on_cdp_error(&e);
+            let _ = session.disconnect().await;
+            emit_output(
+                None,
+                Some((
+                    "SEARCH_FAILED",
+                    &e.to_string(),
+                    "Retry with different arguments",
+                )),
+                flags.resolved_output(),
+                flags.query.as_deref(),
+            );
             return 1;
         }
     };
 
-    if let Err(e) = session.close_tab(tab).await {
-        tracing::warn!("close_tab failed: {e}");
-    }
     if let Err(e) = session.disconnect().await {
         tracing::warn!("disconnect failed: {e}");
     }
 
-    if json {
-        let output = serde_json::to_string(&results).unwrap_or_else(|e| {
-            tracing::error!("serialize output failed: {e}");
-            String::new()
-        });
-        println!("{}", output);
-    } else {
-        for r in &results {
-            let authority = r.domain_authority;
-            let stars = if authority >= 0.9 {
-                "***"
-            } else if authority >= 0.8 {
-                "**"
-            } else if authority >= 0.7 {
-                "*"
-            } else {
-                ""
-            };
-            println!(
-                "#{} {} — {}  [{:.1}{}]",
-                r.position, r.title, r.url, authority, stars
-            );
-            if !r.snippet.is_empty() {
-                println!("  {}", r.snippet);
-            }
-        }
-    }
+    let data = serde_json::json!({
+        "results": result,
+        "query": query_for_output,
+        "body_status": "snippet_only",
+    });
+    emit_output(
+        Some(data),
+        None,
+        flags.resolved_output(),
+        flags.query.as_deref(),
+    );
     0
 }

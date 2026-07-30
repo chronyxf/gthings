@@ -1,23 +1,23 @@
-//! `gthings batch` — batch search multiple queries via CDP.
+//! Batch search (dispatched via `search --strategy parallel`).
 
 use std::sync::Arc;
 
 use gthings_search::BatchProcessor;
 
-use crate::commands::{connect, print_error};
+use crate::commands::{UniversalFlags, connect, emit_output};
 
-/// Batch: detect → connect → batch → disconnect.
+/// Batch: detect → connect → batch → disconnect → output.
 ///
 /// BatchProcessor::search creates and closes tabs internally, so we only
 /// manage the session lifecycle at this level.
 pub(crate) async fn cmd_batch(
+    flags: &UniversalFlags,
     queries: Vec<String>,
     count: usize,
-    do_follow: bool,
+    extract_results: bool,
     max_chars: usize,
-    json: bool,
 ) -> i32 {
-    let session = match connect().await {
+    let session = match connect(flags).await {
         Ok(s) => s,
         Err(c) => return c,
     };
@@ -28,7 +28,7 @@ pub(crate) async fn cmd_batch(
         Arc::clone(&arc_session),
         &queries,
         count,
-        do_follow,
+        extract_results,
         max_chars,
         None,
     )
@@ -36,10 +36,15 @@ pub(crate) async fn cmd_batch(
     {
         Ok(r) => r,
         Err(e) => {
-            print_error(
-                "BATCH_FAILED",
-                &e.to_string(),
-                "Retry with fewer queries or longer timeout",
+            emit_output(
+                None,
+                Some((
+                    "BATCH_FAILED",
+                    &e.to_string(),
+                    "Retry with fewer queries or longer timeout",
+                )),
+                flags.resolved_output(),
+                flags.query.as_deref(),
             );
             return 1;
         }
@@ -52,25 +57,11 @@ pub(crate) async fn cmd_batch(
         }
     }
 
-    if json {
-        let output = serde_json::to_string(&all_results).unwrap_or_else(|e| {
-            tracing::error!("serialize output failed: {e}");
-            String::new()
-        });
-        println!("{}", output);
-    } else {
-        for (i, results) in all_results.iter().enumerate() {
-            println!("Query #{}:", i + 1);
-            for r in results {
-                println!(
-                    "  #{} {} — {}  [{:.1}]",
-                    r.position, r.title, r.url, r.domain_authority
-                );
-                if !r.snippet.is_empty() {
-                    println!("    {}", r.snippet);
-                }
-            }
-        }
-    }
+    emit_output(
+        Some(serde_json::json!(all_results)),
+        None,
+        flags.resolved_output(),
+        flags.query.as_deref(),
+    );
     0
 }

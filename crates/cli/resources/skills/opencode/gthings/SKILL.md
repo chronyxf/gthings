@@ -1,6 +1,6 @@
 ---
 name: gthings
-description: "Browser automation and web research CLI — search, follow, extract, PDF, batch, harvest with quality gates"
+description: "Browser automation and web research CLI — search, extract, PDF, AX, status, update with quality gates"
 ---
 
 # Skill: gthings
@@ -9,54 +9,58 @@ Rust CLI for AI-agent-driven web research. Reuses installed Chrome via CDP. All 
 
 ## When This Skill Activates
 
-User says: "search" "research" "look up" "find" "gthings" "web research" "harvest" "extract" "pdf"
+User says: "search" "research" "look up" "find" "gthings" "web research" "extract" "pdf" "ax"
 
 ## Core Rules
 
-1. Always use `--json` for structured output.
-2. Prefer `harvest` for multi-query research (handles dedup, diversity, quality in one pass).
+1. Always use `--output json` for structured output (or `--json` as backward-compat alias).
+2. Prefer `search --strategy harvest` for multi-query research (handles dedup, diversity, quality in one pass).
 3. Filter results by `body_status == "ok"` before using content as factual source.
 4. Check `quality.reasons` — never use content with paywall/bot_blocked/too_short.
 5. Browser must be running with `--remote-debugging-port=9222`.
 
+## Universal Flags (every command)
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <FORMAT>` | Output format: text, json, nd-json (default: text) |
+| `-q, --query <JMES>` | JMESPath filter on JSON output |
+| `--cdp-port <PORT>` | CDP port (default: 9222) |
+| `--cdp-url <URL>` | CDP WebSocket URL (overrides port) |
+| `--timeout <SECS>` | Timeout for CDP/extraction (default: 30) |
+| `-v` | Verbose (-v -v debug, -v -v -v trace) |
+| `-q, --quiet` | Suppress non-error output |
+| `--json` | Backward-compat alias for `--output json` |
+
 ## Commands
 
-### `gthings search <query> [--count N] [--json]`
+### `gthings search <queries...> [--count N] [--strategy simple|parallel|harvest] [--extract-results] [--max-chars N] [--dedup STR] [--rank STR] [--follow-top N] [--warn-tabs N]`
 
-Google SERP. Returns `SearchResult[]` with title, url, snippet, domain_authority, provenance.
+Google SERP search with strategy-based processing. Returns `SearchResult[]` (simple), `SearchResult[][]` (parallel), or `HarvestedResult[]` with summary (harvest). Default strategy: simple.
 
-### `gthings follow <url> [--max-chars N] [--offset N] [--json]`
+### `gthings extract <url> [--max-chars N] [--offset N]`
 
-Page content via CDP. Returns `FollowResult` with content, quality, pagination, sections.
+HTTP extraction. Auto-detects web (Readability), PDF (pdftotext), arXiv (abs→pdf), GitHub (raw). Returns `Article` with quality score.
 
-### `gthings extract <url> [--max-chars N] [--offset N] [--json]`
+### `gthings ax <url> [--max-nodes N]`
 
-HTTP extraction. Auto-detects web (Readability), PDF (pdftotext), arXiv (abs→pdf), GitHub (raw). Better for PDFs than follow.
+Fetch compressed accessibility tree via CDP. Returns AX nodes (default max 500). Good for structured page analysis.
 
-### `gthings batch <q1> [<q2> ...] [--count N] [--follow] [--max-chars N] [--json]`
+### `gthings pdf-url <url> [--max-chars N] [--offset N]`
 
-Multi-query search. Returns `SearchResult[][]`. With --follow, follows top result per query.
+PDF extraction via pdftotext from URL. Requires `brew install poppler`. Quality >= 0.90 for clean text.
 
-### `gthings harvest <q1> [<q2> ...] [--follow-top N] [--max-chars N] [--dedup url] [--rank composite] [--json]`
+### `gthings pdf-file <path> [--max-chars N] [--offset N]`
 
-Full research pipeline: search → dedup → rank → diverse selection → follow → quality score → summary.
+PDF extraction from local file.
 
-Output: `{ "results": HarvestedResult[], "summary": HarvestRunSummary }`
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| --follow-top | 8 | Max URLs to follow |
-| --max-chars | 15000 | Max chars per follow |
-| --dedup | url | Dedup strategy |
-| --rank | composite | serp_order, domain_authority, snippet_length, composite |
-
-### `gthings pdf url <url> [--json]` / `gthings pdf file <path> [--json]`
-
-PDF via pdftotext. Requires `brew install poppler`. Quality >= 0.90 for clean text.
-
-### `gthings status [--json]`
+### `gthings status`
 
 Browser connection check.
+
+### `gthings update`
+
+Update gthings to latest version.
 
 ## Key Output Fields for Agent Triage
 
@@ -65,7 +69,7 @@ Browser connection check.
 | Value | Agent Action |
 |-------|-------------|
 | ok | Use followed_content directly |
-| pdf_unextracted | Fetch via extract or pdf command |
+| pdf_unextracted | Fetch via extract or pdf-url command |
 | extract_failed | Skip — blocked/paywall |
 | chrome_or_empty | Skip — no usable content |
 | snippet_only | Lead only, not a body |
@@ -82,7 +86,7 @@ Browser connection check.
 
 `paywall`, `bot_blocked`, `captcha`, `empty_shell`, `too_short`, `too_few_words`, `low_entropy`, `empty_content`
 
-### coverage_by_query (in summary)
+### coverage_by_query (in harvest summary)
 
 Per-query `{ total_hits, followed_ok, followed_failed }`. Shows which topics have body coverage.
 
@@ -96,6 +100,6 @@ Per-query `{ total_hits, followed_ok, followed_failed }`. Shows which topics hav
 |--------|--------|
 | BROWSER_NOT_FOUND | Start Chrome with --remote-debugging-port=9222 |
 | CONNECTION_FAILED | Check status, verify port |
-| body_status=chrome_or_empty | Retry with extract instead of follow |
-| body_status=pdf_unextracted | Use extract or pdf command |
+| body_status=chrome_or_empty | Retry with extract instead |
+| body_status=pdf_unextracted | Use extract or pdf-url |
 | quality.score==0 with reasons | Skip result |

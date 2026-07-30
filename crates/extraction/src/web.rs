@@ -26,7 +26,7 @@ impl WebExtractor {
 
     /// Extract metadata from HTML <head> and <meta> tags.
     /// Returns (SourceInfo, title).
-    fn extract_metadata(&self, doc: &Html, url: &str) -> (SourceInfo, String) {
+    fn extract_metadata(doc: &Html, url: &str) -> (SourceInfo, String) {
         let title_sel = Selector::parse("title").ok();
         let meta_author = Selector::parse(r#"meta[name="author"]"#).ok();
         let meta_og_title = Selector::parse(r#"meta[property="og:title"]"#).ok();
@@ -91,8 +91,6 @@ impl WebExtractor {
     /// Extract sections from full text by finding heading markers (flat heuristic fallback).
     fn extract_sections(text: &str) -> Vec<Section> {
         let mut sections = Vec::new();
-        let current_depth = 0u8;
-
         for line in text.lines() {
             let trimmed = line.trim();
             let is_heading = trimmed.starts_with('#')
@@ -107,10 +105,8 @@ impl WebExtractor {
                     3
                 } else if trimmed.starts_with("##") {
                     2
-                } else if trimmed.starts_with('#') {
-                    1
                 } else {
-                    current_depth.clamp(1, 2)
+                    1u8
                 };
 
                 let offset = text.find(trimmed).unwrap_or(0);
@@ -341,6 +337,17 @@ impl Extractor for WebExtractor {
 
         let status = resp.status();
         if !status.is_success() {
+            if status.as_u16() == 429 {
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                return Err(ExtractionError::RateLimited {
+                    detail: format!("Rate limited while fetching {url}"),
+                    retry_after,
+                });
+            }
             return Err(ExtractionError::Http(format!("HTTP {status}")));
         }
 
@@ -355,7 +362,7 @@ impl Extractor for WebExtractor {
 
         let doc = Html::parse_document(&html);
 
-        let (source, title) = self.extract_metadata(&doc, &url);
+        let (source, title) = Self::extract_metadata(&doc, &url);
 
         // Use readability's local extraction on already-fetched HTML (no double fetch)
         let full_text = {

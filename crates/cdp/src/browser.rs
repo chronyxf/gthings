@@ -2,6 +2,7 @@ use crate::connection::Connection;
 use crate::error::{CdpError, Result};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Info about a running browser discovered by [`detect`].
 #[derive(Debug, Clone, serde::Serialize)]
@@ -78,7 +79,7 @@ pub async fn detect(port: u16) -> Result<DetectedBrowser> {
 ///
 /// This is a thin wrapper around [`Connection::connect`].
 pub async fn connect(ws_url: &str) -> Result<Connection> {
-    Connection::connect(ws_url).await
+    Connection::connect(ws_url, None).await
 }
 
 /// Dismiss the macOS "Allow remote debugging connection?" dialog that appears
@@ -90,7 +91,7 @@ pub async fn connect(ws_url: &str) -> Result<Connection> {
 /// since the dialog may take 1–3 seconds to appear. Logs a warning if the
 /// dialog is never found — the WebSocket handshake may still proceed.
 #[cfg(target_os = "macos")]
-pub fn dismiss_allow_debugging_dialog() {
+pub async fn dismiss_allow_debugging_dialog() {
     /// AppleScript that checks each known browser process for a sheet dialog
     /// (attached to window 1) and clicks the "Allow" button if found.
     /// Returns the browser name if dismissed, or empty string otherwise.
@@ -161,50 +162,45 @@ pub fn dismiss_allow_debugging_dialog() {
         return browserName
     end tell"#;
 
-    use std::sync::mpsc;
-    use std::time::Duration;
-
     const OSASCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
-    const MAX_ATTEMPTS: u32 = 5;
+    const MAX_ATTEMPTS: u32 = 2;
 
     for attempt in 1..=MAX_ATTEMPTS {
-        let (tx, rx) = mpsc::channel();
         let script = SCRIPT.to_owned();
 
-        std::thread::spawn(move || {
-            let result = std::process::Command::new("osascript")
+        let result = tokio::time::timeout(OSASCRIPT_TIMEOUT, async {
+            tokio::process::Command::new("osascript")
                 .args(["-e", &script])
-                .output();
-            let _ = tx.send(result);
-        });
+                .output()
+                .await
+        })
+        .await;
 
-        let output = match rx.recv_timeout(OSASCRIPT_TIMEOUT) {
-            Ok(Ok(out)) => Some(out),
+        match result {
+            Ok(Ok(out)) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let browser = stdout.trim();
+                if !browser.is_empty() {
+                    tracing::warn!(
+                        "Dismissed remote debugging dialog for {browser} (attempt {attempt})"
+                    );
+                    return;
+                }
+            }
             Ok(Err(e)) => {
                 tracing::warn!("osascript command failed: {e}");
-                None
             }
             Err(_) => {
                 tracing::warn!(
                     "osascript timed out after {OSASCRIPT_TIMEOUT:?} (attempt {attempt})"
                 );
-                None
-            }
-        };
-
-        if let Some(out) = output {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let browser = stdout.trim();
-            if !browser.is_empty() {
-                tracing::warn!(
-                    "Dismissed remote debugging dialog for {browser} (attempt {attempt})"
-                );
-                return;
+                // Timeout dropped the future, which drops the Child process,
+                // killing the osascript process. Continue to next attempt.
             }
         }
 
         if attempt < MAX_ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(500));
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -213,7 +209,7 @@ pub fn dismiss_allow_debugging_dialog() {
 
 /// Non-macOS: no-op.
 #[cfg(not(target_os = "macos"))]
-pub fn dismiss_allow_debugging_dialog() {}
+pub async fn dismiss_allow_debugging_dialog() {}
 // ---------------------------------------------------------------------------
 // Internal probe helpers
 // ---------------------------------------------------------------------------

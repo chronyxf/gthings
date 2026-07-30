@@ -122,6 +122,11 @@ pub enum ExtractionError {
     BotBlocked(String),
     #[error("Timeout: {0}")]
     Timeout(String),
+    #[error("Rate limited (HTTP 429): {detail}")]
+    RateLimited {
+        detail: String,
+        retry_after: Option<u64>,
+    },
 }
 
 /// Round a score to 2 decimal places to avoid floating-point artifacts in JSON output.

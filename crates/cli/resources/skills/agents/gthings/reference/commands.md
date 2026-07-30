@@ -1,16 +1,51 @@
 # gthings CLI Command Reference
 
-All commands support `--json` for structured JSON output.
+All commands support `--output json` (or `--json` for backward compat) for structured JSON output.
+
+## Universal Flags
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <FORMAT>` | Output format: text, json, nd-json (default: text) |
+| `-q, --query <JMES>` | JMESPath filter on JSON output |
+| `--cdp-port <PORT>` | CDP port (default: 9222, env: GTHINGS_CDP_PORT) |
+| `--cdp-url <URL>` | CDP WebSocket URL (overrides port) |
+| `--timeout <SECS>` | Timeout for CDP/extraction (default: 30) |
+| `-v` | Verbose (-v -v debug, -v -v -v trace) |
+| `-q, --quiet` | Suppress non-error output |
+| `--json` | Backward-compat alias for `--output json` |
+
+All JSON output follows the envelope:
+```json
+{
+  "status": "ok" | "error",
+  "data": <command-specific result>,
+  "error": {
+    "code": "ERROR_CODE",
+    "detail": "human-readable detail",
+    "hint": "recovery hint"
+  }
+}
+```
+
+---
 
 ## search
 
 ```
-gthings search <query> [--count N] [--json]
+gthings search <queries...> [--count N] [--strategy simple|parallel|harvest]
+    [--extract-results] [--max-chars N] [--dedup STR] [--rank STR]
+    [--follow-top N] [--warn-tabs N]
 ```
 
-Single Google SERP search via CDP browser.
+Google SERP search via CDP browser with strategy-based processing.
 
-**Output** (`SearchResult[]`):
+**Strategies:**
+- `simple` (default): Single-query search, returns `SearchResult[]`
+- `parallel`: Multi-query parallel search, returns `SearchResult[][]`
+- `--strategy harvest`: Full research pipeline — search → dedup → rank → select → follow → quality score → summary
+
+**Output** (simple — `SearchResult[]`):
 ```json
 [
   {
@@ -30,77 +65,7 @@ Single Google SERP search via CDP browser.
 ]
 ```
 
-## follow
-
-```
-gthings follow <url> [--max-chars N] [--offset N] [--json]
-```
-
-Single page content via CDP browser (`document.body.innerText`).
-
-**Output** (`FollowResult`):
-```json
-{
-  "url": "https://example.com/page",
-  "title": "Page Title",
-  "content": "Full visible text content...",
-  "error": "",
-  "provenance": { "source_url": "...", "method": "Follow", "agent": "gthings/0.6.0", "accessed_at": "...", "duration_ms": 500 },
-  "pagination": { "offset": 0, "returned_len": 15000, "total_len": 45320, "truncated": true, "continuation_token": "..." }
-}
-```
-
-If `pagination.truncated == true`, fetch next chunk with `--offset N`.
-
-## extract
-
-```
-gthings extract <url> [--max-chars N] [--offset N] [--json]
-```
-
-HTTP-based extraction with auto-detection:
-- Web URLs → Readability parser
-- PDF URLs → pdftotext
-- arXiv URLs → /pdf/ path rewrite + PDF extraction
-- GitHub URLs → raw content fetch
-
-**Output** (`Article`):
-```json
-{
-  "url": "https://example.com/article",
-  "title": "Article Title",
-  "source": { "author": "Author Name", "site_name": "Site", "domain_authority": 0.85 },
-  "extraction": { "method": "Readability", "confidence": 0.95, "accessed_at": "2026-07-26T12:00:00Z", "duration_ms": 800 },
-  "body": {
-    "Article": {
-      "sections": [{"heading": "Introduction", "depth": 1, "content": "Section text..."}],
-      "full_text": "Complete article text...",
-      "total_length": 12000
-    }
-  },
-  "quality": { "score": 0.95, "is_ok": true, "reasons": [], "entropy_bits_per_char": 4.2 }
-}
-```
-
-## batch
-
-```
-gthings batch <q1> [<q2> ...] [--count N] [--follow] [--max-chars N] [--json]
-```
-
-Multi-query search. Returns `SearchResult[][]` (one array per query). With `--follow`, follows top result per query.
-
-## harvest
-
-```
-gthings harvest <q1> [<q2> ...] [--follow-top N] [--max-chars N] [--dedup url] [--rank composite] [--json]
-```
-
-Full research pipeline. One command replaces search + dedup + rank + select + follow + quality.
-
-**Pipeline**: parallel search (JoinSet) → dedup (canonical URL normalization) → rank (composite or other strategy) → select (per-query minimum, per-host cap max 2, junk URL filter) → parallel follow (JoinSet, 30s timeout) → quality scoring → summary.
-
-**Output**:
+**Output** (harvest — `{ results: HarvestedResult[], summary: HarvestRunSummary }`):
 ```json
 {
   "results": [
@@ -128,23 +93,99 @@ Full research pipeline. One command replaces search + dedup + rank + select + fo
 }
 ```
 
-**BodyStatus values**: `ok` | `snippet_only` | `extract_failed` | `pdf_unextracted` | `chrome_or_empty`
+**Flags:**
 
-**Rank strategies**:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--count` | 5 | Results per query |
+| `--strategy` | simple | simple, parallel, or harvest |
+| `--extract-results` | false | Extract content from result URLs (parallel/harvest) |
+| `--max-chars` | 15000 | Max chars per extracted page |
+| `--dedup` | url | Dedup strategy |
+| `--rank` | composite | serp_order, domain_authority, snippet_length, composite |
+| `--follow-top` | 8 | Max URLs to follow (harvest) |
+| `--warn-tabs` | 20 | Warn when tabs exceed threshold (harvest) |
+
+**BodyStatus values:** `ok` | `snippet_only` | `extract_failed` | `pdf_unextracted` | `chrome_or_empty`
+
+**Rank strategies:**
 - `serp_order` — Google's original order, interleaved round-robin across queries
 - `domain_authority` — Descending by domain authority score
 - `snippet_length` — Descending by SERP snippet length
 - `composite` (default) — `0.5 * authority + 0.3 * norm_snippet + 0.2 * diversity_bonus`
 
-## pdf
+---
+
+## extract
 
 ```
-gthings pdf url <url> [--json]
-gthings pdf file <path> [--json]
+gthings extract <url> [--max-chars N] [--offset N]
 ```
 
-PDF extraction via pdftotext. Requires poppler. Output includes full text, pages, quality score.
+HTTP-based extraction with auto-detection:
+- Web URLs → Readability parser
+- PDF URLs → pdftotext
+- arXiv URLs → /pdf/ path rewrite + PDF extraction
+- GitHub URLs → raw content fetch
 
+**Output** (`Article`):
+```json
+{
+  "url": "https://example.com/article",
+  "title": "Article Title",
+  "source": { "author": "Author Name", "site_name": "Site", "domain_authority": 0.85 },
+  "extraction": { "method": "Readability", "confidence": 0.95, "accessed_at": "2026-07-26T12:00:00Z", "duration_ms": 800 },
+  "body": {
+    "Article": {
+      "sections": [{"heading": "Introduction", "depth": 1, "content": "Section text..."}],
+      "full_text": "Complete article text...",
+      "total_length": 12000
+    }
+  },
+  "quality": { "score": 0.95, "is_ok": true, "reasons": [], "entropy_bits_per_char": 4.2 }
+}
+```
+
+---
+
+## ax
+
+```
+gthings ax <url> [--max-nodes N]
+```
+
+Fetch compressed accessibility tree for a URL via CDP. Returns AX tree nodes for structured page analysis without full text render.
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max-nodes` | 500 | Max nodes in output (0 = unlimited) |
+
+**Output** (compressed AX tree):
+```json
+{
+  "url": "https://example.com",
+  "node_count": 120,
+  "truncated": false,
+  "nodes": [
+    { "node_id": 1, "role": "heading", "name": "Introduction", "value": "", "children": [2, 3] },
+    { "node_id": 2, "role": "text", "name": "", "value": "Some text content...", "children": [] }
+  ]
+}
+```
+
+---
+
+## pdf-url
+
+```
+gthings pdf-url <url> [--max-chars N] [--offset N]
+```
+
+PDF extraction from URL via pdftotext. Requires poppler (`brew install poppler`).
+
+**Output:**
 ```json
 {
   "url": "https://arxiv.org/pdf/2405.10119",
@@ -154,10 +195,22 @@ PDF extraction via pdftotext. Requires poppler. Output includes full text, pages
 }
 ```
 
+---
+
+## pdf-file
+
+```
+gthings pdf-file <path> [--max-chars N] [--offset N]
+```
+
+PDF extraction from local file via pdftotext. Same output schema as pdf-url (uses `path` instead of `url`).
+
+---
+
 ## status
 
 ```
-gthings status [--json]
+gthings status
 ```
 
 Browser connection check.
@@ -165,6 +218,22 @@ Browser connection check.
 ```json
 { "status": "running", "pid": 12345, "ws_url": "ws://127.0.0.1:9222/..." }
 ```
+
+---
+
+## update
+
+```
+gthings update
+```
+
+Update gthings to the latest version.
+
+```json
+{ "status": "ok", "version": "0.7.0" }
+```
+
+---
 
 ## Exit Codes
 

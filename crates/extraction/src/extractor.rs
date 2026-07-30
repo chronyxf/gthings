@@ -59,7 +59,7 @@ fn authority_for_domain(domain: &str) -> f64 {
     let domain = domain.to_lowercase();
 
     // High-authority academic/scholarly domains
-    let high: [&str; 14] = [
+    let high: [&str; 16] = [
         "arxiv.org",
         "scholar.google.com",
         "pubmed.ncbi.nlm.nih.gov",
@@ -74,6 +74,8 @@ fn authority_for_domain(domain: &str) -> f64 {
         "plos.org",
         "wikipedia.org",
         "wikidata.org",
+        "semanticscholar.org",
+        "cell.com",
     ];
 
     // Medium-high authority (technical, educational, government)

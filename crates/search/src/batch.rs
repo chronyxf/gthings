@@ -66,7 +66,7 @@ impl BatchProcessor {
                 // inside the follow call below.
 
                 // 1. Create tab outside timeout — guarantees we can close it on all paths
-                let tab = match session.create_tab("about:blank").await {
+                let tab = match session.create_background_tab().await {
                     Ok(t) => t,
                     Err(e) => return Err(e),
                 };

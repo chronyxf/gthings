@@ -174,8 +174,8 @@ async fn phase_search(
         let query = query.clone();
 
         search_join_set.spawn(async move {
-            // 1. Create tab outside timeout — guarantees we can close it on all paths
-            let tab = match session.create_tab("about:blank").await {
+            // 1. Create isolated background tab — guarantees no cross-tab blocking
+            let tab = match session.create_background_tab().await {
                 Ok(t) => t,
                 Err(e) => return Err(e),
             };
@@ -409,7 +409,7 @@ async fn phase_follow(
             let q_task = q;
 
             follow_join_set.spawn(async move {
-                let tab = match session.create_tab("about:blank").await {
+                let tab = match session.create_background_tab().await {
                     Ok(t) => t,
                     Err(e) => {
                         return (
@@ -453,7 +453,8 @@ async fn phase_follow(
 
                 let harvest_result = match result {
                     Ok(Ok(fr)) => {
-                        let quality = compute_quality(&fr.content);
+                        let quality =
+                            compute_quality(&fr.content, &format!("{:?}", fr.provenance.method));
                         let sections = extract_sections(&fr.content);
                         let body_status = if fr.content.is_empty() && fr.error.is_empty() {
                             BodyStatus::ChromeOrEmpty
@@ -891,7 +892,7 @@ fn interleave_by_query(results: Vec<(String, SearchResult)>) -> Vec<(String, Sea
 ///
 /// Starts at 1.0 and subtracts for each detected issue (bot wall, paywall,
 /// captcha, empty shell, too short, too few words).
-fn compute_quality(content: &str) -> QualityScore {
+fn compute_quality(content: &str, method: &str) -> QualityScore {
     let mut reasons = Vec::new();
     let mut score = 1.0_f64;
 
@@ -920,13 +921,19 @@ fn compute_quality(content: &str) -> QualityScore {
         reasons.push("empty_shell".into());
         score -= 0.2;
     }
-    if content.len() < 80 {
-        reasons.push("too_short".into());
-        score -= 0.2;
-    }
-    if content.split_whitespace().count() < 15 {
-        reasons.push("too_few_words".into());
-        score -= 0.1;
+
+    // Length/word checks are unreliable for PDF/Arxiv extraction — short but valid
+    // content (e.g. abstract, small PDF) should not be penalised.
+    let skip_length_checks = method.contains("Pdf") || method.contains("Arxiv");
+    if !skip_length_checks {
+        if content.len() < 80 {
+            reasons.push("too_short".into());
+            score -= 0.2;
+        }
+        if content.split_whitespace().count() < 15 {
+            reasons.push("too_few_words".into());
+            score -= 0.1;
+        }
     }
 
     let entropy = shannon_entropy(content);
@@ -1175,7 +1182,7 @@ mod tests {
 
     #[test]
     fn test_compute_quality_empty() {
-        let q = compute_quality("");
+        let q = compute_quality("", "Follow");
         assert!(!q.is_ok);
         assert_eq!(q.score, 0.0);
     }
@@ -1188,7 +1195,7 @@ mod tests {
                      or empty shells. It has plenty of text to be considered high \
                      quality content for our research purposes. We need at least \
                      80 characters and 15 words.";
-        let q = compute_quality(text);
+        let q = compute_quality(text, "Follow");
         assert!(q.is_ok);
         assert!(q.score >= 0.5);
     }
@@ -1196,7 +1203,7 @@ mod tests {
     #[test]
     fn test_compute_quality_detects_bot() {
         let text = "Checking your browser before accessing the site. Please wait while we verify you are human.";
-        let q = compute_quality(text);
+        let q = compute_quality(text, "Follow");
         assert!(!q.is_ok);
         assert!(q.reasons.iter().any(|r| r.contains("bot_blocked")));
     }
@@ -1204,7 +1211,7 @@ mod tests {
     #[test]
     fn test_compute_quality_detects_paywall() {
         let text = "Subscribe now to continue reading this article. You have reached your free article limit.";
-        let q = compute_quality(text);
+        let q = compute_quality(text, "Follow");
         assert!(!q.is_ok);
         assert!(q.reasons.iter().any(|r| r.contains("paywall")));
     }
@@ -1212,7 +1219,7 @@ mod tests {
     #[test]
     fn test_compute_quality_detects_captcha() {
         let text = "Please complete the recaptcha widget to continue.";
-        let q = compute_quality(text);
+        let q = compute_quality(text, "Follow");
         assert!(!q.is_ok);
         assert!(q.reasons.iter().any(|r| r.contains("captcha")));
     }
@@ -1644,7 +1651,7 @@ mod tests {
     #[test]
     fn test_compute_quality_reasons_never_empty_when_low() {
         // Empty content → reasons has "empty_content"
-        let q = compute_quality("");
+        let q = compute_quality("", "Follow");
         assert!(
             q.reasons.iter().any(|r| r == "empty_content"),
             "empty content should produce 'empty_content' reason, got: {:?}",
@@ -1653,7 +1660,7 @@ mod tests {
 
         // Bot wall → reasons has "bot_blocked"
         let bot_text = "Checking your browser before accessing the site. Please wait while we verify you are human.";
-        let q = compute_quality(bot_text);
+        let q = compute_quality(bot_text, "Follow");
         assert!(
             q.reasons.iter().any(|r| r.contains("bot_blocked")),
             "bot-detected content should produce 'bot_blocked' reason, got: {:?}",
@@ -1662,7 +1669,7 @@ mod tests {
 
         // Paywall → reasons has "paywall"
         let paywall_text = "Subscribe now to continue reading this article. You have reached your free article limit.";
-        let q = compute_quality(paywall_text);
+        let q = compute_quality(paywall_text, "Follow");
         assert!(
             q.reasons.iter().any(|r| r.contains("paywall")),
             "paywall content should produce 'paywall' reason, got: {:?}",
@@ -1670,7 +1677,7 @@ mod tests {
         );
 
         // Tiny content → reasons has "too_short"
-        let q = compute_quality("tiny");
+        let q = compute_quality("tiny", "Follow");
         assert!(
             q.reasons.iter().any(|r| r.contains("too_short")),
             "tiny content should produce 'too_short' reason, got: {:?}",
@@ -1840,7 +1847,7 @@ mod tests {
     #[test]
     fn test_body_status_mapping() {
         // Empty content → ChromeOrEmpty (indirectly via quality)
-        let q = compute_quality("");
+        let q = compute_quality("", "Follow");
         assert!(!q.is_ok, "empty content quality should not be ok");
         assert!(
             q.reasons.iter().any(|r| r == "empty_content"),
@@ -1851,7 +1858,7 @@ mod tests {
         let good = "This is a sufficiently long piece of content with many words \
                      and sentences that should pass all quality checks without \
                      triggering any of the detection heuristics.";
-        let q = compute_quality(good);
+        let q = compute_quality(good, "Follow");
         assert!(q.is_ok, "good content quality should be ok");
 
         // PDF URL → PdfUnextracted (detected before follow in phase_follow)

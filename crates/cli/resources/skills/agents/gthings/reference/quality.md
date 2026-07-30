@@ -1,20 +1,20 @@
 # Content Quality, Body Status, and Section Extraction
 
-## BodyStatus (harvest output)
+## BodyStatus (search --strategy harvest output)
 
 Every harvested result has a `body_status` field for agent triage:
 
 | Status | Meaning | Agent Action |
 |--------|---------|-------------|
 | `ok` | Full body extracted successfully | Use `followed_content` directly |
-| `pdf_unextracted` | PDF/arXiv URL — CDP cannot extract | Fetch separately: `extract <url>` or `pdf url <url>` |
+| `pdf_unextracted` | PDF/arXiv URL — CDP cannot extract | Fetch separately: `extract <url>` or `pdf-url <url>` |
 | `extract_failed` | Paywall, bot wall, network error | Skip — no usable content |
 | `chrome_or_empty` | CDP returned navigation chrome or empty text | Skip — nav-only or JS-rendered page |
 | `snippet_only` | Only SERP snippet available, not followed | Use as search lead only, not body |
 
-## QualityScore (present on follow, extract, harvest)
+## QualityScore (present on extract/ax/search --strategy harvest)
 
-Every followed/extracted result includes `quality`:
+Every extracted or harvested result includes `quality`:
 
 ```json
 {
@@ -81,9 +81,9 @@ Every followed page has `sections` from heading detection:
 }
 ```
 
-If `sections` is empty, use `followed_content` (harvest) or `content` (follow) for full text.
+If `sections` is empty, use `followed_content` (harvest results) for full text.
 
-## URL Canonicalization (for harvest dedup)
+## URL Canonicalization (for search --strategy harvest dedup)
 
 Applied to every URL before dedup and ranking:
 - Scheme+host lowercased

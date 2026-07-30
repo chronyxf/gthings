@@ -36,24 +36,37 @@ Requires Rust 1.85+ and a Chromium-based browser (Dia, Chrome, Brave, Edge).
 ```bash
 # Browser auto-launches on first command, persists across calls
 
-# Search
-./target/release/gthings --json search query "Rust async" --count 5
+# Simple search (5 results by default)
+./target/release/gthings search "Rust async" --json
 
-# Read a page
-./target/release/gthings --json follow url "https://www.rust-lang.org" --max 20000
+# Multi-query search (parallel)
+./target/release/gthings search "Rust async" "Tokio tutorial" --strategy parallel --json
 
-# Batch read
-./target/release/gthings --json follow batch "url1" "url2" --max 20000
+# Search + follow top results (harvest)
+./target/release/gthings search "rust borrow checker" --strategy harvest --follow-top 5 --json
 
-# Browse PDF
-./target/release/gthings --json pdf url "https://arxiv.org/pdf/xxxx.xxxxx"
+# Extract content from a URL
+./target/release/gthings extract "https://www.rust-lang.org" --max-chars 20000 --json
 
-# Explicit browser lifecycle
-./target/release/gthings --json browser status
-./target/release/gthings browser stop
+# Accessibility tree
+./target/release/gthings ax "https://www.rust-lang.org" --json
+
+# Extract PDF from URL
+./target/release/gthings pdf-url "https://arxiv.org/pdf/2401.12345" --json
+
+# Extract PDF from local file
+./target/release/gthings pdf-file "paper.pdf" --json
+
+# Check browser status
+./target/release/gthings status --json
+
+# Update gthings
+./target/release/gthings update
 ```
 
 Add `--trace /tmp/trace.jsonl` to every command for step-level debugging.
+
+All commands accept `--output text|json|nd-json` (or legacy `--json`) and `--query <JMESPath>` for field filtering.
 
 ## For AI Agents
 
@@ -74,14 +87,14 @@ Then agents load it via `skill gthings`. The skill provides:
 
 | Command | Description | JSON Output |
 |---------|-------------|-------------|
-| `search query <q> --count N` | Google search | `[{title, url, snippet}]` |
-| `search batch <q1> <q2> --count N` | Multi-query search | `[{results[], meta}]` |
-| `search harvest <q1> <q2> --count N --follow M` | Search + follow pipeline | `{search_results[], read_pages[], meta}` |
-| `follow url <url> --max N` | Extract page content | `{url, content, sections[], quality, truncated}` |
-| `follow batch <url1> <url2> --max N` | Multi-page extraction | `[{url, content, quality}...]` |
-| `pdf url <url>` | Extract PDF text | `{content, pages, meta}` |
-| `pdf file <path>` | Extract local PDF | `{content, pages, meta}` |
-| `browser status` | Check browser state | `{status, pid, ws_url}` |
-| `browser stop` | Kill browser | `{pid, status}` |
+| `search <q> --strategy simple` | Google search | `[{title, url, snippet, position}]` |
+| `search <q1> <q2> --strategy parallel` | Multi-query parallel search | `{queries: [{query, results}]}` |
+| `search <q1>... --strategy harvest --follow-top M` | Search + follow pipeline | `{results[], summary}` |
+| `extract <url>` | HTTP/Readability extraction (auto-detects PDF, arXiv, GitHub) | `{title, body, quality, provenance}` |
+| `ax <url>` | Accessibility tree | `{tree, url, total_nodes, truncated}` |
+| `pdf-url <url>` | PDF from URL | `{Pdf:{pages, text}, quality}` |
+| `pdf-file <path>` | Local PDF file | `{Pdf:{pages, text}, quality}` |
+| `status` | Browser connection check | `{browser, status, version}` |
+| `update` | Update gthings to latest version | version info |
 
-All commands support `--json` (structured output) and `--trace <file>` (step-level JSONL logging).
+All commands support `--output text|json|nd-json` (or `--json` for JSON output), `--query <JMESPath>` for field filtering, and `--trace <file>` for step-level JSONL logging.

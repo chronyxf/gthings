@@ -2,8 +2,6 @@ use std::fs;
 use std::io;
 use std::time::Duration;
 
-use base64::Engine;
-use sha2::{Digest, Sha256};
 use tokio::task;
 
 use crate::error::GthingsError;
@@ -78,20 +76,6 @@ impl Sha256DiskCache {
     }
 }
 
-/// Compute a composite cache key from URL, offset, and max_chars.
-///
-/// Returns a base64-encoded SHA-256 hash of `url|offset|max_chars`.
-/// This ensures that different pagination states of the same URL produce
-/// distinct cache entries.
-#[allow(dead_code)]
-pub(crate) fn cache_key(url: &str, offset: usize, max_chars: usize) -> String {
-    let mut hasher = Sha256::new();
-    let input = format!("{url}|{offset}|{max_chars}");
-    hasher.update(input.as_bytes());
-    let hash = hasher.finalize();
-    base64::engine::general_purpose::URL_SAFE.encode(hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,13 +95,6 @@ mod tests {
         assert_eq!(on_disk, content);
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_cache_keys_differ_on_offset() {
-        let key1 = cache_key("https://example.com", 0, 15000);
-        let key2 = cache_key("https://example.com", 15000, 15000);
-        assert_ne!(key1, key2);
     }
 
     #[tokio::test]

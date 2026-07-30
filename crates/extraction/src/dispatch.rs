@@ -1,5 +1,6 @@
 use gthings_common::pagination::ExtractParams;
 use gthings_common::provenance::{ExtractionMethod as ProvenanceMethod, Provenance};
+use url::Url;
 
 use crate::article::{Article, ExtractionError, ExtractionMethod};
 use crate::extractor::{Extractor, SourceType};
@@ -126,6 +127,17 @@ impl AutoExtractor {
 
         let status = resp.status();
         if !status.is_success() {
+            if status.as_u16() == 429 {
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                return Err(ExtractionError::RateLimited {
+                    detail: format!("Rate limited while fetching PDF {url}"),
+                    retry_after,
+                });
+            }
             return Err(ExtractionError::Http(format!("HTTP {status} for PDF")));
         }
 
@@ -147,25 +159,86 @@ impl AutoExtractor {
         self.pdf.extract((url.to_string(), bytes), params).await
     }
 
-    /// Handle GitHub URLs: rewrite to raw content URL.
+    /// Handle GitHub URLs with intelligent routing:
+    ///
+    /// | Pattern                | Action                                          |
+    /// |------------------------|-------------------------------------------------|
+    /// | `/blob/` or `/tree/`   | Rewrite to `raw.githubusercontent.com`           |
+    /// | `.diff` / `.patch`     | Direct HTTP fetch (follows to `patch-diff...`)   |
+    /// | `/owner/repo` (root)   | Fetch `raw.githubusercontent.com/.../README.md`  |
+    /// | Everything else        | Fall through to `WebExtractor` (Readability)     |
     async fn extract_github(
         &self,
         url: &str,
         params: ExtractParams,
     ) -> Result<Article, ExtractionError> {
-        let raw_url = url
-            .replace("github.com", "raw.githubusercontent.com")
-            .replace("/blob/", "/");
+        let parsed = Url::parse(url)
+            .map_err(|e| ExtractionError::Http(format!("invalid github url: {e}")))?;
+        let path = parsed.path();
 
+        // Determine which raw URL to fetch, or None (fall through to web extraction)
+        let maybe_raw: Option<String> = {
+            if path.contains("/blob/") {
+                Some(
+                    url.replace("github.com", "raw.githubusercontent.com")
+                        .replace("/blob/", "/"),
+                )
+            } else if path.contains("/tree/") {
+                Some(
+                    url.replace("github.com", "raw.githubusercontent.com")
+                        .replace("/tree/", "/"),
+                )
+            } else if path.ends_with(".diff") || path.ends_with(".patch") {
+                // Fetch directly from github.com; reqwest follows the redirect
+                // to patch-diff.githubusercontent.com automatically.
+                Some(url.to_string())
+            } else {
+                // Repo root: path has exactly two non-empty segments (owner/repo)
+                let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                if segments.len() == 2 {
+                    Some(format!(
+                        "https://raw.githubusercontent.com/{}/{}/master/README.md",
+                        segments[0], segments[1]
+                    ))
+                } else {
+                    None
+                }
+            }
+        };
+
+        match maybe_raw {
+            Some(raw_url) => self.fetch_raw_github(&raw_url, url, params).await,
+            None => self.web.extract(url.to_string(), params).await,
+        }
+    }
+
+    /// Fetch a raw GitHub file and wrap it in an [`Article`] with [`ContentTree::Code`].
+    async fn fetch_raw_github(
+        &self,
+        raw_url: &str,
+        original_url: &str,
+        params: ExtractParams,
+    ) -> Result<Article, ExtractionError> {
         let resp = self
             .client
-            .get(&raw_url)
+            .get(raw_url)
             .send()
             .await
             .map_err(|e| ExtractionError::Http(format!("github raw fetch: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
+            if status.as_u16() == 429 {
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                return Err(ExtractionError::RateLimited {
+                    detail: format!("Rate limited while fetching {raw_url}"),
+                    retry_after,
+                });
+            }
             return Err(ExtractionError::Http(format!("GitHub HTTP {status}")));
         }
 
@@ -174,7 +247,7 @@ impl AutoExtractor {
             .await
             .map_err(|e| ExtractionError::Http(format!("github read: {e}")))?;
 
-        let language = Self::detect_language(url);
+        let language = Self::detect_language(original_url);
         let total_len = content.len();
         let line_count = content.lines().count();
 
@@ -186,12 +259,16 @@ impl AutoExtractor {
             .collect();
         let effective_len = effective_content.len();
 
-        let pagination =
-            gthings_common::pagination::build_pagination(&params, url, total_len, effective_len);
+        let pagination = gthings_common::pagination::build_pagination(
+            &params,
+            original_url,
+            total_len,
+            effective_len,
+        );
 
         let now = chrono::Utc::now();
         let provenance = Provenance {
-            source_url: url.to_string(),
+            source_url: original_url.to_string(),
             method: ProvenanceMethod::Github,
             agent: gthings_common::GTHINGS_AGENT.into(),
             accessed_at: now,
@@ -200,13 +277,13 @@ impl AutoExtractor {
         };
 
         Ok(Article {
-            url: url.to_string(),
+            url: original_url.to_string(),
             title: String::new(),
             source: crate::article::SourceInfo {
                 author: None,
                 published: None,
                 site_name: "GitHub".into(),
-                domain_authority: crate::extractor::compute_domain_authority(url),
+                domain_authority: crate::extractor::compute_domain_authority(original_url),
                 language: None,
             },
             extraction: crate::article::ExtractionInfo {
@@ -218,7 +295,7 @@ impl AutoExtractor {
             body: crate::article::ContentTree::Code {
                 language,
                 content: effective_content,
-                file_path: url.to_string(),
+                file_path: original_url.to_string(),
                 line_count,
             },
             signals: crate::article::ContinuationSignals {
