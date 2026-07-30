@@ -6,7 +6,7 @@ use crate::commands::{UniversalFlags, emit_output, print_error};
 
 /// Status: detect only, no connection needed.
 pub(crate) async fn cmd_status(flags: &UniversalFlags) -> i32 {
-    let p = crate::commands::port(flags);
+    let p = flags.cdp_port;
 
     match detect(p).await {
         Ok(browser) => {

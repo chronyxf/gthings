@@ -8,7 +8,7 @@ use gthings_common::domain_reputation::DomainReputation;
 use gthings_common::pagination::ExtractParams;
 use gthings_search::harvest::{BatchHarvestRequest, DedupStrategy, RankStrategy, harvest};
 
-use crate::commands::{UniversalFlags, connect, emit_output};
+use crate::commands::{UniversalFlags, emit_output, with_session};
 
 /// Harvest: detect → connect → harvest → disconnect → output.
 pub(crate) async fn cmd_harvest(
@@ -20,26 +20,20 @@ pub(crate) async fn cmd_harvest(
     max_chars: usize,
     warn_tabs: usize,
 ) -> i32 {
-    let session = match connect(flags).await {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
-
-    let dedup_strategy = match dedup.as_str() {
-        "url" => DedupStrategy::UrlOnly,
-        _ => {
-            emit_output(
-                None,
-                Some((
-                    "INVALID_DEDUP",
-                    &format!("Unknown dedup strategy: {dedup}"),
-                    "Use --dedup=url",
-                )),
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
-            return 1;
-        }
+    let dedup_strategy = if dedup.as_str() == "url" {
+        DedupStrategy::UrlOnly
+    } else {
+        emit_output(
+            None,
+            Some((
+                "INVALID_DEDUP",
+                &format!("Unknown dedup strategy: {dedup}"),
+                "Use --dedup=url",
+            )),
+            flags.resolved_output(),
+            flags.query.as_deref(),
+        );
+        return 1;
     };
 
     let rank_strategy = match rank.as_str() {
@@ -89,46 +83,35 @@ pub(crate) async fn cmd_harvest(
         reputation: Some(reputation),
     };
 
-    let arc_session = Arc::new(session);
-
-    let (results, summary) = match harvest(Arc::clone(&arc_session), req).await {
-        Ok(r) => r,
-        Err(e) => {
-            emit_output(
-                None,
-                Some((
-                    "HARVEST_FAILED",
-                    &e.to_string(),
-                    "Check browser connection and network",
-                )),
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
-            if let Ok(s) = Arc::try_unwrap(arc_session) {
-                if let Err(e) = s.disconnect().await {
-                    tracing::warn!("disconnect failed: {e}");
-                }
+    with_session(flags, |session| async move {
+        let (results, summary) = match harvest(session, req).await {
+            Ok(r) => r,
+            Err(e) => {
+                emit_output(
+                    None,
+                    Some((
+                        "HARVEST_FAILED",
+                        &e.to_string(),
+                        "Check browser connection and network",
+                    )),
+                    flags.resolved_output(),
+                    flags.query.as_deref(),
+                );
+                return 1;
             }
-            return 1;
-        }
-    };
+        };
 
-    if let Ok(s) = Arc::try_unwrap(arc_session) {
-        if let Err(e) = s.disconnect().await {
-            tracing::warn!("disconnect failed: {e}");
-        }
-    }
-
-    let value = serde_json::json!({
-        "results": results,
-        "summary": summary,
-    });
-    emit_output(
-        Some(value),
-        None,
-        flags.resolved_output(),
-        flags.query.as_deref(),
-    );
-
-    0
+        let value = serde_json::json!({
+            "results": results,
+            "summary": summary,
+        });
+        emit_output(
+            Some(value),
+            None,
+            flags.resolved_output(),
+            flags.query.as_deref(),
+        );
+        0
+    })
+    .await
 }

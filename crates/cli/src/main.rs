@@ -108,6 +108,168 @@ enum SearchStrategy {
     Harvest,
 }
 
+/// Run a future with a timeout, printing an error on timeout.
+/// Returns `Ok(result)` on success, `Err(2)` on timeout.
+async fn run_with_timeout<T, F: std::future::Future<Output = T>>(
+    name: &str,
+    secs: u64,
+    fut: F,
+) -> Result<T, i32> {
+    if let Ok(result) = tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(result)
+    } else {
+        eprintln!("gthings: {name} timed out after {secs}s");
+        Err(2)
+    }
+}
+
+async fn handle_search_simple(
+    universal: &mut commands::UniversalFlags,
+    queries: Vec<String>,
+    count: usize,
+) -> i32 {
+    if queries.is_empty() {
+        commands::emit_output(
+            None,
+            Some((
+                "EMPTY_QUERY",
+                "Search query cannot be empty",
+                "Provide a search term",
+            )),
+            universal.resolved_output(),
+            universal.query.as_deref(),
+        );
+        return 1;
+    }
+    run_with_timeout(
+        "search",
+        30,
+        commands::cmd_search(universal, &queries[0], count),
+    )
+    .await
+    .unwrap_or_else(|e| e)
+}
+
+async fn handle_search_parallel(
+    universal: &mut commands::UniversalFlags,
+    queries: Vec<String>,
+    count: usize,
+    extract_results: bool,
+    max_chars: usize,
+) -> i32 {
+    run_with_timeout(
+        "parallel search",
+        60,
+        commands::cmd_batch(universal, queries, count, extract_results, max_chars),
+    )
+    .await
+    .unwrap_or_else(|e| e)
+}
+
+async fn handle_search_harvest(
+    universal: &mut commands::UniversalFlags,
+    queries: Vec<String>,
+    dedup: String,
+    rank: String,
+    follow_top: usize,
+    max_chars: usize,
+    warn_tabs: usize,
+) -> i32 {
+    run_with_timeout(
+        "harvest",
+        120,
+        commands::cmd_harvest(
+            universal, queries, dedup, rank, follow_top, max_chars, warn_tabs,
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| e)
+}
+
+async fn handle_status(
+    universal: &mut commands::UniversalFlags,
+    global: &commands::UniversalFlags,
+) -> i32 {
+    universal.merge_from(global);
+    run_with_timeout("status", 10, commands::cmd_status(universal))
+        .await
+        .unwrap_or_else(|e| e)
+}
+
+async fn handle_update() -> i32 {
+    run_with_timeout("update", 60, commands::cmd_update())
+        .await
+        .unwrap_or_else(|e| e)
+}
+
+async fn handle_extract(
+    universal: &mut commands::UniversalFlags,
+    global: &commands::UniversalFlags,
+    url: String,
+    max_chars: usize,
+    offset: usize,
+) -> i32 {
+    universal.merge_from(global);
+    run_with_timeout(
+        "extract",
+        30,
+        commands::cmd_extract(universal, &url, max_chars, offset),
+    )
+    .await
+    .unwrap_or_else(|e| e)
+}
+
+async fn handle_ax(
+    universal: &mut commands::UniversalFlags,
+    global: &commands::UniversalFlags,
+    url: String,
+    max_nodes: usize,
+) -> i32 {
+    universal.merge_from(global);
+    let max_nodes = if max_nodes == 0 {
+        None
+    } else {
+        Some(max_nodes)
+    };
+    run_with_timeout("ax", 30, commands::cmd_ax(universal, &url, max_nodes))
+        .await
+        .unwrap_or_else(|e| e)
+}
+
+async fn handle_pdf_url(
+    universal: &mut commands::UniversalFlags,
+    global: &commands::UniversalFlags,
+    url: String,
+    max_chars: usize,
+    offset: usize,
+) -> i32 {
+    universal.merge_from(global);
+    run_with_timeout(
+        "pdf url",
+        30,
+        commands::cmd_pdf_url(universal, &url, max_chars, offset),
+    )
+    .await
+    .unwrap_or_else(|e| e)
+}
+
+async fn handle_pdf_file(
+    universal: &mut commands::UniversalFlags,
+    global: &commands::UniversalFlags,
+    path: std::path::PathBuf,
+    max_chars: usize,
+    offset: usize,
+) -> i32 {
+    universal.merge_from(global);
+    run_with_timeout(
+        "pdf file",
+        15,
+        commands::cmd_pdf_file(universal, &path, max_chars, offset),
+    )
+    .await
+    .unwrap_or_else(|e| e)
+}
+
 #[tokio::main]
 async fn main() {
     let mut cli = Cli::parse();
@@ -121,27 +283,8 @@ async fn main() {
     }));
 
     let code = match cli.command {
-        Command::Status { ref mut universal } => {
-            universal.merge_from(&cli.universal);
-            match tokio::time::timeout(Duration::from_secs(10), commands::cmd_status(universal))
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    eprintln!("gthings: status command timed out after 10s");
-                    1
-                }
-            }
-        }
-        Command::Update => {
-            match tokio::time::timeout(Duration::from_secs(60), commands::cmd_update()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    eprintln!("gthings: update command timed out after 60s");
-                    1
-                }
-            }
-        }
+        Command::Status { ref mut universal } => handle_status(universal, &cli.universal).await,
+        Command::Update => handle_update().await,
         Command::Search {
             ref mut universal,
             queries,
@@ -156,63 +299,16 @@ async fn main() {
         } => {
             universal.merge_from(&cli.universal);
             match strategy {
-                SearchStrategy::Simple => {
-                    if queries.is_empty() {
-                        commands::emit_output(
-                            None,
-                            Some((
-                                "EMPTY_QUERY",
-                                "Search query cannot be empty",
-                                "Provide a search term",
-                            )),
-                            universal.resolved_output(),
-                            universal.query.as_deref(),
-                        );
-                        1
-                    } else {
-                        match tokio::time::timeout(
-                            Duration::from_secs(30),
-                            commands::cmd_search(universal, &queries[0], count),
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => {
-                                eprintln!("gthings: search command timed out after 30s");
-                                1
-                            }
-                        }
-                    }
-                }
+                SearchStrategy::Simple => handle_search_simple(universal, queries, count).await,
                 SearchStrategy::Parallel => {
-                    match tokio::time::timeout(
-                        Duration::from_secs(60),
-                        commands::cmd_batch(universal, queries, count, extract_results, max_chars),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            eprintln!("gthings: parallel search command timed out after 60s");
-                            1
-                        }
-                    }
+                    handle_search_parallel(universal, queries, count, extract_results, max_chars)
+                        .await
                 }
                 SearchStrategy::Harvest => {
-                    match tokio::time::timeout(
-                        Duration::from_secs(120),
-                        commands::cmd_harvest(
-                            universal, queries, dedup, rank, follow_top, max_chars, warn_tabs,
-                        ),
+                    handle_search_harvest(
+                        universal, queries, dedup, rank, follow_top, max_chars, warn_tabs,
                     )
                     .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            eprintln!("gthings: harvest command timed out after 120s");
-                            1
-                        }
-                    }
                 }
             }
         }
@@ -222,85 +318,24 @@ async fn main() {
             url,
             max_chars,
             offset,
-        } => {
-            universal.merge_from(&cli.universal);
-            match tokio::time::timeout(
-                Duration::from_secs(30),
-                commands::cmd_extract(universal, &url, max_chars, offset),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    eprintln!("gthings: extract command timed out after 30s");
-                    1
-                }
-            }
-        }
+        } => handle_extract(universal, &cli.universal, url, max_chars, offset).await,
         Command::Ax {
             ref mut universal,
             url,
             max_nodes,
-        } => {
-            universal.merge_from(&cli.universal);
-            let max_nodes = if max_nodes == 0 {
-                None
-            } else {
-                Some(max_nodes)
-            };
-            match tokio::time::timeout(
-                Duration::from_secs(30),
-                commands::cmd_ax(universal, &url, max_nodes),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    eprintln!("gthings: ax command timed out after 30s");
-                    1
-                }
-            }
-        }
+        } => handle_ax(universal, &cli.universal, url, max_nodes).await,
         Command::PdfUrl {
             ref mut universal,
             url,
             max_chars,
             offset,
-        } => {
-            universal.merge_from(&cli.universal);
-            match tokio::time::timeout(
-                Duration::from_secs(30),
-                commands::cmd_pdf_url(universal, &url, max_chars, offset),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    eprintln!("gthings: pdf url command timed out after 30s");
-                    1
-                }
-            }
-        }
+        } => handle_pdf_url(universal, &cli.universal, url, max_chars, offset).await,
         Command::PdfFile {
             ref mut universal,
             path,
             max_chars,
             offset,
-        } => {
-            universal.merge_from(&cli.universal);
-            match tokio::time::timeout(
-                Duration::from_secs(15),
-                commands::cmd_pdf_file(universal, &path, max_chars, offset),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    eprintln!("gthings: pdf file command timed out after 15s");
-                    1
-                }
-            }
-        }
+        } => handle_pdf_file(universal, &cli.universal, path, max_chars, offset).await,
     };
     std::process::exit(code);
 }

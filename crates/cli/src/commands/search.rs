@@ -27,17 +27,19 @@ pub(crate) async fn cmd_search(flags: &UniversalFlags, term: &str, count: usize)
         Err(c) => return c,
     };
 
-    let term = term.to_string();
-    let query_for_output = term.clone();
+    let query_for_output = term.to_string();
+    let term_owned = term.to_string();
     let result = match session
         .with_isolated_tab(|session, tab| {
-            Box::pin(async move { search(session, tab, &term, count).await })
+            Box::pin(async move { search(session, tab, &term_owned, count).await })
         })
         .await
     {
         Ok(r) => r,
         Err(e) => {
-            let _ = session.disconnect().await;
+            if let Err(e) = session.disconnect().await {
+                tracing::warn!("disconnect failed after search error: {e}");
+            }
             emit_output(
                 None,
                 Some((
@@ -59,7 +61,6 @@ pub(crate) async fn cmd_search(flags: &UniversalFlags, term: &str, count: usize)
     let data = serde_json::json!({
         "results": result,
         "query": query_for_output,
-        "body_status": "snippet_only",
     });
     emit_output(
         Some(data),

@@ -5,6 +5,7 @@
 
 use crate::commands::{UniversalFlags, emit_output};
 use gthings_common::pagination::ExtractParams;
+use gthings_extraction::Extractor;
 use gthings_extraction::dispatch::AutoExtractor;
 
 /// Extract content from any URL using auto-detection.
@@ -14,15 +15,9 @@ pub(crate) async fn cmd_extract(
     max_chars: usize,
     offset: usize,
 ) -> i32 {
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; gthings/0.5)")
-        .timeout(std::time::Duration::from_secs(flags.timeout))
-        .build()
-        .expect("reqwest Client::builder() with default config should never fail");
-
-    let extractor = AutoExtractor::new(client);
+    let extractor = AutoExtractor::new(crate::commands::http_client());
     let params = ExtractParams { offset, max_chars };
-    match extractor.extract(url, params).await {
+    match extractor.extract(url.to_string(), params).await {
         Ok(article) => {
             let mut value = serde_json::json!(article);
             if let Some(obj) = value.as_object_mut() {

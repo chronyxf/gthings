@@ -1,10 +1,8 @@
 //! Batch search (dispatched via `search --strategy parallel`).
 
-use std::sync::Arc;
+use gthings_search::{BatchProcessor, BatchSearchConfig};
 
-use gthings_search::BatchProcessor;
-
-use crate::commands::{UniversalFlags, connect, emit_output};
+use crate::commands::{UniversalFlags, emit_output, with_session};
 
 /// Batch: detect → connect → batch → disconnect → output.
 ///
@@ -17,51 +15,37 @@ pub(crate) async fn cmd_batch(
     extract_results: bool,
     max_chars: usize,
 ) -> i32 {
-    let session = match connect(flags).await {
-        Ok(s) => s,
-        Err(c) => return c,
+    let config = BatchSearchConfig {
+        follow_results: extract_results,
+        follow_max_chars: max_chars,
+        reputation: None,
     };
 
-    let arc_session = Arc::new(session);
+    with_session(flags, |session| async move {
+        let all_results = match BatchProcessor::search(session, &queries, count, config).await {
+            Ok(r) => r,
+            Err(e) => {
+                emit_output(
+                    None,
+                    Some((
+                        "BATCH_FAILED",
+                        &e.to_string(),
+                        "Retry with fewer queries or longer timeout",
+                    )),
+                    flags.resolved_output(),
+                    flags.query.as_deref(),
+                );
+                return 1;
+            }
+        };
 
-    let all_results = match BatchProcessor::search(
-        Arc::clone(&arc_session),
-        &queries,
-        count,
-        extract_results,
-        max_chars,
-        None,
-    )
+        emit_output(
+            Some(serde_json::json!({"results": all_results})),
+            None,
+            flags.resolved_output(),
+            flags.query.as_deref(),
+        );
+        0
+    })
     .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            emit_output(
-                None,
-                Some((
-                    "BATCH_FAILED",
-                    &e.to_string(),
-                    "Retry with fewer queries or longer timeout",
-                )),
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
-            return 1;
-        }
-    };
-
-    // Clean disconnect when possible (unique reference).
-    if let Ok(s) = Arc::try_unwrap(arc_session) {
-        if let Err(e) = s.disconnect().await {
-            tracing::warn!("disconnect failed: {e}");
-        }
-    }
-
-    emit_output(
-        Some(serde_json::json!(all_results)),
-        None,
-        flags.resolved_output(),
-        flags.query.as_deref(),
-    );
-    0
 }

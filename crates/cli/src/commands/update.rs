@@ -33,7 +33,7 @@ pub(crate) async fn cmd_update() -> i32 {
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            eprintln!("Warning: `cargo install gthings` exited with code {}", s);
+            eprintln!("Warning: `cargo install gthings` exited with code {s}");
             // Continue anyway — maybe skill-install is still useful.
         }
         Err(e) => {
@@ -51,23 +51,25 @@ pub(crate) async fn cmd_update() -> i32 {
         return 0;
     };
 
-    let Some(home) = std::env::var("HOME").ok() else {
-        eprintln!("Warning: could not determine home directory; skill files not installed.");
-        return 0;
-    };
-
     // Destination paths
     let skill_dir = base.join("skills").join("gthings");
-    let agent_dir = PathBuf::from(&home)
-        .join(".agents")
-        .join("skills")
-        .join("gthings");
+    let home_dir = base
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("opencode_dir path must have at least 2 parent directories");
+    let agent_dir = home_dir.join(".agents").join("skills").join("gthings");
     let ref_dir = agent_dir.join("reference");
 
-    // Create directories (ignore errors — let writes fail below for specific messages)
-    let _ = fs::create_dir_all(&skill_dir);
-    let _ = fs::create_dir_all(&agent_dir);
-    let _ = fs::create_dir_all(&ref_dir);
+    // Create directories (log warnings on failure — writes will also surface issues)
+    fs::create_dir_all(&skill_dir).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %skill_dir.display(), "failed to create skill directory");
+    });
+    fs::create_dir_all(&agent_dir).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %agent_dir.display(), "failed to create agent directory");
+    });
+    fs::create_dir_all(&ref_dir).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %ref_dir.display(), "failed to create reference directory");
+    });
 
     // Write files, collecting individual results
     let writes: [(&str, &str, PathBuf); 4] = [

@@ -32,6 +32,22 @@
 ### Added
 - Add `gthings update` CLI command that updates the binary via `cargo install gthings` and installs/refreshes opencode skill files to `~/.config/opencode/skills/gthings/` and agent files to `~/.config/opencode/agents/gthings/`
 
+## 0.6.7 (2026-07-30)
+
+### Fixes
+
+#### - fix: parallel strategy output wrapped in {"results": ...} (batch.rs)
+
+- refactor: extract with_session() lifecycle helper (helpers.rs, batch.rs, harvest.rs)
+- refactor: extract dispatch functions from main() (main.rs)
+- refactor: remove dead code in update.rs
+- fix: replace expect() with unwrap_or_else in helpers.rs
+- fix: remove unused async from handle_pdf_extraction (pdf.rs)
+- fix: remove unnecessary .to_vec() on Bytes (pdf.rs)
+- fix: inline port() function (connect.rs, status.rs)
+- fix: clippy lints — uninlined_format_args, single_match_else (main.rs, connect.rs, update.rs, harvest.rs)
+- refactor: elide lifetimes, reduce Vec allocation in text_summary (helpers.rs)
+
 ## 0.6.1 (2026-07-26)
 
 ### Added

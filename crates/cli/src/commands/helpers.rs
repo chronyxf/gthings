@@ -1,6 +1,13 @@
 //! Shared CLI helpers: universal flags, output formatting, and query filtering.
+//!
+//! Output pipeline: command → [`emit_output`] → [`format_output`] → stdout.
+//! Every command returns a `{status, data, error}` envelope so agents have one
+//! parse path regardless of success or failure.
 
 use serde_json::Value;
+use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 /// Output format for command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -120,50 +127,76 @@ impl UniversalFlags {
 }
 
 /// Format a JSON value according to the output format and optional query filter.
+///
+/// When no query is given, the original value is formatted directly (no clone).
+/// When a query is provided, the filtered result is formatted instead.
 pub(crate) fn format_output(value: &Value, format: OutputFormat, query: Option<&str>) -> String {
-    let value = match query {
-        Some(q) => apply_query(value, q),
-        None => value.clone(),
-    };
+    match query {
+        // Short-circuit: no query → format the original value (zero-copy).
+        None => format_value(value, format),
+        // Apply the query filter, then format the result.
+        Some(q) => format_value(&apply_query(value, q), format),
+    }
+}
 
+/// Core formatting: convert a JSON value to its string representation
+/// in one of the three output styles.
+fn format_value(value: &Value, format: OutputFormat) -> String {
     match format {
-        OutputFormat::Text => {
-            if let Some(s) = value.as_str() {
-                s.to_string()
-            } else if let Some(n) = value.as_i64() {
-                n.to_string()
-            } else if let Some(n) = value.as_f64() {
-                n.to_string()
-            } else if let Some(b) = value.as_bool() {
-                b.to_string()
-            } else if let Some(arr) = value.as_array() {
-                // For arrays, show one item per line with index
-                arr.iter()
-                    .enumerate()
-                    .map(|(i, v)| format!("[{}] {}", i + 1, text_summary(v)))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else if let Some(obj) = value.as_object() {
-                // For objects, show key: value pairs
-                obj.iter()
-                    .map(|(k, v)| format!("{}: {}", k, text_summary(v)))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                serde_json::to_string(&value).unwrap_or_default()
-            }
-        }
-        OutputFormat::Json => serde_json::to_string_pretty(&value).unwrap_or_default(),
-        OutputFormat::NdJson => {
-            if let Some(arr) = value.as_array() {
-                arr.iter()
-                    .filter_map(|v| serde_json::to_string(v).ok())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                serde_json::to_string(&value).unwrap_or_default()
-            }
-        }
+        OutputFormat::Text => format_text(value),
+        OutputFormat::Json => serde_json::to_string_pretty(value).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "JSON serialization failed");
+            String::new()
+        }),
+        OutputFormat::NdJson => format_ndjson(value),
+    }
+}
+
+/// Human-readable text representation.
+fn format_text(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        s.to_string()
+    } else if let Some(n) = value.as_i64() {
+        n.to_string()
+    } else if let Some(n) = value.as_f64() {
+        n.to_string()
+    } else if let Some(b) = value.as_bool() {
+        b.to_string()
+    } else if let Some(arr) = value.as_array() {
+        // Array items: one indexed line per element.
+        arr.iter()
+            .enumerate()
+            .map(|(i, v)| format!("[{}] {}", i + 1, text_summary(v)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else if let Some(obj) = value.as_object() {
+        // Object entries: one "key: value" line per field.
+        obj.iter()
+            .map(|(k, v)| format!("{}: {}", k, text_summary(v)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "JSON serialization failed");
+            String::new()
+        })
+    }
+}
+
+/// Compact JSON-lines format: one JSON value per line.
+/// Arrays expand into multiple lines; scalars/objects render as single lines.
+fn format_ndjson(value: &Value) -> String {
+    if let Some(arr) = value.as_array() {
+        arr.iter()
+            .filter_map(|v| {
+                serde_json::to_string(v)
+                    .map_err(|e| tracing::warn!(error = %e, "JSON serialization failed in filter"))
+                    .ok()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        serde_json::to_string(value).unwrap_or_default()
     }
 }
 
@@ -260,45 +293,102 @@ fn apply_segments(value: &Value, segments: &[QuerySegment]) -> Vec<Value> {
     }
 }
 
-/// Unified output format for AI agent consumption.
-/// Every command returns {status, data, error} so agents have one parse path.
+/// Unified output for AI-agent consumption.
+///
+/// Every command produces a `{status, data, error}` envelope so that agents
+/// (and humans) have a single parse path regardless of success or failure.
+/// The optional `query` is applied *after* the envelope is built, allowing
+/// callers to extract specific sub-fields (e.g. `--query .data`).
 pub(crate) fn emit_output(
-    value: Option<serde_json::Value>,
+    value: Option<Value>,
     error: Option<(&str, &str, &str)>,
     format: OutputFormat,
     query: Option<&str>,
 ) {
-    let output = serde_json::json!({
-        "status": if error.is_some() { "error" } else { "ok" },
-        "data": value,
-        "error": error.map(|(code, detail, hint)| serde_json::json!({
-            "code": code,
-            "detail": detail,
-            "hint": hint,
-        })),
-    });
-    let formatted = format_output(&output, format, query);
+    let envelope = build_envelope(value, error);
+    let formatted = format_output(&envelope, format, query);
     println!("{formatted}");
 }
+
+/// Build the standard `{status, data, error}` JSON envelope.
+#[allow(clippy::needless_pass_by_value)]
+fn build_envelope(data: Option<Value>, error: Option<(&str, &str, &str)>) -> Value {
+    let error_obj = error.map(
+        |(code, detail, hint)| serde_json::json!({"code": code, "detail": detail, "hint": hint}),
+    );
+    serde_json::json!({
+        "status": if error_obj.is_some() { "error" } else { "ok" },
+        "data": data,
+        "error": error_obj,
+    })
+}
+/// Shared HTTP client (lazily initialized, connection-pooled).
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; gthings/0.5)")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "Failed to build HTTP client");
+                std::process::exit(1);
+            })
+    })
+}
+
 /// Produce a concise human-readable summary of a JSON value.
-fn text_summary(value: &Value) -> String {
+///
+/// Long strings (>200 chars) are truncated with an ellipsis.
+/// Short strings are returned as a borrowed slice to avoid allocation.
+#[allow(clippy::incompatible_msrv)]
+fn text_summary(value: &Value) -> Cow<'_, str> {
     match value {
         Value::String(s) => {
             if s.len() > 200 {
-                format!("{}...", &s[..200])
+                // Truncate and allocate a new shortened string.
+                format!("{}...", &s[..s.floor_char_boundary(200)]).into()
             } else {
-                s.clone()
+                // Borrow the original string — no allocation needed.
+                Cow::Borrowed(s.as_str())
             }
         }
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => "null".to_string(),
-        Value::Array(a) => format!("[{} items]", a.len()),
+        Value::Number(n) => n.to_string().into(),
+        Value::Bool(b) => b.to_string().into(),
+        Value::Null => Cow::Borrowed("null"),
+        Value::Array(a) => format!("[{} items]", a.len()).into(),
         Value::Object(o) => {
-            let keys: Vec<String> = o.keys().cloned().collect();
-            format!("{{{}}}", keys.join(", "))
+            let keys: Vec<&str> = o.keys().map(|k| k.as_str()).collect();
+            format!("{{{}}}", keys.join(", ")).into()
         }
     }
+}
+
+/// Attempt a clean disconnect when the Arc has unique ownership.
+/// If other references still exist, the disconnect is silently skipped.
+pub(crate) async fn disconnect_session(session: Arc<gthings_cdp::Session>) {
+    if let Ok(s) = Arc::try_unwrap(session) {
+        if let Err(e) = s.disconnect().await {
+            tracing::warn!("disconnect failed: {e}");
+        }
+    }
+}
+
+/// Connect, wrap in `Arc<Session>`, run the async function, then disconnect.
+/// Returns the exit code from `f`, or the connection error code.
+pub(crate) async fn with_session<F, Fut>(flags: &UniversalFlags, f: F) -> i32
+where
+    F: FnOnce(Arc<gthings_cdp::Session>) -> Fut,
+    Fut: std::future::Future<Output = i32>,
+{
+    let session = match crate::commands::connect(flags).await {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let arc_session = Arc::new(session);
+    let code = f(Arc::clone(&arc_session)).await;
+    disconnect_session(arc_session).await;
+    code
 }
 
 #[cfg(test)]

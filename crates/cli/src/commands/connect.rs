@@ -4,11 +4,6 @@ use gthings_cdp::{Session, detect};
 
 use crate::commands::helpers::UniversalFlags;
 
-/// Port from `--cdp-port` flag, `GTHINGS_CDP_PORT` env var, or default 9222.
-pub(crate) fn port(flags: &UniversalFlags) -> u16 {
-    flags.cdp_port
-}
-
 /// Resolve the CDP WebSocket URL.
 ///
 /// Priority: `--cdp-url` flag → `GTHINGS_CDP_WS_URL` env var → detection via port.
@@ -23,11 +18,11 @@ pub(crate) async fn resolve_ws_url(flags: &UniversalFlags) -> Result<String, i32
         }
     }
 
-    let p = port(flags);
-    let browser = detect(p).await.map_err(|_| {
+    let p = flags.cdp_port;
+    let browser = detect(p).await.map_err(|e| {
         print_error(
             "BROWSER_NOT_FOUND",
-            &format!("No browser found on port {p}"),
+            &format!("No browser found on port {p}: {e}"),
             "Open Dia or Chrome with --remote-debugging-port=9222",
         );
         1
@@ -43,7 +38,7 @@ pub(crate) fn print_error(code: &str, detail: &str, hint: &str) {
         "detail": detail,
         "hint": hint,
     });
-    eprintln!("{}", err);
+    eprintln!("{err}");
 }
 
 /// Detect browser → connect → return Session.

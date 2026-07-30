@@ -4,62 +4,26 @@ use crate::commands::{UniversalFlags, emit_output};
 use gthings_common::pagination::ExtractParams;
 use gthings_extraction::PdfExtractor;
 
-/// Extract text from PDF at URL.
-pub(crate) async fn cmd_pdf_url(
+/// Emit a uniform error envelope for PDF extraction failures.
+fn emit_error(code: &str, detail: &str, hint: &str, flags: &UniversalFlags) {
+    emit_output(
+        None,
+        Some((code, detail, hint)),
+        flags.resolved_output(),
+        flags.query.as_deref(),
+    );
+}
+
+/// Shared helper: run `PdfExtractor::extract_article` and emit the result.
+fn handle_pdf_extraction(
     flags: &UniversalFlags,
     url: &str,
-    max_chars: usize,
-    offset: usize,
+    bytes: &[u8],
+    params: ExtractParams,
+    hint: &str,
 ) -> i32 {
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; gthings/0.5)")
-        .timeout(std::time::Duration::from_secs(flags.timeout))
-        .build()
-        .expect("reqwest Client::builder() with default config should never fail");
-
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            emit_output(
-                None,
-                Some(("PDF_FETCH_FAILED", &e.to_string(), "Check URL")),
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
-            return 1;
-        }
-    };
-
-    if !resp.status().is_success() {
-        emit_output(
-            None,
-            Some((
-                "PDF_HTTP_ERROR",
-                &format!("HTTP {}", resp.status()),
-                "Verify URL",
-            )),
-            flags.resolved_output(),
-            flags.query.as_deref(),
-        );
-        return 1;
-    }
-
-    let bytes = match resp.bytes().await {
-        Ok(b) => b.to_vec(),
-        Err(e) => {
-            emit_output(
-                None,
-                Some(("PDF_READ_FAILED", &e.to_string(), "Retry")),
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
-            return 1;
-        }
-    };
-
     let extractor = PdfExtractor;
-    let params = ExtractParams { offset, max_chars };
-    match extractor.extract_article(url, &bytes, &params) {
+    match extractor.extract_article(url, bytes, &params) {
         Ok(article) => {
             let value = serde_json::json!(article);
             emit_output(
@@ -73,13 +37,52 @@ pub(crate) async fn cmd_pdf_url(
         Err(e) => {
             emit_output(
                 None,
-                Some(("PDF_EXTRACT_FAILED", &e.to_string(), "Try a different PDF")),
+                Some(("PDF_EXTRACT_FAILED", &e.to_string(), hint)),
                 flags.resolved_output(),
                 flags.query.as_deref(),
             );
             1
         }
     }
+}
+
+/// Extract text from PDF at URL.
+pub(crate) async fn cmd_pdf_url(
+    flags: &UniversalFlags,
+    url: &str,
+    max_chars: usize,
+    offset: usize,
+) -> i32 {
+    let client = crate::commands::http_client();
+
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            emit_error("PDF_FETCH_FAILED", &e.to_string(), "Check URL", flags);
+            return 1;
+        }
+    };
+
+    if !resp.status().is_success() {
+        emit_error(
+            "PDF_HTTP_ERROR",
+            &format!("HTTP {}", resp.status()),
+            "Verify URL",
+            flags,
+        );
+        return 1;
+    }
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            emit_error("PDF_READ_FAILED", &e.to_string(), "Retry", flags);
+            return 1;
+        }
+    };
+
+    let params = ExtractParams { offset, max_chars };
+    handle_pdf_extraction(flags, url, &bytes, params, "Try a different PDF")
 }
 
 /// Extract text from local PDF file.
@@ -103,31 +106,6 @@ pub(crate) async fn cmd_pdf_file(
     };
 
     let url = format!("file://{}", path.display());
-    let extractor = PdfExtractor;
     let params = ExtractParams { offset, max_chars };
-    match extractor.extract_article(&url, &bytes, &params) {
-        Ok(article) => {
-            let value = serde_json::json!(article);
-            emit_output(
-                Some(value),
-                None,
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
-            0
-        }
-        Err(e) => {
-            emit_output(
-                None,
-                Some((
-                    "PDF_EXTRACT_FAILED",
-                    &e.to_string(),
-                    "File may not be a valid PDF",
-                )),
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
-            1
-        }
-    }
+    handle_pdf_extraction(flags, &url, &bytes, params, "File may not be a valid PDF")
 }
