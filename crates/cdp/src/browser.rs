@@ -163,7 +163,7 @@ pub async fn dismiss_allow_debugging_dialog() {
     end tell"#;
 
     const OSASCRIPT_TIMEOUT: Duration = Duration::from_secs(1);
-    const MAX_ATTEMPTS: u32 = 1;
+    const MAX_ATTEMPTS: u32 = 20;
 
     for attempt in 1..=MAX_ATTEMPTS {
         let script = SCRIPT.to_owned();
@@ -215,25 +215,44 @@ pub async fn dismiss_allow_debugging_dialog() {}
 // ---------------------------------------------------------------------------
 
 /// Shared HTTP client with sensible timeouts.
-fn http_client() -> &'static reqwest::Client {
+#[allow(clippy::result_large_err)]
+fn http_client() -> Result<&'static reqwest::Client> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
+    Ok(CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .expect("valid reqwest client config")
-    })
+            .expect("failed to build reqwest client")
+    }))
 }
 
 /// Probe `/json/version` — the richest endpoint (includes `webSocketDebuggerUrl`,
 /// `Browser`, and version info).
 async fn probe_http_version(port: u16) -> Option<DetectedBrowser> {
     let url = format!("http://127.0.0.1:{port}/json/version");
-    let client = http_client();
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
 
-    let resp = client.get(&url).send().await.ok()?;
-    let body: serde_json::Value = resp.json().await.ok()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::debug!(error = %e, "probe_http_version http get failed");
+            e
+        })
+        .ok()?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| {
+            tracing::debug!(error = %e, "probe_http_version json parse failed");
+            e
+        })
+        .ok()?;
 
     let ws_url = body.get("webSocketDebuggerUrl")?.as_str()?;
     let full_browser = body
@@ -259,10 +278,28 @@ async fn probe_http_version(port: u16) -> Option<DetectedBrowser> {
 /// the first available page target.
 async fn probe_http_list(port: u16, path: &str) -> Option<String> {
     let url = format!("http://127.0.0.1:{port}{path}");
-    let client = http_client();
+    let client = match http_client() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
 
-    let resp = client.get(&url).send().await.ok()?;
-    let list: Vec<serde_json::Value> = resp.json().await.ok()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::debug!(error = %e, "probe_http_list http get failed");
+            e
+        })
+        .ok()?;
+    let list: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| {
+            tracing::debug!(error = %e, "probe_http_list json parse failed");
+            e
+        })
+        .ok()?;
 
     for entry in &list {
         if let Some(ws_url) = entry.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
@@ -293,9 +330,12 @@ async fn probe_devtools_active_port(port: u16) -> Option<DetectedBrowser> {
             if lines.len() < 2 {
                 continue;
             }
-            let file_port: u16 = match lines[0].trim().parse().ok() {
-                Some(p) => p,
-                None => continue,
+            let file_port: u16 = match lines[0].trim().parse() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to parse port from DevToolsActivePort");
+                    continue;
+                }
             };
             if file_port != port {
                 continue;
@@ -351,29 +391,26 @@ fn get_profile_dirs() -> Vec<PathBuf> {
 fn infer_browser_name(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
     let s = s.as_ref();
-    if s.contains("Dia") {
-        "Dia".into()
-    } else if s.contains("Chrome Canary") {
-        "Google Chrome Canary".into()
-    } else if s.contains("Chrome") {
-        "Google Chrome".into()
-    } else if s.contains("Chromium") {
-        "Chromium".into()
-    } else if s.contains("Edge Canary") {
-        "Microsoft Edge Canary".into()
-    } else if s.contains("Edge") {
-        "Microsoft Edge".into()
-    } else if s.contains("Brave") {
-        "Brave".into()
-    } else if s.contains("Arc") {
-        "Arc".into()
-    } else if s.contains("Vivaldi") {
-        "Vivaldi".into()
-    } else if s.contains("Opera") {
-        "Opera".into()
-    } else {
-        "unknown".into()
+    // Map from path suffix keywords to browser display names.
+    // Order matters: check more specific patterns first.
+    const BROWSER_MAP: &[(&str, &str)] = &[
+        ("Chrome Canary", "Google Chrome Canary"),
+        ("Chrome", "Google Chrome"),
+        ("Chromium", "Chromium"),
+        ("Edge Canary", "Microsoft Edge Canary"),
+        ("Edge", "Microsoft Edge"),
+        ("Brave", "Brave"),
+        ("Arc", "Arc"),
+        ("Vivaldi", "Vivaldi"),
+        ("Opera", "Opera"),
+        ("Dia", "Dia"),
+    ];
+    for (keyword, name) in BROWSER_MAP {
+        if s.contains(keyword) {
+            return name.to_string();
+        }
     }
+    "unknown".into()
 }
 
 #[cfg(test)]

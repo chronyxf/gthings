@@ -11,3 +11,6 @@ pub use connection::{CdpEvent, Connection};
 pub use error::{CdpError, Result};
 pub use session::Session;
 pub use tab::Tab;
+
+/// The `about:blank` URL constant used for background tab creation.
+pub const ABOUT_BLANK: &str = "about:blank";

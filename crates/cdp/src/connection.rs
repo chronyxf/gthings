@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -24,14 +24,28 @@ const CALL_RETRY_BASE_DELAY_MS: u64 = 200;
 /// WebSocket connection timeout (10 seconds).
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Error message for WS connection timeouts.
+const WS_CONNECT_TIMEOUT_MSG: &str = "WebSocket connection timed out after 10s";
+
 /// Overall connection timeout (15 seconds).
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounded channel capacity for CDP commands and events.
+///
+/// Provides backpressure: if the I/O task falls behind, callers will queue
+/// instead of letting memory grow unboundedly. 256 is generous enough for
+/// most workflows while keeping memory bounded.
+const CHANNEL_CAPACITY: usize = 256;
 
 /// Internal mutable state wrapped in `Arc<Mutex<...>>` so it can be
 /// replaced atomically during auto-reconnect without changing the public
 /// `&self` signature of [`Connection::call`].
+///
+/// Uses a **bounded** channel (capacity [`CHANNEL_CAPACITY`]) to provide
+/// backpressure: if the background I/O task cannot keep up, callers will
+/// block or receive an error instead of unbounded memory growth.
 struct ConnectionInner {
-    write: mpsc::UnboundedSender<InternalMessage>,
+    write: mpsc::Sender<InternalMessage>,
     handle: JoinHandle<()>,
 }
 
@@ -62,6 +76,92 @@ pub(crate) enum InternalMessage {
     },
 }
 
+/// Background I/O loop state — encapsulates all the parameters previously
+/// passed directly to [`Connection::run`] so the signature is clean.
+struct RunState {
+    write_rx: mpsc::Receiver<InternalMessage>,
+    ws_writer: futures_util::stream::SplitSink<
+        WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        Message,
+    >,
+    ws_reader:
+        futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>,
+    pending: PendingMap,
+    events: broadcast::Sender<CdpEvent>,
+}
+
+impl RunState {
+    /// Run the I/O loop until the WebSocket disconnects or the command
+    /// channel closes.
+    async fn run(mut self) {
+        loop {
+            tokio::select! {
+                // Outgoing CDP commands from Connection::call
+                msg = self.write_rx.recv() => {
+                    match msg {
+                        Some(InternalMessage::Call { id, method, params, session_id, tx }) => {
+                            let cmd = Connection::build_cdp_command(id, &method, &params, session_id.as_deref());
+                            let text = match serde_json::to_string(&cmd) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    tracing::warn!("Failed to serialize CDP command: {e}");
+                                    let _ = tx.send(Err(CdpError::Json(e)));
+                                    continue;
+                                }
+                            };
+                            // Store pending before sending to avoid race
+                            self.pending.insert(id, PendingCall { method, tx });
+                            if let Err(e) = self.ws_writer.send(Message::Text(text)).await {
+                                tracing::warn!("WS send error: {e}");
+                                if let Some(pc) = self.pending.remove(&id) {
+                                    let _ = pc.tx.send(Err(CdpError::ConnectionFailed {
+                                        detail: format!("WebSocket send failed: {e}"),
+                                    }));
+                                }
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                // Incoming WebSocket messages
+                msg = self.ws_reader.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                Connection::dispatch_message(value, &mut self.pending, &self.events).await;
+                            }
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            tracing::debug!("CDP WebSocket closed: {frame:?}");
+                            break;
+                        }
+                        Some(Ok(Message::Binary(_))) => {
+                            tracing::warn!("Unexpected CDP Binary frame received, ignoring");
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!("CDP WebSocket read error: {e}");
+                            break;
+                        }
+                        None => {
+                            tracing::debug!("CDP WebSocket stream ended");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Clean up all pending calls when the loop exits
+        for (_, pc) in self.pending.drain() {
+            let _ = pc.tx.send(Err(CdpError::ConnectionFailed {
+                detail: "WebSocket connection closed".into(),
+            }));
+        }
+    }
+}
+
 /// Event-driven CDP WebSocket connection.
 ///
 /// Spawns a background task that multiplexes outgoing CDP commands and
@@ -80,6 +180,27 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
+    /// Lock the inner state, recovering from a poisoned mutex if needed.
+    fn lock_inner(&self) -> MutexGuard<'_, ConnectionInner> {
+        self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!(target: "gthings_cdp::connection", "mutex poisoned, recovering");
+            e.into_inner()
+        })
+    }
+
+    /// Build a CDP command JSON value, optionally including a sessionId.
+    fn build_cdp_command(id: u64, method: &str, params: &Value, session_id: Option<&str>) -> Value {
+        let mut cmd = serde_json::json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if let Some(sid) = session_id {
+            cmd["sessionId"] = serde_json::json!(sid);
+        }
+        cmd
+    }
+
     /// Connect to a CDP WebSocket endpoint.
     ///
     /// `timeout` controls the per-call response timeout (default 30s when
@@ -90,57 +211,37 @@ impl Connection {
         tokio::time::timeout(CONNECTION_TIMEOUT, async {
             // Start connecting in background
             let ws_url_owned = ws_url.to_owned();
-            let mut connect_fut = tokio::spawn(async move {
-                match tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url_owned)).await {
-                    Ok(Ok(pair)) => Ok(pair),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(tokio_tungstenite::tungstenite::Error::Io(
-                        std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "WebSocket connection timed out after 10s",
-                        ),
-                    )),
-                }
+            let connect_fut = tokio::spawn(async move {
+                tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url_owned))
+                    .await
+                    .map_err(|_| CdpError::ConnectionFailed {
+                        detail: WS_CONNECT_TIMEOUT_MSG.into(),
+                    })?
+                    .map_err(|e| CdpError::ConnectionFailed {
+                        detail: format!("WebSocket connect to {ws_url_owned} failed: {e}"),
+                    })
             });
 
-            // Try the WebSocket first with a short timeout. If it connects
-            // quickly, no dialog is blocking the handshake and we skip the
-            // expensive osascript call entirely — saving ~1.6s per connection.
-            let (ws_stream, _) = match tokio::time::timeout(Duration::from_secs(3), &mut connect_fut).await {
-                Ok(Ok(Ok(pair))) => {
-                    // Fast path — connected without osascript
-                    pair
-                }
-                _ => {
-                    // First attempt failed or timed out; the browser debugging
-                    // dialog may be blocking the WebSocket handshake. Dismiss
-                    // it, then retry the original connection (still in flight).
-                    #[cfg(target_os = "macos")]
-                    {
-                        tokio::time::sleep(Duration::from_millis(600)).await;
-                        dismiss_allow_debugging_dialog().await;
-                    }
+            let ws_stream = Self::connect_with_dialog(connect_fut, ws_url).await?;
 
-                    connect_fut
-                        .await
-                        .map_err(|e| CdpError::ConnectionFailed {
-                            detail: format!("task join: {e}"),
-                        })?
-                        .map_err(|e| CdpError::ConnectionFailed {
-                            detail: format!("WebSocket connect to {ws_url} failed: {e}"),
-                        })?
-                }
-            };
-
-            let (write_tx, write_rx) = mpsc::unbounded_channel::<InternalMessage>();
-            let (events_tx, _) = broadcast::channel::<CdpEvent>(256);
+            // Bounded channel limits in-flight commands and provides backpressure.
+            let (write_tx, write_rx) = mpsc::channel::<InternalMessage>(CHANNEL_CAPACITY);
+            let (events_tx, _) = broadcast::channel::<CdpEvent>(CHANNEL_CAPACITY);
             let pending: PendingMap = HashMap::new();
 
             let (ws_writer, ws_reader) = ws_stream.split();
             let events_clone = events_tx.clone();
 
             let handle = tokio::spawn(async move {
-                Self::run(write_rx, ws_writer, ws_reader, pending, events_clone).await;
+                RunState {
+                    write_rx,
+                    ws_writer,
+                    ws_reader,
+                    pending,
+                    events: events_clone,
+                }
+                .run()
+                .await;
             });
 
             Ok(Connection {
@@ -159,100 +260,56 @@ impl Connection {
         })?
     }
 
-    /// Background I/O loop: processes outgoing commands and incoming WebSocket messages.
-    async fn run(
-        mut write_rx: mpsc::UnboundedReceiver<InternalMessage>,
-        mut ws_writer: futures_util::stream::SplitSink<
-            WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-            Message,
+    /// Try a fast WebSocket connect with a short 3-second timeout. If it fails,
+    /// the macOS "Allow remote debugging?" dialog may be blocking — dismiss it
+    /// and retry the original (still in-flight) connection.
+    #[allow(clippy::type_complexity)]
+    async fn connect_with_dialog(
+        mut connect_fut: tokio::task::JoinHandle<
+            std::result::Result<
+                (
+                    WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+                    impl std::fmt::Debug,
+                ),
+                CdpError,
+            >,
         >,
-        mut ws_reader: futures_util::stream::SplitStream<
-            WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-        >,
-        mut pending: PendingMap,
-        events: broadcast::Sender<CdpEvent>,
-    ) {
-        loop {
-            tokio::select! {
-                // Outgoing CDP commands from Connection::call
-                msg = write_rx.recv() => {
-                    match msg {
-                        Some(InternalMessage::Call { id, method, params, session_id, tx }) => {
-                            let cmd = if let Some(ref sid) = session_id {
-                                serde_json::json!({
-                                    "id": id,
-                                    "method": method,
-                                    "params": params,
-                                    "sessionId": sid,
-                                })
-                            } else {
-                                serde_json::json!({
-                                    "id": id,
-                                    "method": method,
-                                    "params": params,
-                                })
-                            };
-                            let text = match serde_json::to_string(&cmd) {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    tracing::warn!("Failed to serialize CDP command: {e}");
-                                    let _ = tx.send(Err(CdpError::Json(e)));
-                                    continue;
-                                }
-                            };
-                            // Store pending before sending to avoid race
-                            pending.insert(id, PendingCall { method, tx });
-                            if let Err(e) = ws_writer.send(Message::Text(text)).await {
-                                tracing::warn!("WS send error: {e}");
-                                if let Some(pc) = pending.remove(&id) {
-                                    let _ = pc.tx.send(Err(CdpError::ConnectionFailed {
-                                        detail: format!("WebSocket send failed: {e}"),
-                                    }));
-                                }
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                // Incoming WebSocket messages
-                msg = ws_reader.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                Self::dispatch_message(value, &mut pending, &events).await;
-                            }
-                        }
-                        Some(Ok(Message::Close(frame))) => {
-                            tracing::debug!("CDP WebSocket closed: {frame:?}");
-                            break;
-                        }
-                        Some(Ok(Message::Binary(_))) => {
-                            // Binary frames not expected from CDP
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!("CDP WebSocket read error: {e}");
-                            break;
-                        }
-                        None => {
-                            tracing::debug!("CDP WebSocket stream ended");
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
+        ws_url: &str,
+    ) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
+        // Try the WebSocket first with a short timeout. If it connects
+        // quickly, no dialog is blocking the handshake and we skip the
+        // expensive osascript call entirely — saving ~1.6s per connection.
+        match tokio::time::timeout(Duration::from_secs(3), &mut connect_fut).await {
+            Ok(Ok(Ok(pair))) => {
+                // Fast path — connected without osascript
+                Ok(pair.0)
             }
-        }
+            _ => {
+                // First attempt failed or timed out; the browser debugging
+                // dialog may be blocking the WebSocket handshake. Dismiss
+                // it, then retry the original connection (still in flight).
+                #[cfg(target_os = "macos")]
+                {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    dismiss_allow_debugging_dialog().await;
+                }
 
-        // Clean up all pending calls when the loop exits
-        for (_, pc) in pending.drain() {
-            let _ = pc.tx.send(Err(CdpError::ConnectionFailed {
-                detail: "WebSocket connection closed".into(),
-            }));
+                let (ws_stream, _) = connect_fut
+                    .await
+                    .map_err(|e| CdpError::ConnectionFailed {
+                        detail: format!("task join: {e}"),
+                    })?
+                    .map_err(|e| CdpError::ConnectionFailed {
+                        detail: format!("WebSocket connect to {ws_url} failed: {e}"),
+                    })?;
+                Ok(ws_stream)
+            }
         }
     }
 
     /// Route an incoming JSON message: either a response (has "id") or an event (has "method").
+    /// Response routing (has "id") dispatches to the pending oneshot sender;
+    /// event dispatch (has "method") broadcasts via the event channel.
     async fn dispatch_message(
         value: Value,
         pending: &mut PendingMap,
@@ -291,94 +348,127 @@ impl Connection {
         }
     }
 
-    /// Send a CDP command and wait for the response.
+    /// Send a CDP command and wait for the response, with retry on
+    /// ConnectionFailed errors using exponential backoff.
     ///
     /// If `session_id` is `Some`, the command is sent as a Target-scoped message;
     /// if `None`, it is sent as a Browser-level message.
-    /// Send a CDP command and wait for the response, with retry on
-    /// ConnectionFailed errors using exponential backoff.
     pub async fn call(
         &self,
         method: &str,
         params: Value,
         session_id: Option<&str>,
     ) -> Result<Value> {
+        // Hoist allocations out of the retry loop — method and session_id are
+        // the same across attempts. params.clone() is still needed inside the
+        // loop because `Value` is moved into `InternalMessage::Call`; we must
+        // retain the original to reconstruct the message on each retry.
+        let method_owned = method.to_string();
+        let session_id_owned = session_id.map(String::from);
+
         for attempt in 0..=MAX_CALL_RETRIES {
             let id = NEXT_CDP_ID.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             let msg = InternalMessage::Call {
                 id,
-                method: method.to_string(),
+                method: method_owned.clone(),
+                // params is cloned each retry because the original `Value` is
+                // consumed by the first `InternalMessage` that is moved into
+                // the channel.  We keep the original for subsequent attempts.
                 params: params.clone(),
-                session_id: session_id.map(String::from),
+                session_id: session_id_owned.clone(),
                 tx,
             };
             match self.try_send(msg).await {
                 Ok(()) => match self.await_response(rx, method).await {
                     Ok(v) => return Ok(v),
                     Err(CdpError::ConnectionFailed { .. }) => {
-                        if attempt < MAX_CALL_RETRIES {
-                            let delay = CALL_RETRY_BASE_DELAY_MS * 2_u64.pow(attempt);
-                            tracing::warn!(
-                                "CDP call {} failed (ConnectionFailed), retry {} in {}ms",
-                                method,
-                                attempt + 1,
-                                delay
-                            );
-                            tokio::time::sleep(Duration::from_millis(delay)).await;
-                            if let Err(e) = self.reconnect().await {
-                                tracing::warn!("Reconnect attempt {} failed: {e}", attempt + 1);
-                            }
-                            continue;
-                        }
-                        return Err(CdpError::CdpCallFailed {
-                            method: method.to_string(),
-                            detail: format!(
-                                "connection dropped after {} retries",
-                                MAX_CALL_RETRIES
-                            ),
-                        });
+                        self.retry_or_fail(
+                            method,
+                            attempt,
+                            CdpError::CdpCallFailed {
+                                method: method_owned.clone(),
+                                detail: format!(
+                                    "connection dropped after {} retries",
+                                    MAX_CALL_RETRIES
+                                ),
+                            },
+                        )
+                        .await?;
+                        continue;
                     }
                     Err(e) => return Err(e),
                 },
                 Err(CdpError::ConnectionFailed { .. }) => {
-                    if attempt < MAX_CALL_RETRIES {
-                        let delay = CALL_RETRY_BASE_DELAY_MS * 2_u64.pow(attempt);
-                        tracing::warn!(
-                            "CDP call {} failed (ConnectionFailed), retry {} in {}ms",
-                            method,
-                            attempt + 1,
-                            delay
-                        );
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                        if let Err(e) = self.reconnect().await {
-                            tracing::warn!("Reconnect attempt {} failed: {e}", attempt + 1);
-                        }
-                        continue;
-                    }
-                    return Err(CdpError::ConnectionFailed {
-                        detail: format!(
-                            "call failed after {} retries: I/O loop terminated",
-                            MAX_CALL_RETRIES
-                        ),
-                    });
+                    self.retry_or_fail(
+                        method,
+                        attempt,
+                        CdpError::ConnectionFailed {
+                            detail: format!(
+                                "call failed after {} retries: I/O loop terminated",
+                                MAX_CALL_RETRIES
+                            ),
+                        },
+                    )
+                    .await?;
+                    continue;
                 }
                 Err(e) => return Err(e),
             }
         }
 
         Err(CdpError::CdpCallFailed {
-            method: method.to_string(),
+            method: method_owned,
             detail: "all retry attempts exhausted".into(),
         })
     }
 
+    /// Shared retry logic for `ConnectionFailed` errors: exponential backoff
+    /// sleep followed by reconnection. Returns `true` if the caller should
+    /// `continue` the retry loop, or `false` if retries are exhausted.
+    async fn handle_connection_failed(&self, method: &str, attempt: u32) -> bool {
+        if attempt < MAX_CALL_RETRIES {
+            let delay = CALL_RETRY_BASE_DELAY_MS * 2_u64.pow(attempt);
+            tracing::warn!(
+                "CDP call {} failed (ConnectionFailed), retry {} in {}ms",
+                method,
+                attempt + 1,
+                delay
+            );
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            if let Err(e) = self.reconnect().await {
+                tracing::warn!("Reconnect attempt {} failed: {e}", attempt + 1);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// If retries remain, sleep+reconnect and return `Ok(())` so the caller can
+    /// `continue`. Otherwise return `Err(fatal_err)` to terminate the call.
+    async fn retry_or_fail(&self, method: &str, attempt: u32, fatal_err: CdpError) -> Result<()> {
+        if self.handle_connection_failed(method, attempt).await {
+            Ok(())
+        } else {
+            Err(fatal_err)
+        }
+    }
+
     /// Send a CDP command and wait for its response (single attempt, no reconnect).
+    ///
+    /// Uses the bounded channel's async `send()` which waits for capacity,
+    /// providing natural backpressure. If the receiver (background I/O task)
+    /// has dropped (i.e., the WebSocket disconnected), returns
+    /// `CdpError::ConnectionFailed`.
     async fn try_send(&self, msg: InternalMessage) -> Result<()> {
-        let inner = self.inner.lock().expect("connection inner lock poisoned");
-        inner
-            .write
+        // Clone the sender while holding the lock, then drop the guard before
+        // awaiting — `MutexGuard` is not `Send` and would violate the future's
+        // `Send` bound.
+        let sender = { self.lock_inner().write.clone() };
+        sender
             .send(msg)
+            .await
             .map_err(|_| CdpError::ConnectionFailed {
                 detail: "background I/O task has terminated".into(),
             })
@@ -390,16 +480,18 @@ impl Connection {
         rx: oneshot::Receiver<Result<Value>>,
         method: &str,
     ) -> Result<Value> {
-        tokio::time::timeout(self.timeout, rx)
-            .await
-            .map_err(|_| CdpError::CdpCallFailed {
-                method: method.to_string(),
-                detail: format!("timeout waiting for response ({}s)", self.timeout.as_secs()),
-            })? // Result<Result<Value, CdpError>, RecvError>
-            .map_err(|_| CdpError::CdpCallFailed {
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(Ok(val))) => Ok(val),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => Err(CdpError::CdpCallFailed {
                 method: method.to_string(),
                 detail: "oneshot channel closed".into(),
-            })? // -> Result<Value, CdpError>
+            }),
+            Err(_) => Err(CdpError::CdpCallFailed {
+                method: method.to_string(),
+                detail: format!("timeout waiting for response ({}s)", self.timeout.as_secs()),
+            }),
+        }
     }
 
     /// Re-detect the browser WebSocket endpoint and establish a new CDP
@@ -415,23 +507,32 @@ impl Connection {
         let (ws_stream, _) = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url))
             .await
             .map_err(|_| CdpError::ConnectionFailed {
-                detail: "WebSocket connection timed out after 10s".into(),
+                detail: WS_CONNECT_TIMEOUT_MSG.into(),
             })?
             .map_err(|e| CdpError::ConnectionFailed {
                 detail: format!("WebSocket reconnect failed: {e}"),
             })?;
 
-        let (write_tx, write_rx) = mpsc::unbounded_channel::<InternalMessage>();
+        // Bounded channel — same capacity as the initial connection.
+        let (write_tx, write_rx) = mpsc::channel::<InternalMessage>(CHANNEL_CAPACITY);
         let pending: PendingMap = HashMap::new();
         let (ws_writer, ws_reader) = ws_stream.split();
         let events = self.events.clone();
 
         let handle = tokio::spawn(async move {
-            Self::run(write_rx, ws_writer, ws_reader, pending, events).await;
+            RunState {
+                write_rx,
+                ws_writer,
+                ws_reader,
+                pending,
+                events,
+            }
+            .run()
+            .await;
         });
 
         // Atomically replace the inner state (write channel + handle).
-        let mut inner = self.inner.lock().expect("connection inner lock poisoned");
+        let mut inner = self.lock_inner();
         inner.write = write_tx;
         inner.handle = handle;
 
@@ -469,34 +570,17 @@ impl Connection {
 
     /// (crate-internal) Clone the write channel for fire-and-forget CDP commands
     /// from spawned background tasks.
-    pub(crate) fn write_tx(&self) -> mpsc::UnboundedSender<InternalMessage> {
-        self.inner
-            .lock()
-            .expect("connection inner lock poisoned")
-            .write
-            .clone()
+    pub(crate) fn write_tx(&self) -> mpsc::Sender<InternalMessage> {
+        self.lock_inner().write.clone()
     }
 
-    /// Disconnect cleanly. Closes the command channel and waits for the
-    /// background I/O task to finish.
+    /// Disconnect cleanly. Signals the background I/O loop to exit
+    /// by closing the command channel. The Drop impl will abort the
+    /// I/O task if it is still running.
     pub async fn close(self) {
-        // We own self, so try_unwrap should succeed (Connection is not Clone).
-        match Arc::try_unwrap(self.inner.clone()) {
-            Ok(mutex) => {
-                let inner = mutex.into_inner().unwrap_or_else(|e| {
-                    tracing::warn!("Mutex poisoned in close: {e}");
-                    e.into_inner()
-                });
-                drop(inner.write); // Signals the background loop to exit
-                let _ = inner.handle.await;
-            }
-            Err(arc) => {
-                // Fallback: clone the write sender and drop the clone to
-                // signal the run loop. This should never be reached.
-                let guard = arc.lock().expect("connection inner lock poisoned");
-                drop(guard.write.clone());
-            }
-        }
+        // Clone the sender and drop the clone to signal the run loop.
+        let write = self.lock_inner().write.clone();
+        drop(write);
     }
 }
 
@@ -506,8 +590,7 @@ impl Drop for Connection {
         // outliving the connection and holding stale resources.
         // The WebSocket will be dropped as part of the task's
         // local variables, which sends a close frame to the browser.
-        let inner = self.inner.lock().expect("connection inner lock poisoned");
-        inner.handle.abort();
+        self.lock_inner().handle.abort();
     }
 }
 
@@ -521,8 +604,12 @@ fn parse_port_from_ws_url(ws_url: &str) -> Option<u16> {
 
 /// Send a CDP command without waiting for the response (fire-and-forget).
 /// Used by background tasks that don't need the result.
+///
+/// Uses `try_send` (non-blocking) so the caller is never suspended.
+/// If the channel is full (backpressure), the message is dropped and
+/// a warning is logged rather than blocking the background task.
 pub(crate) fn call_async(
-    write: &mpsc::UnboundedSender<InternalMessage>,
+    write: &mpsc::Sender<InternalMessage>,
     method: &str,
     params: Value,
     session_id: Option<String>,
@@ -536,7 +623,16 @@ pub(crate) fn call_async(
         session_id,
         tx,
     };
-    let _ = write.send(msg);
+    if let Err(e) = write.try_send(msg) {
+        match e {
+            mpsc::error::TrySendError::Full(_) => {
+                tracing::warn!("CDP command channel full, dropping {method}");
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                tracing::warn!("CDP command channel closed, dropping {method}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -559,7 +655,7 @@ mod tests {
                 tx,
             },
         );
-        let (event_tx, _) = broadcast::channel::<CdpEvent>(256);
+        let (event_tx, _) = broadcast::channel::<CdpEvent>(CHANNEL_CAPACITY);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(Connection::dispatch_message(
@@ -588,7 +684,7 @@ mod tests {
                 tx,
             },
         );
-        let (event_tx, _) = broadcast::channel::<CdpEvent>(256);
+        let (event_tx, _) = broadcast::channel::<CdpEvent>(CHANNEL_CAPACITY);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(Connection::dispatch_message(
@@ -605,7 +701,7 @@ mod tests {
     #[test]
     fn test_dispatch_message_unknown_id_ignored() {
         let mut pending: PendingMap = HashMap::new();
-        let (event_tx, _) = broadcast::channel::<CdpEvent>(256);
+        let (event_tx, _) = broadcast::channel::<CdpEvent>(CHANNEL_CAPACITY);
 
         // A response with an id not in pending should be silently ignored
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -621,7 +717,7 @@ mod tests {
     #[test]
     fn test_dispatch_message_broadcasts_event_with_session_id() {
         let mut pending: PendingMap = HashMap::new();
-        let (event_tx, mut event_rx) = broadcast::channel::<CdpEvent>(256);
+        let (event_tx, mut event_rx) = broadcast::channel::<CdpEvent>(CHANNEL_CAPACITY);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(Connection::dispatch_message(
@@ -643,7 +739,7 @@ mod tests {
     #[test]
     fn test_dispatch_message_unrecognized_message_is_noop() {
         let mut pending: PendingMap = HashMap::new();
-        let (event_tx, mut event_rx) = broadcast::channel::<CdpEvent>(256);
+        let (event_tx, mut event_rx) = broadcast::channel::<CdpEvent>(CHANNEL_CAPACITY);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(Connection::dispatch_message(
@@ -670,30 +766,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let ws_url = format!("ws://{}/devtools/browser/test", addr);
 
-        // Server handle so we can kill it cleanly.
-        let server_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-        let server_handle_clone = server_handle.clone();
-
-        let server_task = tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
-                    let (mut writer, mut reader) = ws_stream.split();
-                    while let Some(Ok(msg)) = reader.next().await {
-                        if let Message::Text(text) = msg {
-                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
-                                    let resp = json!({"id": id, "result": {"ok": true}});
-                                    let _ = writer.send(Message::Text(resp.to_string())).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        *server_handle_clone
-            .lock()
-            .expect("connection inner lock poisoned") = Some(server_task);
+        let server = spawn_echo_server(listener).await;
 
         // Small delay to ensure the server is listening.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -709,17 +782,8 @@ mod tests {
 
         // Kill the echo server — the TCP connection drops, the run loop
         // detects the WS error and exits.
-        let handle = server_handle
-            .lock()
-            .expect("connection inner lock poisoned")
-            .take();
-        if let Some(h) = handle {
-            h.abort(); // aborts the server task
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Wait for the run loop to detect the disconnect and clean up.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        server.abort();
+        tokio::time::sleep(Duration::from_millis(400)).await;
 
         // The next call should see a dead write channel → ConnectionFailed.
         let result = conn.call("Test.echo", json!({"msg": "world"}), None).await;
@@ -729,28 +793,8 @@ mod tests {
         );
 
         // Start a *new* server on the same address.
-        // Uses an accept loop so multiple connections (detect-cascade probes
-        // followed by the actual WS reconnect) are all handled.
         let listener2 = tokio::net::TcpListener::bind(addr).await.unwrap();
-        let server_task2 = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener2.accept().await {
-                tokio::spawn(async move {
-                    if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
-                        let (mut writer, mut reader) = ws_stream.split();
-                        while let Some(Ok(msg)) = reader.next().await {
-                            if let Message::Text(text) = msg {
-                                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                    if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
-                                        let resp = json!({"id": id, "result": {"ok": true}});
-                                        let _ = writer.send(Message::Text(resp.to_string())).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
+        let server2 = spawn_echo_server(listener2).await;
 
         // Give the new server time to start.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -772,30 +816,32 @@ mod tests {
         );
 
         // Clean up.
-        server_task2.abort();
+        server2.abort();
     }
 
-    /// Spawn a CDP echo server that accepts multiple connections.
-    /// Each connection handles CDP commands and responds with
-    /// `{"id": <id>, "result": {"ok": true}}`.
+    /// Spawn a CDP echo server that accepts connections.
+    /// Handles **one connection at a time** inline (no per-connection spawn).
+    /// When the returned handle is aborted, the currently in-flight connection
+    /// is dropped immediately — this is how the reconnection tests simulate a
+    /// clean WebSocket disconnect.
     async fn spawn_echo_server(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
-                        let (mut writer, mut reader) = ws_stream.split();
-                        while let Some(Ok(msg)) = reader.next().await {
-                            if let Message::Text(text) = msg {
-                                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                    if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
-                                        let resp = json!({"id": id, "result": {"ok": true}});
-                                        let _ = writer.send(Message::Text(resp.to_string())).await;
-                                    }
+                // NOTE: intentionally *not* spawning the handler so that
+                // aborting this task drops the active WS connection.
+                if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
+                    let (mut writer, mut reader) = ws_stream.split();
+                    while let Some(Ok(msg)) = reader.next().await {
+                        if let Message::Text(text) = msg {
+                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
+                                    let resp = json!({"id": id, "result": {"ok": true}});
+                                    let _ = writer.send(Message::Text(resp.to_string())).await;
                                 }
                             }
                         }
                     }
-                });
+                }
             }
         })
     }
@@ -849,23 +895,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let ws_url = format!("ws://{}/devtools/browser/test", addr);
 
-        let server = tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
-                    let (mut writer, mut reader) = ws_stream.split();
-                    while let Some(Ok(msg)) = reader.next().await {
-                        if let Message::Text(text) = msg {
-                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
-                                    let resp = json!({"id": id, "result": {"ok": true}});
-                                    let _ = writer.send(Message::Text(resp.to_string())).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        let server = spawn_echo_server(listener).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -908,23 +938,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let ws_url = format!("ws://{}/devtools/browser/test", addr);
 
-        let server = tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
-                    let (mut writer, mut reader) = ws_stream.split();
-                    while let Some(Ok(msg)) = reader.next().await {
-                        if let Message::Text(text) = msg {
-                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                if let Some(id) = value.get("id").and_then(|v| v.as_u64()) {
-                                    let resp = json!({"id": id, "result": {"ok": true}});
-                                    let _ = writer.send(Message::Text(resp.to_string())).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        let server = spawn_echo_server(listener).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 

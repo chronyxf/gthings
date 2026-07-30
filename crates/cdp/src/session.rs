@@ -9,6 +9,9 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+/// Default timeout for navigation-related operations (25 seconds).
+const DEFAULT_NAV_TIMEOUT: Duration = Duration::from_secs(25);
+
 /// High-level CDP session. Manages connection + tabs with event-driven lifecycle.
 pub struct Session {
     conn: Connection,
@@ -32,6 +35,32 @@ impl Drop for Session {
     }
 }
 
+/// Shared wait loop body: receives events from the broadcast channel,
+/// filters by method + predicate, and returns the matching event or an error.
+async fn wait_impl(
+    rx: &mut broadcast::Receiver<CdpEvent>,
+    method: &str,
+    predicate: impl Fn(&CdpEvent) -> bool + Send,
+) -> Result<CdpEvent> {
+    loop {
+        match rx.recv().await {
+            Ok(event) if event.method.as_str() == method && predicate(&event) => {
+                return Ok(event);
+            }
+            Ok(_) => continue,
+            Err(broadcast::error::RecvError::Closed) => {
+                return Err(CdpError::ConnectionFailed {
+                    detail: "event channel closed while waiting".into(),
+                });
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("Event receiver lagged by {n} messages");
+                continue;
+            }
+        }
+    }
+}
+
 /// Wait for a specific CDP event on a pre-subscribed receiver.
 /// Subscribe BEFORE the triggering action to avoid missing the event.
 async fn wait_for_event(
@@ -39,31 +68,14 @@ async fn wait_for_event(
     method: &str,
     predicate: impl Fn(&CdpEvent) -> bool + Send,
     timeout: Duration,
+    url: &str,
 ) -> Result<CdpEvent> {
-    tokio::time::timeout(timeout, async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) if event.method.as_str() == method && predicate(&event) => {
-                    return Ok(event);
-                }
-                Ok(_) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
-                    return Err(CdpError::ConnectionFailed {
-                        detail: "event channel closed while waiting".into(),
-                    });
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("Event receiver lagged by {n} messages");
-                    continue;
-                }
-            }
-        }
-    })
-    .await
-    .map_err(|_| CdpError::NavigationTimeout {
-        url: "unknown".into(),
-        timeout: timeout.as_secs(),
-    })?
+    tokio::time::timeout(timeout, wait_impl(rx, method, predicate))
+        .await
+        .map_err(|_| CdpError::NavigationTimeout {
+            url: url.to_string(),
+            timeout: timeout.as_secs(),
+        })?
 }
 
 impl Session {
@@ -130,8 +142,49 @@ impl Session {
         Tab::create_background(self).await
     }
 
+    /// Create an isolated background tab, optionally navigate, run the closure,
+    /// and close the tab in a finally-like pattern (tab is closed even on error
+    /// or timeout).
+    ///
+    /// Shared implementation for [`with_isolated_tab`] and [`run_in_tab`].
+    async fn with_background_tab_impl<F, T>(&self, url: Option<&str>, f: F) -> Result<T>
+    where
+        F: for<'a> FnOnce(
+            &'a Session,
+            &'a Tab,
+        ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
+    {
+        let tab = Tab::create_background(self).await?;
+        if let Some(url) = url {
+            tab.navigate(self, url).await?;
+        }
+        let result = tokio::time::timeout(DEFAULT_NAV_TIMEOUT, f(self, &tab)).await;
+        let result = match result {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(
+                    "background tab operation timed out after {}s, closing tab",
+                    DEFAULT_NAV_TIMEOUT.as_secs()
+                );
+                let _ = tab.close(self).await;
+                return Err(CdpError::CdpCallFailed {
+                    method: "background_tab".to_string(),
+                    detail: format!(
+                        "operation timed out after {}s",
+                        DEFAULT_NAV_TIMEOUT.as_secs()
+                    ),
+                });
+            }
+        };
+        // Close tab in finally-like pattern — report but swallow close errors
+        if let Err(e) = tab.close(self).await {
+            tracing::warn!("close background tab failed: {e}");
+        }
+        result
+    }
+
     /// Create an isolated background tab, run the closure, and close the tab
-    /// in a finally-like pattern (tab is closed even on error or timeout).
+    /// in a finally-like pattern.
     ///
     /// This is the primary isolation primitive: each operation gets its own
     /// background tab, preventing cross-process blocking.
@@ -157,24 +210,7 @@ impl Session {
             &'a Tab,
         ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
     {
-        let tab = Tab::create_background(self).await?;
-        let result = tokio::time::timeout(Duration::from_secs(25), f(self, &tab)).await;
-        let result = match result {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::warn!("with_isolated_tab: closure timed out after 60s, closing tab");
-                let _ = tab.close(self).await;
-                return Err(CdpError::CdpCallFailed {
-                    method: "with_isolated_tab".to_string(),
-                    detail: "operation timed out after 60s".into(),
-                });
-            }
-        };
-        // Close tab in finally-like pattern — report but swallow close errors
-        if let Err(e) = tab.close(self).await {
-            tracing::warn!("close isolated tab failed: {e}");
-        }
-        result
+        self.with_background_tab_impl(None, f).await
     }
 
     /// Create an isolated background tab, navigate to `url`, run the closure,
@@ -192,24 +228,7 @@ impl Session {
             &'a Tab,
         ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
     {
-        let tab = Tab::create_background(self).await?;
-        tab.navigate(self, url).await?;
-        let result = tokio::time::timeout(Duration::from_secs(25), f(self, &tab)).await;
-        let result = match result {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::warn!("run_in_tab: closure timed out after 60s, closing tab");
-                let _ = tab.close(self).await;
-                return Err(CdpError::CdpCallFailed {
-                    method: "run_in_tab".to_string(),
-                    detail: "operation timed out after 60s".into(),
-                });
-            }
-        };
-        if let Err(e) = tab.close(self).await {
-            tracing::warn!("close run_in_tab tab failed: {e}");
-        }
-        result
+        self.with_background_tab_impl(Some(url), f).await
     }
 
     /// Evaluate JavaScript in a tab, return JSON result
@@ -237,7 +256,7 @@ impl Session {
         let mut rx = conn.event_rx();
 
         // 2a. Set a real desktop Chrome User-Agent to avoid "HeadlessChrome" detection
-        let _ = conn
+        if let Err(e) = conn
             .call(
                 "Network.setUserAgentOverride",
                 serde_json::json!({
@@ -246,17 +265,18 @@ impl Session {
                 }),
                 sid,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "failed to set user agent override");
+        }
 
-        // 2b. Inject minimal stealth script that hides automation fingerprints (navigator.webdriver override)
-        // Complex JS (MimeType prototype manipulation, Chrome runtime construction, WebGL override) removed
-        // because those operations can throw errors in Chrome 150+ and block page navigation.
+        // 2b. Inject minimal stealth script that hides automation fingerprints (navigator.webdriver override).
         let stealth_js = r#"(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
         })()"#;
 
-        let _ = conn
+        if let Err(e) = conn
             .call(
                 "Page.addScriptToEvaluateOnNewDocument",
                 serde_json::json!({
@@ -264,7 +284,10 @@ impl Session {
                 }),
                 sid,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "failed to add stealth script");
+        }
 
         // Clone sid for the closure — session_id filtering prevents cross-tab event matches
         let sid_owned = tab.session_id.clone();
@@ -287,6 +310,7 @@ impl Session {
                 session_match && name_match
             },
             Duration::from_secs(10),
+            url,
         )
         .await;
 
@@ -369,31 +393,12 @@ impl Session {
         F: Fn(&CdpEvent) -> bool + Send + 'static,
     {
         let mut rx = self.conn.event_rx();
-
-        tokio::time::timeout(timeout, async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) if event.method.as_str() == method && predicate(&event) => {
-                        return Ok(event);
-                    }
-                    Ok(_) => continue,
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err(CdpError::ConnectionFailed {
-                            detail: "event channel closed while waiting".into(),
-                        });
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Event receiver lagged by {n} messages");
-                        continue;
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|_| CdpError::CdpCallFailed {
-            method: format!("wait_for({method})"),
-            detail: format!("timeout after {timeout:?}"),
-        })?
+        tokio::time::timeout(timeout, wait_impl(&mut rx, method, predicate))
+            .await
+            .map_err(|_| CdpError::CdpCallFailed {
+                method: format!("wait_for({method})"),
+                detail: format!("timeout after {timeout:?}"),
+            })?
     }
 
     /// Close a tab
@@ -505,25 +510,6 @@ mod tests {
     // ── Isolated tab API tests ────────────────────────────────────────────
 
     #[test]
-    fn test_isolated_tab_creation_api() {
-        // Verify that Tab meets required trait bounds so it works with
-        // with_isolated_tab and run_in_tab (Tab must be Send + Clone).
-        fn check_tab_bounds<T: Send + Clone + std::fmt::Debug>() {}
-        check_tab_bounds::<Tab>();
-
-        // Verify that with_isolated_tab / run_in_tab take the expected
-        // closure signature — constructs a dummy session to type-check.
-        fn check_method_bounds() {
-            // The closure FnOnce(&Session, &Tab) -> Future<Output=Result<T>>
-            // must work. We verify this by checking that a closure that
-            // takes &Session and &Tab can be formed.
-            fn _assert_closure(_f: &dyn Fn(&Session, &Tab)) {}
-            _assert_closure(&|_: &Session, _: &Tab| {});
-        }
-        check_method_bounds();
-    }
-
-    #[test]
     fn test_tab_cleanup_sequence() {
         // Verify that Tab::close constructs the correct CDP calls:
         // 1. Runtime.evaluate with window.close()
@@ -553,11 +539,11 @@ mod tests {
 
         // Verify that create_background uses background:true
         let bg_params = json!({
-            "url": "about:blank",
+            "url": crate::ABOUT_BLANK,
             "background": true,
         });
         assert_eq!(bg_params.get("background"), Some(&json!(true)));
-        assert_eq!(bg_params.get("url"), Some(&json!("about:blank")));
+        assert_eq!(bg_params.get("url"), Some(&json!(crate::ABOUT_BLANK)));
     }
 
     #[test]
@@ -566,7 +552,7 @@ mod tests {
         // `"background": true` so the browser creates the tab without stealing
         // window focus.  This is the core isolation primitive for background tabs.
         let params = json!({
-            "url": "about:blank",
+            "url": crate::ABOUT_BLANK,
             "background": true,
         });
 
@@ -577,7 +563,7 @@ mod tests {
         );
         assert_eq!(
             params.get("url"),
-            Some(&json!("about:blank")),
+            Some(&json!(crate::ABOUT_BLANK)),
             "url must be about:blank"
         );
 
@@ -593,78 +579,9 @@ mod tests {
     }
 
     #[test]
-    fn test_with_isolated_tab_creates_and_closes() {
-        // Verify that with_isolated_tab accepts a closure bound by the correct
-        // signature: FnOnce(&Session, &Tab) -> Future<Output=Result<T>>.
-        // The tab must be created, the closure executed, and the tab closed
-        // in a finally-like pattern (errors from close are logged but not
-        // propagated).
-        //
-        // We type-check this by verifying the function pointer signature.
-        // Use a concrete type (()) instead of a generic parameter to avoid
-        // E0401 (nested items can't use generic params from outer items).
-        fn _assert_isolated_tab_signature() {
-            fn _check<'a>(
-                _f: &dyn Fn(
-                    &'a Session,
-                    &'a Tab,
-                )
-                    -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>,
-            ) {
-            }
-            let _ = _check;
-        }
-        _assert_isolated_tab_signature();
-
-        // Verify that with_isolated_tab is a method on Session (structural check).
-        // This also confirms Tab is Send + Clone (required by the API).
-        fn _tab_is_send_clone() {
-            fn _check<T: Send + Clone>() {}
-            _check::<Tab>();
-        }
-        _tab_is_send_clone();
-    }
-
-    #[test]
-    fn test_run_in_tab_navigates_first() {
-        // Verify that run_in_tab creates a background tab, navigates to the URL,
-        // runs the closure, and closes the tab — in that order.
-        //
-        // We type-check the signature: run_in_tab takes (&self, &str, F) where
-        // F: FnOnce(&Session, &Tab) -> Future<Output=Result<T>>.  The URL is
-        // a separate argument so navigation MUST happen before the closure.
-        //
-        // This is a structural assertion: look at the run_in_tab body:
-        //   1. Tab::create_background(self).await?;
-        //   2. tab.navigate(self, url).await?;
-        //   3. f(self, &tab).await;
-        //   4. tab.close(self).await;
-        //
-        // Step 2 happens before step 3, guaranteeing navigation completes before
-        // the closure runs.  The URL parameter is a required argument, so the
-        // method cannot be called without providing a navigation target.
-        fn _check_run_in_tab_exists() {
-            // Verify the method accepts the right types by checking the method
-            // exists on Session.  This compiles iff run_in_tab has the correct
-            // signature.
-            //
-            // We use a type alias to verify the closure shape without needing
-            // to construct an actual lifecycle-conforming closure.
-            type RunInTabResult<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
-            fn _validate_signature() {
-                fn _url_not_empty(url: &str) {
-                    assert!(!url.is_empty());
-                }
-                _url_not_empty("https://example.com");
-                // Tab must be Send + Clone for the API to work
-                fn _bounds<T: Send + Clone>() {}
-                _bounds::<Tab>();
-                // The return future must be Send
-                fn _send_future<T: Send>(_fut: RunInTabResult<T>) {}
-                let _ = _send_future::<()>;
-            }
-            _validate_signature();
-        }
-        _check_run_in_tab_exists();
+    fn test_with_isolated_tab_compiles() {
+        // Minimal type-check: Tab must be Send + Clone for the API.
+        fn _bounds<T: Send + Clone>() {}
+        _bounds::<Tab>();
     }
 }

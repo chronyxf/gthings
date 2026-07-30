@@ -6,13 +6,13 @@
 //!
 //! # Functions
 //! - [`ax_tree`] — navigate to a URL, fetch the full AX tree, return compressed text
-//! - [`ax_query`] — query the AX tree by role/accessible name, return matching nodes
 //! - [`compress_ax_tree`] — compress raw `getFullAXTree` JSON into a compact text format
 //! - [`ax_diff`] — LCS-based structural diff of two compressed AX tree strings
 
 use crate::error::Result;
 use crate::session::Session;
 use serde_json::{Value, json};
+use similar::{Algorithm, ChangeTag, TextDiff};
 use std::collections::{HashMap, HashSet};
 
 /// Roles that are interactive/actionable — the agent can click, type, or focus these.
@@ -89,6 +89,27 @@ const DROP_ROLES: &[&str] = &[
 /// Leaf AX roles that wrap raw text — no semantic value, always dropped.
 const LEAF_ROLES: &[&str] = &["InlineTextBox", "LineBreak", "ListMarker"];
 
+/// Configuration for AX tree compression — bundles role sets and max_nodes limit.
+struct AxTreeConfig {
+    interactive: HashSet<&'static str>,
+    landmark: HashSet<&'static str>,
+    drop: HashSet<&'static str>,
+    leaf: HashSet<&'static str>,
+    max_nodes: usize,
+}
+
+impl AxTreeConfig {
+    fn new(max_nodes: Option<usize>) -> Self {
+        Self {
+            interactive: HashSet::from_iter(INTERACTIVE_ROLES.iter().copied()),
+            landmark: HashSet::from_iter(LANDMARK_ROLES.iter().copied()),
+            drop: HashSet::from_iter(DROP_ROLES.iter().copied()),
+            leaf: HashSet::from_iter(LEAF_ROLES.iter().copied()),
+            max_nodes: max_nodes.unwrap_or(500),
+        }
+    }
+}
+
 /// Result of compressing an AX tree, including truncation metadata.
 pub struct AxTreeResult {
     /// The compressed tree text (potentially truncated).
@@ -140,134 +161,94 @@ pub async fn ax_tree(
     Ok(compress_ax_tree(&result, max_nodes))
 }
 
-/// Query the AX tree by role and/or accessible name using `Accessibility.queryAXTree`.
-///
-/// The `selector` can be:
-/// - A role name, e.g. `"button"`
-/// - `role:name`, e.g. `"button:Submit"`
-/// - `role["name"]`, e.g. `r#"button["Submit"]"#`
-///
-/// Returns the raw CDP response `Value` containing matching nodes.
-pub async fn ax_query(session: &Session, selector: &str) -> Result<Value> {
-    let tab = session.create_background_tab().await?;
-    let sid = tab.session_id.as_deref();
+// ---------------------------------------------------------------------------
+// AxNode wrapper — bundles role/name/ignored/props queries into methods
+// ---------------------------------------------------------------------------
 
-    session
-        .connection()
-        .call("Accessibility.enable", json!({}), sid)
-        .await?;
-
-    let (role, name) = parse_selector(selector);
-
-    let mut params = json!({});
-    if let Some(r) = role {
-        params["role"] = json!(r);
-    }
-    if let Some(n) = name {
-        params["accessibleName"] = json!(n);
-    }
-
-    let result = session
-        .connection()
-        .call("Accessibility.queryAXTree", params, sid)
-        .await?;
-
-    let _ = session
-        .connection()
-        .call("Accessibility.disable", json!({}), sid)
-        .await;
-
-    session.close_tab(tab).await?;
-
-    Ok(result)
+/// A lightweight wrapper around a single AX node `&Value` that provides
+/// convenient accessors for common Chrome AX tree fields.
+struct AxNode<'a> {
+    node: &'a Value,
 }
 
-/// Parse a selector string into (role, name).
-///
-/// Supported formats:
-/// - `"button"` → (`Some("button")`, `None`)
-/// - `"button:Submit"` → (`Some("button")`, `Some("Submit")`)
-/// - `r#"button["Submit"]"#` → (`Some("button")`, `Some("Submit")`)
-fn parse_selector(selector: &str) -> (Option<&str>, Option<&str>) {
-    let trimmed = selector.trim();
-    if trimmed.is_empty() {
-        return (None, None);
+impl<'a> AxNode<'a> {
+    fn new(node: &'a Value) -> Self {
+        Self { node }
     }
 
-    // Try role["name"] format
-    if let Some(bracket_pos) = trimmed.find('[') {
-        let role_part = trimmed[..bracket_pos].trim();
-        let rest = &trimmed[bracket_pos + 1..];
-        if let Some(close_pos) = rest.find(']') {
-            let name_part = rest[..close_pos].trim();
-            let name = name_part
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .unwrap_or(name_part)
-                .trim();
-            let role = if role_part.is_empty() {
-                None
-            } else {
-                Some(role_part)
-            };
-            let name = if name.is_empty() { None } else { Some(name) };
-            return (role, name);
+    /// Extract role string from a node.
+    fn role(&self) -> &str {
+        self.node
+            .get("role")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| if self.ignored() { "IGNORED" } else { "NONE" })
+    }
+
+    /// Extract name from a node, normalizing whitespace (no intermediate Vec).
+    fn name(&self) -> String {
+        let text = self
+            .node
+            .get("name")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut result = String::with_capacity(text.len());
+        let mut first = true;
+        for word in text.split_whitespace() {
+            if !first {
+                result.push(' ');
+            }
+            result.push_str(word);
+            first = false;
+        }
+        result
+    }
+
+    /// Check if a node is ignored.
+    fn ignored(&self) -> bool {
+        self.node
+            .get("ignored")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Extract properties map from a node.
+    fn props(&self) -> HashMap<String, Value> {
+        let mut p = HashMap::new();
+        if let Some(properties) = self.node.get("properties").and_then(|v| v.as_array()) {
+            for prop in properties {
+                if let (Some(name), Some(val)) =
+                    (prop.get("name").and_then(|v| v.as_str()), prop.get("value"))
+                {
+                    if let Some(inner_val) = val.get("value") {
+                        p.insert(name.to_string(), inner_val.clone());
+                    }
+                }
+            }
+        }
+        p
+    }
+}
+
+/// Traverse all StaticText children recursively and call `f` on each.
+fn for_each_child_static_text<'a>(
+    node: &'a Value,
+    by_id: &HashMap<&'a str, &'a Value>,
+    f: &mut dyn FnMut(&'a Value),
+) {
+    if let Some(child_ids) = node.get("childIds").and_then(|v| v.as_array()) {
+        for cid in child_ids {
+            if let Some(cid_str) = cid.as_str() {
+                if let Some(child) = by_id.get(cid_str) {
+                    if AxNode::new(child).role() == "StaticText" {
+                        f(child);
+                    }
+                    for_each_child_static_text(child, by_id, f);
+                }
+            }
         }
     }
-
-    // Try role:name format
-    if let Some(colon_pos) = trimmed.find(':') {
-        let role_part = trimmed[..colon_pos].trim();
-        let name_part = trimmed[colon_pos + 1..].trim();
-        let role = if role_part.is_empty() {
-            None
-        } else {
-            Some(role_part)
-        };
-        let name = if name_part.is_empty() {
-            None
-        } else {
-            Some(name_part)
-        };
-        return (role, name);
-    }
-
-    // Just a role
-    (Some(trimmed), None)
-}
-
-// ---------------------------------------------------------------------------
-// Plain helper functions (no closures, easy lifetime handling)
-// ---------------------------------------------------------------------------
-
-/// Extract role string from a node.
-fn node_role(node: &Value) -> &str {
-    node.get("role")
-        .and_then(|r| r.get("value"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(if node_ignored(node) {
-            "IGNORED"
-        } else {
-            "NONE"
-        })
-}
-
-/// Extract name from a node.
-fn node_name(node: &Value) -> String {
-    node.get("name")
-        .and_then(|r| r.get("value"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Check if a node is ignored.
-fn node_ignored(node: &Value) -> bool {
-    node.get("ignored")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
 }
 
 /// Collect text from StaticText children recursively.
@@ -276,24 +257,15 @@ fn collect_text_children<'a>(
     by_id: &HashMap<&'a str, &'a Value>,
     parts: &mut Vec<String>,
 ) {
-    if let Some(child_ids) = node.get("childIds").and_then(|v| v.as_array()) {
-        for cid in child_ids {
-            if let Some(cid_str) = cid.as_str() {
-                if let Some(child) = by_id.get(cid_str) {
-                    if node_role(child) == "StaticText" {
-                        if let Some(name) = child
-                            .get("name")
-                            .and_then(|r| r.get("value"))
-                            .and_then(|v| v.as_str())
-                        {
-                            parts.push(name.to_string());
-                        }
-                    }
-                    collect_text_children(child, by_id, parts);
-                }
-            }
+    for_each_child_static_text(node, by_id, &mut |child| {
+        if let Some(name) = child
+            .get("name")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+        {
+            parts.push(name.to_string());
         }
-    }
+    });
 }
 
 /// Mark StaticText children for suppression.
@@ -302,38 +274,24 @@ fn suppress_static_text<'a>(
     by_id: &HashMap<&'a str, &'a Value>,
     suppress: &mut HashSet<&'a str>,
 ) {
-    if let Some(child_ids) = node.get("childIds").and_then(|v| v.as_array()) {
-        for cid in child_ids {
-            if let Some(cid_str) = cid.as_str() {
-                if let Some(child) = by_id.get(cid_str) {
-                    if node_role(child) == "StaticText" {
-                        if let Some(nid) = child.get("nodeId").and_then(|v| v.as_str()) {
-                            suppress.insert(nid);
-                        }
-                    }
-                    suppress_static_text(child, by_id, suppress);
-                }
-            }
+    for_each_child_static_text(node, by_id, &mut |child| {
+        if let Some(nid) = child.get("nodeId").and_then(|v| v.as_str()) {
+            suppress.insert(nid);
         }
-    }
+    });
 }
 
 /// Check if a node should be kept for its own sake (not just as ancestor).
-fn keep_self(
-    node: &Value,
-    interactive_set: &HashSet<&str>,
-    landmark_set: &HashSet<&str>,
-    drop_set: &HashSet<&str>,
-    leaf_set: &HashSet<&str>,
-) -> bool {
-    let r = node_role(node);
-    let nm = node_name(node);
+fn keep_self(node: &Value, config: &AxTreeConfig) -> bool {
+    let n = AxNode::new(node);
+    let r = n.role();
+    let nm = n.name();
 
-    if leaf_set.contains(r) {
+    if config.leaf.contains(r) {
         return false;
     }
     // Always keep interactive and landmark roles
-    if interactive_set.contains(r) || landmark_set.contains(r) {
+    if config.interactive.contains(r) || config.landmark.contains(r) {
         return true;
     }
     // Keep non-empty headings
@@ -345,7 +303,7 @@ fn keep_self(
         return true;
     }
     // Keep named nodes that aren't in the drop set
-    if !nm.is_empty() && !drop_set.contains(r) {
+    if !nm.is_empty() && !config.drop.contains(r) {
         return true;
     }
     false
@@ -357,33 +315,23 @@ fn post_traverse<'a>(
     node: &'a Value,
     by_id: &HashMap<&'a str, &'a Value>,
     survive: &mut HashSet<&'a str>,
-    interactive_set: &HashSet<&str>,
-    landmark_set: &HashSet<&str>,
-    drop_set: &HashSet<&str>,
-    leaf_set: &HashSet<&str>,
+    config: &AxTreeConfig,
 ) -> bool {
     if !node.is_object() {
         return false;
     }
-    let r = node_role(node);
-    if leaf_set.contains(r) {
+    let n = AxNode::new(node);
+    let r = n.role();
+    if config.leaf.contains(r) {
         return false;
     }
-    if node_ignored(node) {
+    if n.ignored() {
         let mut any_child = false;
         if let Some(child_ids) = node.get("childIds").and_then(|v| v.as_array()) {
             for cid in child_ids {
                 if let Some(cid_str) = cid.as_str() {
                     if let Some(child) = by_id.get(cid_str) {
-                        if post_traverse(
-                            child,
-                            by_id,
-                            survive,
-                            interactive_set,
-                            landmark_set,
-                            drop_set,
-                            leaf_set,
-                        ) {
+                        if post_traverse(child, by_id, survive, config) {
                             any_child = true;
                         }
                     }
@@ -393,22 +341,14 @@ fn post_traverse<'a>(
         return any_child;
     }
 
-    let mut keep = keep_self(node, interactive_set, landmark_set, drop_set, leaf_set);
+    let mut keep = keep_self(node, config);
     let mut children_survive = false;
 
     if let Some(child_ids) = node.get("childIds").and_then(|v| v.as_array()) {
         for cid in child_ids {
             if let Some(cid_str) = cid.as_str() {
                 if let Some(child) = by_id.get(cid_str) {
-                    if post_traverse(
-                        child,
-                        by_id,
-                        survive,
-                        interactive_set,
-                        landmark_set,
-                        drop_set,
-                        leaf_set,
-                    ) {
+                    if post_traverse(child, by_id, survive, config) {
                         children_survive = true;
                     }
                 }
@@ -427,116 +367,22 @@ fn post_traverse<'a>(
     keep
 }
 
-/// Extract properties map from a node.
-fn node_props(node: &Value) -> HashMap<String, Value> {
-    let mut p = HashMap::new();
-    if let Some(properties) = node.get("properties").and_then(|v| v.as_array()) {
-        for prop in properties {
-            if let (Some(name), Some(val)) =
-                (prop.get("name").and_then(|v| v.as_str()), prop.get("value"))
-            {
-                if let Some(inner_val) = val.get("value") {
-                    p.insert(name.to_string(), inner_val.clone());
-                }
-            }
-        }
-    }
-    p
+/// Mutable context for [`emit_tree`] — bundles all state that is threaded through
+/// the recursive traversal so the function signature is minimal.
+struct EmitContext<'a> {
+    out: Vec<String>,
+    ref_by_id: HashMap<&'a str, usize>,
+    ref_map: Vec<(usize, i64)>,
+    next_ref: usize,
+    by_id: &'a HashMap<&'a str, &'a Value>,
+    survive: &'a HashSet<&'a str>,
+    suppress: &'a HashSet<&'a str>,
+    config: &'a AxTreeConfig,
 }
 
-/// Recursively emit the compressed tree.
-#[allow(clippy::too_many_arguments)]
-fn emit_tree<'a>(
-    node: &'a Value,
-    depth: usize,
-    by_id: &HashMap<&'a str, &'a Value>,
-    survive: &HashSet<&'a str>,
-    suppress: &HashSet<&'a str>,
-    interactive_set: &HashSet<&str>,
-    landmark_set: &HashSet<&str>,
-    drop_set: &HashSet<&str>,
-    leaf_set: &HashSet<&str>,
-    out: &mut Vec<String>,
-    ref_by_id: &mut HashMap<&'a str, usize>,
-    ref_map: &mut Vec<(usize, i64)>,
-    next_ref: &mut usize,
-) {
-    if !node.is_object() {
-        return;
-    }
-    let nid = match node.get("nodeId").and_then(|v| v.as_str()) {
-        Some(id) => id,
-        None => return,
-    };
-    if suppress.contains(nid) {
-        return;
-    }
-
-    let r = node_role(node);
-    let nm = node_name(node);
-
-    // Handle ignored / dropped nodes by descending into children
-    if node_ignored(node)
-        || (drop_set.contains(r)
-            && r != "heading"
-            && !interactive_set.contains(r)
-            && !landmark_set.contains(r))
-    {
-        if let Some(child_ids) = node.get("childIds").and_then(|v| v.as_array()) {
-            for cid in child_ids {
-                if let Some(cid_str) = cid.as_str() {
-                    if let Some(child) = by_id.get(cid_str) {
-                        emit_tree(
-                            child,
-                            depth,
-                            by_id,
-                            survive,
-                            suppress,
-                            interactive_set,
-                            landmark_set,
-                            drop_set,
-                            leaf_set,
-                            out,
-                            ref_by_id,
-                            ref_map,
-                            next_ref,
-                        );
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    if !survive.contains(nid) || leaf_set.contains(r) {
-        return;
-    }
-
-    // Build ref for actionable/named nodes
-    let dom_id = node.get("backendDOMNodeId").and_then(|v| v.as_i64());
-    let has_ref = dom_id.is_some()
-        && (interactive_set.contains(r) || r == "heading" || (r != "StaticText" && !nm.is_empty()));
-
-    let ref_str = if has_ref {
-        let ref_num = if let Some(existing) = ref_by_id.get(nid) {
-            *existing
-        } else {
-            let n = *next_ref;
-            ref_by_id.insert(nid, n);
-            if let Some(bdom) = dom_id {
-                ref_map.push((n, bdom));
-            }
-            *next_ref += 1;
-            n
-        };
-        format!("[{}] ", ref_num)
-    } else {
-        String::new()
-    };
-
-    // Build flags string
-    let p = node_props(node);
-    let mut flags: Vec<&str> = Vec::new();
+/// Collect flags from a property map into a `Vec<&'static str>`.
+fn emit_flags_vec(p: &HashMap<String, Value>) -> Vec<&'static str> {
+    let mut flags: Vec<&'static str> = Vec::new();
     if p.get("focused").and_then(|v| v.as_bool()) == Some(true) {
         flags.push("focused");
     }
@@ -560,6 +406,104 @@ fn emit_tree<'a>(
     if p.get("pressed").and_then(|v| v.as_str()) == Some("true") {
         flags.push("pressed");
     }
+    flags
+}
+
+/// Build a `[N] ` reference string for an actionable/named node.
+fn emit_ref_str<'a>(
+    ctx: &mut EmitContext<'a>,
+    nid: &'a str,
+    dom_id: Option<i64>,
+    has_ref: bool,
+) -> String {
+    if !has_ref {
+        return String::new();
+    }
+    let ref_num = if let Some(existing) = ctx.ref_by_id.get(nid) {
+        *existing
+    } else {
+        let n = ctx.next_ref;
+        ctx.ref_by_id.insert(nid, n);
+        if let Some(bdom) = dom_id {
+            ctx.ref_map.push((n, bdom));
+        }
+        ctx.next_ref += 1;
+        n
+    };
+    format!("[{}] ", ref_num)
+}
+
+/// Build the `="value"` suffix for a property map, with truncation at 40 chars.
+#[allow(clippy::incompatible_msrv)]
+fn emit_value_part(p: &HashMap<String, Value>) -> String {
+    match p.get("value") {
+        Some(val) if let Some(s) = val.as_str() => {
+            if s.is_empty() {
+                String::new()
+            } else {
+                let end = s.floor_char_boundary(s.len().min(40));
+                format!(" =\"{}\"", &s[..end])
+            }
+        }
+        Some(val) if let Some(n) = val.as_f64() => {
+            format!(" =\"{}\"", n)
+        }
+        _ => String::new(),
+    }
+}
+
+/// Recursively emit the compressed tree.
+fn emit_tree<'a>(ctx: &mut EmitContext<'a>, node: &'a Value, depth: usize) {
+    if !node.is_object() {
+        return;
+    }
+    let nid = match node.get("nodeId").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return,
+    };
+    if ctx.suppress.contains(nid) {
+        return;
+    }
+
+    let ax = AxNode::new(node);
+    let r = ax.role();
+    let nm = ax.name();
+
+    // Handle ignored / dropped nodes by descending into children
+    if ax.ignored()
+        || (ctx.config.drop.contains(r)
+            && r != "heading"
+            && !ctx.config.interactive.contains(r)
+            && !ctx.config.landmark.contains(r))
+    {
+        if let Some(child_ids) = node.get("childIds").and_then(|v| v.as_array()) {
+            for cid in child_ids {
+                if let Some(cid_str) = cid.as_str() {
+                    if let Some(child) = ctx.by_id.get(cid_str) {
+                        emit_tree(ctx, child, depth);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if !ctx.survive.contains(nid) || ctx.config.leaf.contains(r) {
+        return;
+    }
+
+    // Build ref for actionable/named nodes
+    let dom_id = node.get("backendDOMNodeId").and_then(|v| v.as_i64());
+    let has_ref = dom_id.is_some()
+        && (ctx.config.interactive.contains(r)
+            || r == "heading"
+            || (r != "StaticText" && !nm.is_empty()));
+
+    let ref_str = emit_ref_str(ctx, nid, dom_id, has_ref);
+
+    // Build flags string
+    let p = ax.props();
+    let flags = emit_flags_vec(&p);
 
     let indent = "  ".repeat(depth);
     let name_part = if nm.is_empty() {
@@ -585,23 +529,9 @@ fn emit_tree<'a>(
     };
 
     // Add value
-    let value_part = if let Some(val) = p.get("value") {
-        if let Some(s) = val.as_str() {
-            if !s.is_empty() {
-                format!(" =\"{}\"", &s[..s.len().min(40)])
-            } else {
-                String::new()
-            }
-        } else if let Some(n) = val.as_f64() {
-            format!(" =\"{}\"", n)
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
+    let value_part = emit_value_part(&p);
 
-    out.push(format!(
+    ctx.out.push(format!(
         "{}{}{}{}{}{}{}",
         indent, ref_str, r, name_part, flags_part, level_part, value_part
     ));
@@ -610,22 +540,8 @@ fn emit_tree<'a>(
     if let Some(child_ids) = node.get("childIds").and_then(|v| v.as_array()) {
         for cid in child_ids {
             if let Some(cid_str) = cid.as_str() {
-                if let Some(child) = by_id.get(cid_str) {
-                    emit_tree(
-                        child,
-                        depth + 1,
-                        by_id,
-                        survive,
-                        suppress,
-                        interactive_set,
-                        landmark_set,
-                        drop_set,
-                        leaf_set,
-                        out,
-                        ref_by_id,
-                        ref_map,
-                        next_ref,
-                    );
+                if let Some(child) = ctx.by_id.get(cid_str) {
+                    emit_tree(ctx, child, depth + 1);
                 }
             }
         }
@@ -661,19 +577,91 @@ fn emit_tree<'a>(
 /// - `None` → default 500
 /// - `Some(0)` → unlimited
 /// - `Some(n)` → limit to n nodes
-pub fn compress_ax_tree(value: &Value, max_nodes: Option<usize>) -> AxTreeResult {
-    // Extract nodes — they can be at `result.nodes` (full tree) or `result` (direct array)
-    let nodes = value
+///
+/// Extract the nodes slice from a `getFullAXTree` result.
+fn extract_nodes_array(value: &Value) -> &[Value] {
+    value
         .get("result")
         .and_then(|r| r.get("nodes"))
         .or_else(|| value.get("nodes"))
-        .or_else(|| {
-            // Maybe it's already an array
-            if value.is_array() { Some(value) } else { None }
-        })
+        .or_else(|| if value.is_array() { Some(value) } else { None })
         .and_then(|v| v.as_array())
         .map(std::vec::Vec::as_slice)
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// Compute the set of suppressed node IDs by coalescing redundant text children.
+fn compute_text_suppression<'a>(
+    by_id: &HashMap<&'a str, &'a Value>,
+    survive: &HashSet<&'a str>,
+) -> HashSet<&'a str> {
+    let mut suppress: HashSet<&str> = HashSet::new();
+    for node in by_id.values() {
+        let nid = match node.get("nodeId").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+        if !survive.contains(nid) {
+            continue;
+        }
+        let ax_node = AxNode::new(node);
+        let r = ax_node.role();
+        if r == "StaticText" {
+            continue;
+        }
+        let nm = ax_node.name();
+        if nm.is_empty() {
+            continue;
+        }
+        let mut text_parts: Vec<String> = Vec::new();
+        collect_text_children(node, by_id, &mut text_parts);
+        let joined: String = text_parts.join(" ");
+        if joined.split_whitespace().eq(nm.split_whitespace()) {
+            suppress_static_text(node, by_id, &mut suppress);
+        }
+    }
+    suppress
+}
+
+/// Build the final output lines from the emitted context, including truncation
+/// and the refs map.
+fn build_final_output<'a>(
+    mut ctx: EmitContext<'a>,
+    config: &AxTreeConfig,
+) -> (Vec<String>, usize, bool) {
+    let total_nodes = ctx.out.len();
+    let truncated = config.max_nodes > 0 && total_nodes > config.max_nodes;
+
+    let mut final_lines: Vec<String> = if truncated {
+        let mut lines: Vec<String> = ctx.out.drain(..config.max_nodes).collect();
+        lines.push(String::new());
+        lines.push(format!(
+            "... truncated {} nodes (max {}) ...",
+            total_nodes - config.max_nodes,
+            config.max_nodes
+        ));
+        lines
+    } else {
+        ctx.out
+    };
+
+    if !ctx.ref_map.is_empty() {
+        final_lines.push(String::new());
+        final_lines.push("# refs -> backendDOMNodeId".to_string());
+        let refs_line = ctx
+            .ref_map
+            .iter()
+            .map(|(r, b)| format!("[{}]={}", r, b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        final_lines.push(refs_line);
+    }
+
+    (final_lines, total_nodes, truncated)
+}
+
+pub fn compress_ax_tree(value: &Value, max_nodes: Option<usize>) -> AxTreeResult {
+    let nodes = extract_nodes_array(value);
 
     if nodes.is_empty() {
         return AxTreeResult {
@@ -689,16 +677,13 @@ pub fn compress_ax_tree(value: &Value, max_nodes: Option<usize>) -> AxTreeResult
         .filter_map(|n| n.get("nodeId").and_then(|id| id.as_str()).map(|id| (id, n)))
         .collect();
 
-    let interactive_set: HashSet<&str> = HashSet::from_iter(INTERACTIVE_ROLES.iter().copied());
-    let landmark_set: HashSet<&str> = HashSet::from_iter(LANDMARK_ROLES.iter().copied());
-    let drop_set: HashSet<&str> = HashSet::from_iter(DROP_ROLES.iter().copied());
-    let leaf_set: HashSet<&str> = HashSet::from_iter(LEAF_ROLES.iter().copied());
+    let config = AxTreeConfig::new(max_nodes);
 
     // Find root — prefer RootWebArea, else first non-ignored
     let root = by_id
         .values()
-        .find(|n| node_role(n) == "RootWebArea")
-        .or_else(|| by_id.values().find(|n| !node_ignored(n)))
+        .find(|n| AxNode::new(n).role() == "RootWebArea")
+        .or_else(|| by_id.values().find(|n| !AxNode::new(n).ignored()))
         .copied();
 
     let root = match root {
@@ -714,95 +699,26 @@ pub fn compress_ax_tree(value: &Value, max_nodes: Option<usize>) -> AxTreeResult
 
     // Phase 1: determine surviving nodes via bottom-up traversal
     let mut survive: HashSet<&str> = HashSet::new();
+    post_traverse(root, &by_id, &mut survive, &config);
 
-    post_traverse(
-        root,
-        &by_id,
-        &mut survive,
-        &interactive_set,
-        &landmark_set,
-        &drop_set,
-        &leaf_set,
-    );
-
-    // Phase 1b: coalesce redundant text children — if a node's name matches the
-    // concatenated text of its StaticText children, suppress those children.
-    let mut suppress: HashSet<&str> = HashSet::new();
-    for node in by_id.values() {
-        let nid = match node.get("nodeId").and_then(|v| v.as_str()) {
-            Some(id) => id,
-            None => continue,
-        };
-        if !survive.contains(nid) {
-            continue;
-        }
-        let r = node_role(node);
-        if r == "StaticText" {
-            continue;
-        }
-        let nm = node_name(node);
-        if nm.is_empty() {
-            continue;
-        }
-        let mut text_parts: Vec<String> = Vec::new();
-        collect_text_children(node, &by_id, &mut text_parts);
-        let joined: String = text_parts.join(" ");
-        if joined.split_whitespace().eq(nm.split_whitespace()) {
-            suppress_static_text(node, &by_id, &mut suppress);
-        }
-    }
+    // Phase 1b: coalesce redundant text children
+    let suppress = compute_text_suppression(&by_id, &survive);
 
     // Phase 2: emit tree
-    let mut out: Vec<String> = Vec::new();
-    let mut ref_by_id: HashMap<&str, usize> = HashMap::new();
-    let mut ref_map: Vec<(usize, i64)> = Vec::new();
-    let mut next_ref: usize = 1;
-
-    emit_tree(
-        root,
-        0,
-        &by_id,
-        &survive,
-        &suppress,
-        &interactive_set,
-        &landmark_set,
-        &drop_set,
-        &leaf_set,
-        &mut out,
-        &mut ref_by_id,
-        &mut ref_map,
-        &mut next_ref,
-    );
-
-    let total_nodes = out.len();
-    let effective_max = max_nodes.unwrap_or(500);
-    let truncated = effective_max > 0 && total_nodes > effective_max;
-
-    // Build final output: truncated tree + refs map
-    let mut final_lines: Vec<String> = if truncated {
-        let mut lines: Vec<String> = out.drain(..effective_max).collect();
-        lines.push(String::new());
-        lines.push(format!(
-            "... truncated {} nodes (max {}) ...",
-            total_nodes - effective_max,
-            effective_max
-        ));
-        lines
-    } else {
-        out
+    let mut ctx = EmitContext {
+        out: Vec::new(),
+        ref_by_id: HashMap::new(),
+        ref_map: Vec::new(),
+        next_ref: 1,
+        by_id: &by_id,
+        survive: &survive,
+        suppress: &suppress,
+        config: &config,
     };
 
-    // Append refs map (always included, after any truncation message)
-    if !ref_map.is_empty() {
-        final_lines.push(String::new());
-        final_lines.push("# refs -> backendDOMNodeId".to_string());
-        let refs_line: String = ref_map
-            .iter()
-            .map(|(r, b)| format!("[{}]={}", r, b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        final_lines.push(refs_line);
-    }
+    emit_tree(&mut ctx, root, 0);
+
+    let (final_lines, total_nodes, truncated) = build_final_output(ctx, &config);
 
     AxTreeResult {
         tree: final_lines.join("\n"),
@@ -822,35 +738,36 @@ fn normalize_line(line: &str) -> String {
 /// Strip `[N]` reference patterns from a line.
 fn strip_ref_pattern(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let n = bytes.len();
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
     let mut i = 0;
     while i < n {
-        if bytes[i] == b'[' {
+        if chars[i] == '[' {
             // Try to find a closing ]
             let mut j = i + 1;
             let mut has_digits = false;
-            while j < n && bytes[j].is_ascii_digit() {
+            while j < n && chars[j].is_ascii_digit() {
                 has_digits = true;
                 j += 1;
             }
-            if has_digits && j < n && bytes[j] == b']' {
+            if has_digits && j < n && chars[j] == ']' {
                 // Consume the ref, then skip optional whitespace
                 let mut k = j + 1;
-                while k < n && bytes[k] == b' ' {
+                while k < n && chars[k] == ' ' {
                     k += 1;
                 }
                 i = k;
                 continue;
             }
         }
-        result.push(bytes[i] as char);
+        result.push(chars[i]);
         i += 1;
     }
     result
 }
 
-/// Compute the LCS-based structural diff of two compressed AX tree strings.
+/// Compute the structural diff of two compressed AX tree strings using Myers'
+/// algorithm (O(N) space via the `similar` crate).
 ///
 /// Refs are stripped before comparison (they renumber every snapshot).
 /// Lines present only in `prev` are prefixed with `-`, lines only in `next`
@@ -863,6 +780,7 @@ fn strip_ref_pattern(text: &str) -> String {
 /// + button "Log out"
 /// ```
 pub fn ax_diff(prev: &str, next: &str) -> String {
+    // Collect meaningful lines, stripping empty / ref-metadata lines.
     let lines = |s: &str| -> Vec<String> {
         s.split('\n')
             .map(|l| l.trim_end().to_string())
@@ -888,63 +806,39 @@ pub fn ax_diff(prev: &str, next: &str) -> String {
 
     let a = lines(prev);
     let b = lines(next);
-    let n = a.len();
-    let m = b.len();
 
-    // Compute LCS length table
-    let mut dp = vec![vec![0usize; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            let key_a = normalize_line(&a[i]);
-            let key_b = normalize_line(&b[j]);
-            dp[i][j] = if key_a == key_b {
-                dp[i + 1][j + 1] + 1
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
+    // Build comparison sequences with refs stripped
+    let norm_a: Vec<String> = a.iter().map(|l| normalize_line(l)).collect();
+    let norm_b: Vec<String> = b.iter().map(|l| normalize_line(l)).collect();
+    let norm_a_refs: Vec<&str> = norm_a.iter().map(|s| s.as_str()).collect();
+    let norm_b_refs: Vec<&str> = norm_b.iter().map(|s| s.as_str()).collect();
 
-    // Trace back to produce diff (strip refs from both comparison AND output)
+    // Myers diff (O(N) space)
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Myers)
+        .diff_slices(&norm_a_refs, &norm_b_refs);
+
     let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    let mut j = 0;
-    while i < n && j < m {
-        let key_a = normalize_line(&a[i]);
-        let key_b = normalize_line(&b[j]);
-        if key_a == key_b {
-            i += 1;
-            j += 1;
-        } else if i + 1 < n && dp[i + 1][j] >= dp[i][j + 1] {
-            let stripped = strip_ref_pattern(a[i].trim_start());
-            out.push(format!("- {}", stripped.trim()));
-            i += 1;
-        } else if j + 1 < m {
-            let stripped = strip_ref_pattern(b[j].trim_start());
-            out.push(format!("+ {}", stripped.trim()));
-            j += 1;
-        } else {
-            // edge: one of them is at the last element
-            if dp[i + 1][j] >= dp[i][j + 1] {
+    let mut i = 0; // index into `a`
+    let mut j = 0; // index into `b`
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                i += 1;
+                j += 1;
+            }
+            ChangeTag::Delete => {
                 let stripped = strip_ref_pattern(a[i].trim_start());
                 out.push(format!("- {}", stripped.trim()));
                 i += 1;
-            } else {
+            }
+            ChangeTag::Insert => {
                 let stripped = strip_ref_pattern(b[j].trim_start());
                 out.push(format!("+ {}", stripped.trim()));
                 j += 1;
             }
         }
-    }
-    while i < n {
-        let stripped = strip_ref_pattern(a[i].trim_start());
-        out.push(format!("- {}", stripped.trim()));
-        i += 1;
-    }
-    while j < m {
-        let stripped = strip_ref_pattern(b[j].trim_start());
-        out.push(format!("+ {}", stripped.trim()));
-        j += 1;
     }
 
     if out.is_empty() {
@@ -1083,34 +977,6 @@ mod tests {
             !compressed.tree.contains("InlineTextBox"),
             "should NOT mention InlineTextBox"
         );
-    }
-
-    #[test]
-    fn test_parse_selector_role_only() {
-        let (role, name) = parse_selector("button");
-        assert_eq!(role, Some("button"));
-        assert_eq!(name, None);
-    }
-
-    #[test]
-    fn test_parse_selector_role_name_colon() {
-        let (role, name) = parse_selector("button:Submit");
-        assert_eq!(role, Some("button"));
-        assert_eq!(name, Some("Submit"));
-    }
-
-    #[test]
-    fn test_parse_selector_role_name_bracket() {
-        let (role, name) = parse_selector(r#"button["Submit"]"#);
-        assert_eq!(role, Some("button"));
-        assert_eq!(name, Some("Submit"));
-    }
-
-    #[test]
-    fn test_parse_selector_empty() {
-        let (role, name) = parse_selector("");
-        assert_eq!(role, None);
-        assert_eq!(name, None);
     }
 
     #[test]
@@ -1285,29 +1151,6 @@ mod tests {
             compressed.tree.contains("Welcome"),
             "should contain heading name"
         );
-    }
-
-    // ── Explicitly-named tests for parse_selector ─────────────────────────
-
-    #[test]
-    fn test_ax_query_parses_role_only() {
-        let (role, name) = parse_selector("button");
-        assert_eq!(role, Some("button"));
-        assert_eq!(name, None);
-    }
-
-    #[test]
-    fn test_ax_query_parses_role_and_name() {
-        let (role, name) = parse_selector("button:Submit");
-        assert_eq!(role, Some("button"));
-        assert_eq!(name, Some("Submit"));
-    }
-
-    #[test]
-    fn test_ax_query_parses_role_with_bracket_name() {
-        let (role, name) = parse_selector(r#"button["Submit"]"#);
-        assert_eq!(role, Some("button"));
-        assert_eq!(name, Some("Submit"));
     }
 
     // ── Focused ax_diff tests ─────────────────────────────────────────────

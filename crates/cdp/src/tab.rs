@@ -4,6 +4,9 @@ use crate::session::Session;
 use serde_json::{Value, json};
 use std::time::Duration;
 
+/// Polling interval for tab close sequence between JS close and CDP close.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Represents a browser tab/page
 #[derive(Debug, Clone)]
 pub struct Tab {
@@ -92,7 +95,7 @@ impl Tab {
     ///
     /// Equivalent to `Tab::create(session, "about:blank", true)`.
     pub async fn create_background(session: &Session) -> Result<Self> {
-        Self::create(session, "about:blank", true).await
+        Self::create(session, crate::ABOUT_BLANK, true).await
     }
 
     /// Navigate to URL and wait for fully loaded. Delegates to Session::navigate.
@@ -151,7 +154,7 @@ impl Tab {
                     .and_then(|r| r.get("value"))
                     .and_then(|v| v.as_str())
                     .unwrap_or_else(|| {
-                        tracing::warn!("failed to extract title");
+                        tracing::warn!("failed to parse page title from evaluate result");
                         ""
                     });
                 Ok(title.to_string())
@@ -169,7 +172,7 @@ impl Tab {
         let sid = self.session_id.as_deref();
 
         // Best-effort: close via JS first (Dia needs this before CDP close)
-        let _ = conn
+        if let Err(e) = conn
             .call(
                 "Runtime.evaluate",
                 json!({
@@ -178,10 +181,13 @@ impl Tab {
                 }),
                 sid,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "window.close() failed");
+        }
 
         // Wait briefly for the JS close to take effect
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
 
         // Then close via CDP
         conn.call(

@@ -7,7 +7,7 @@ license.workspace = true
 description = "CLI binary for gthings — browser-automated web research toolkit"
 
 [dependencies]
-gthings-cdp = { path = "../cdp", version = "0.5.1" }
+gthings-cdp = { path = "../cdp", version = "0.5.4" }
 gthings-search = { path = "../search" , version = "0.7.1" }
 gthings-common = { path = "../common", version = "0.3.5" }
 clap = { workspace = true, features = ["derive"] }
