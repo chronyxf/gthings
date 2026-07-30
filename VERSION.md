@@ -79,7 +79,7 @@ Format (knope 0.23):
 
 ```
 ---
-"gthings-cdp": patch
+gthings-cdp: patch
 ---
 
 - fix: add session_id filter to lifecycle event predicate
