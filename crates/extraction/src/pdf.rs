@@ -21,11 +21,8 @@ use async_trait::async_trait;
 pub struct PdfMetadata {
     pub author: Option<String>,
     pub title: Option<String>,
-    pub subject: Option<String>,
     pub creator: Option<String>,
-    pub producer: Option<String>,
     pub creation_date: Option<String>,
-    pub mod_date: Option<String>,
 }
 
 /// PDF text extractor using `pdf-extract` (bundled MuPDF).
@@ -78,10 +75,14 @@ impl PdfExtractor {
         let effective_len = effective_text.len();
 
         let pagination =
-            gthings_common::pagination::build_pagination(params, url, total_len, effective_len);
+            gthings_common::pagination::build_pagination(params, url, total_len, effective_len)
+                .map_err(|e| ExtractionError::Parse(e.to_string()))?;
 
-        // Extract PDF metadata
-        let pdf_meta = extract_pdf_info_metadata(bytes).or_else(|| extract_pdf_xmp_metadata(bytes));
+        // Extract PDF metadata — try /Info dict first, fall back to XMP
+        let pdf_meta = extract_pdf_info_metadata(bytes)
+            .ok()
+            .flatten()
+            .or_else(|| extract_pdf_xmp_metadata(bytes).ok().flatten());
 
         let author = pdf_meta.as_ref().and_then(|m| m.author.clone());
         let published = pdf_meta.as_ref().and_then(|m| {
@@ -167,10 +168,9 @@ impl PdfExtractor {
     /// Count pages in PDF by counting `/Type /Page` entries (heuristic).
     fn count_pages(bytes: &[u8]) -> usize {
         let src = String::from_utf8_lossy(bytes);
-        Regex::new(r"/Type\s*/Page[^s]")
-            .ok()
-            .map(|re| re.find_iter(&src).count())
-            .unwrap_or(0)
+        let re = Regex::new(r"/Type\s*/Page[^s]")
+            .expect("valid static regex: /Type /Page pattern in PDF content");
+        re.find_iter(&src).count()
     }
 
     /// PDF text extraction via `pdf-extract` (bundled MuPDF).
@@ -259,37 +259,66 @@ impl Extractor for PdfExtractor {
 // ---------------------------------------------------------------------------
 
 /// Parse the PDF trailer to extract the /Info reference and /Root reference.
-/// Returns (info_obj_num, info_gen_num, root_obj_num) or None.
-fn parse_pdf_trailer(bytes: &[u8]) -> Option<(u32, u32, u32)> {
-    let content = std::str::from_utf8(bytes).ok()?;
+/// Returns `Ok(Some((info_obj_num, info_gen_num, root_obj_num)))` on success,
+/// `Ok(None)` when the trailer or required references are not found,
+/// or `Err(ExtractionError)` when the PDF bytes are not valid UTF-8.
+fn parse_pdf_trailer(bytes: &[u8]) -> Result<Option<(u32, u32, u32)>, ExtractionError> {
+    let content = std::str::from_utf8(bytes)
+        .map_err(|e| ExtractionError::Parse(format!("non-UTF8 PDF content: {e}")))?;
 
     // Find "trailer" keyword — search from the end for efficiency
-    let trailer_pos = content.rfind("trailer")?;
+    let trailer_pos = match content.rfind("trailer") {
+        Some(pos) => pos,
+        None => return Ok(None),
+    };
     let after_trailer = &content[trailer_pos..];
 
     // Find /Info reference pattern: /Info <obj> <gen> R
-    let info_re = Regex::new(r"/Info\s+(\d+)\s+(\d+)\s+R").ok()?;
+    let info_re = Regex::new(r"/Info\s+(\d+)\s+(\d+)\s+R")
+        .expect("valid static regex: /Info reference in PDF trailer");
     // Find /Root reference pattern: /Root <obj> <gen> R
-    let root_re = Regex::new(r"/Root\s+(\d+)\s+(\d+)\s+R").ok()?;
+    let root_re = Regex::new(r"/Root\s+(\d+)\s+(\d+)\s+R")
+        .expect("valid static regex: /Root reference in PDF trailer");
 
-    let info_caps = info_re.captures(after_trailer)?;
-    let root_caps = root_re.captures(after_trailer)?;
+    let info_caps = match info_re.captures(after_trailer) {
+        Some(caps) => caps,
+        None => return Ok(None),
+    };
+    let root_caps = match root_re.captures(after_trailer) {
+        Some(caps) => caps,
+        None => return Ok(None),
+    };
 
-    let info_num = info_caps[1].parse::<u32>().ok()?;
-    let info_gen = info_caps[2].parse::<u32>().ok()?;
-    let root_num = root_caps[1].parse::<u32>().ok()?;
+    let info_num = info_caps[1]
+        .parse::<u32>()
+        .map_err(|_| ExtractionError::Parse("PDF /Info object number is not a valid u32".into()))?;
+    let info_gen = info_caps[2].parse::<u32>().map_err(|_| {
+        ExtractionError::Parse("PDF /Info generation number is not a valid u32".into())
+    })?;
+    let root_num = root_caps[1]
+        .parse::<u32>()
+        .map_err(|_| ExtractionError::Parse("PDF /Root object number is not a valid u32".into()))?;
 
-    Some((info_num, info_gen, root_num))
+    Ok(Some((info_num, info_gen, root_num)))
 }
 
 /// Parse a PDF indirect object and return its raw content as a string.
 /// Handles the pattern: `<obj> <gen> obj ... endobj`
-fn parse_pdf_object(bytes: &[u8], obj_num: u32, gen_num: u32) -> Option<String> {
-    let content = std::str::from_utf8(bytes).ok()?;
+fn parse_pdf_object(
+    bytes: &[u8],
+    obj_num: u32,
+    gen_num: u32,
+) -> Result<Option<String>, ExtractionError> {
+    let content = std::str::from_utf8(bytes)
+        .map_err(|e| ExtractionError::Parse(format!("non-UTF8 PDF content: {e}")))?;
     let pattern = format!(r"(?s){} {} obj(.*?)endobj", obj_num, gen_num);
-    let re = Regex::new(&pattern).ok()?;
-    let caps = re.captures(content)?;
-    Some(caps[1].trim().to_string())
+    let re = Regex::new(&pattern)
+        .map_err(|e| ExtractionError::Parse(format!("invalid PDF object regex: {e}")))?;
+    let caps = match re.captures(content) {
+        Some(caps) => caps,
+        None => return Ok(None),
+    };
+    Ok(Some(caps[1].trim().to_string()))
 }
 
 /// Parse a PDF dictionary string (e.g. `/Author (Bram Moolenaar) /Title (Vim)`)
@@ -297,7 +326,13 @@ fn parse_pdf_object(bytes: &[u8], obj_num: u32, gen_num: u32) -> Option<String> 
 fn parse_pdf_dict_value(dict_content: &str, key: &str) -> Option<String> {
     // Try parenthesized strings first: /Key (value)
     let pattern = format!(r"(?s)/{}\s*\((.*?)\)", regex::escape(key));
-    let re = Regex::new(&pattern).ok()?;
+    let re = match Regex::new(&pattern) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, key = %key, "invalid PDF dict regex");
+            return None;
+        }
+    };
     if let Some(caps) = re.captures(dict_content) {
         let val = caps[1].to_string();
         // Unescape PDF string escapes
@@ -313,7 +348,13 @@ fn parse_pdf_dict_value(dict_content: &str, key: &str) -> Option<String> {
 
     // Try hex strings: /Key <hex>
     let hex_pattern = format!(r"/{}\s*<([0-9a-fA-F]*)>", regex::escape(key));
-    let hex_re = Regex::new(&hex_pattern).ok()?;
+    let hex_re = match Regex::new(&hex_pattern) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, key = %key, "invalid PDF dict hex regex");
+            return None;
+        }
+    };
     if let Some(caps) = hex_re.captures(dict_content) {
         let hex = &caps[1];
         if !hex.is_empty() {
@@ -329,21 +370,24 @@ fn parse_pdf_dict_value(dict_content: &str, key: &str) -> Option<String> {
 }
 
 /// Extract metadata from PDF /Info dictionary by finding the object and parsing it.
-fn extract_pdf_info_metadata(bytes: &[u8]) -> Option<PdfMetadata> {
-    let (info_num, info_gen, _) = parse_pdf_trailer(bytes)?;
-    let obj_content = parse_pdf_object(bytes, info_num, info_gen)?;
+fn extract_pdf_info_metadata(bytes: &[u8]) -> Result<Option<PdfMetadata>, ExtractionError> {
+    let (info_num, info_gen, _) = match parse_pdf_trailer(bytes)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let obj_content = match parse_pdf_object(bytes, info_num, info_gen)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
 
     let to_opt = |val: Option<String>| val.filter(|s| !s.is_empty());
 
-    Some(PdfMetadata {
+    Ok(Some(PdfMetadata {
         author: to_opt(parse_pdf_dict_value(&obj_content, "Author")),
         title: to_opt(parse_pdf_dict_value(&obj_content, "Title")),
-        subject: to_opt(parse_pdf_dict_value(&obj_content, "Subject")),
         creator: to_opt(parse_pdf_dict_value(&obj_content, "Creator")),
-        producer: to_opt(parse_pdf_dict_value(&obj_content, "Producer")),
         creation_date: to_opt(parse_pdf_dict_value(&obj_content, "CreationDate")),
-        mod_date: to_opt(parse_pdf_dict_value(&obj_content, "ModDate")),
-    })
+    }))
 }
 
 /// Extract PDF creation date from XMP metadata or /Info dict.
@@ -351,7 +395,8 @@ fn extract_pdf_info_metadata(bytes: &[u8]) -> Option<PdfMetadata> {
 fn normalize_pdf_date(date_str: &str) -> Option<String> {
     let date_str = date_str.trim();
     // PDF date format: D:YYYYMMDDHHmmSSOHH'mm'
-    let re = Regex::new(r"^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?").ok()?;
+    let re = Regex::new(r"^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?")
+        .expect("valid static regex: PDF date format D:YYYYMMDDHHmmSS");
     let caps = re.captures(date_str)?;
 
     let year = &caps[1];
@@ -369,67 +414,77 @@ fn normalize_pdf_date(date_str: &str) -> Option<String> {
 
 /// Find and extract XMP metadata from a PDF file.
 /// XMP is stored as a stream object referenced from the catalog's /Metadata entry.
-fn extract_pdf_xmp_metadata(bytes: &[u8]) -> Option<PdfMetadata> {
+fn extract_pdf_xmp_metadata(bytes: &[u8]) -> Result<Option<PdfMetadata>, ExtractionError> {
     // Find /Metadata reference in the catalog (root) object
     // First find the root object number from trailer
-    let (_, _, root_num) = parse_pdf_trailer(bytes)?;
+    let (_, _, root_num) = parse_pdf_trailer(bytes)?
+        .ok_or_else(|| ExtractionError::Parse("no /Root ref in trailer for XMP lookup".into()))?;
 
     // Read the root object
-    let root_content = parse_pdf_object(bytes, root_num, 0)?;
+    let root_content = parse_pdf_object(bytes, root_num, 0)?
+        .ok_or_else(|| ExtractionError::Parse("root object not found for XMP lookup".into()))?;
 
     // Find /Metadata reference in root
-    let meta_re = Regex::new(r"/Metadata\s+(\d+)\s+(\d+)\s+R").ok()?;
-    let meta_caps = meta_re.captures(&root_content)?;
-    let meta_num: u32 = meta_caps[1].parse().ok()?;
-    let meta_gen: u32 = meta_caps[2].parse().ok()?;
+    let meta_re = Regex::new(r"/Metadata\s+(\d+)\s+(\d+)\s+R")
+        .expect("valid static regex: /Metadata reference in PDF catalog");
+    let meta_caps = meta_re
+        .captures(&root_content)
+        .ok_or_else(|| ExtractionError::Parse("no /Metadata ref in root object".into()))?;
+    let meta_num: u32 = meta_caps[1]
+        .parse()
+        .map_err(|e| ExtractionError::Parse(format!("XMP metadata object number parse: {e}")))?;
+    let meta_gen: u32 = meta_caps[2].parse().map_err(|e| {
+        ExtractionError::Parse(format!("XMP metadata generation number parse: {e}"))
+    })?;
 
     // Read the metadata object
-    let meta_obj = parse_pdf_object(bytes, meta_num, meta_gen)?;
+    let meta_obj = parse_pdf_object(bytes, meta_num, meta_gen)?
+        .ok_or_else(|| ExtractionError::Parse("XMP metadata object not found".into()))?;
 
     // Extract the stream content
-    let stream_re = Regex::new(r"(?s)stream\s(.+?)\s*endstream").ok()?;
-    let stream_caps = stream_re.captures(&meta_obj)?;
+    let stream_re = Regex::new(r"(?s)stream\s(.+?)\s*endstream")
+        .expect("valid static regex: stream/endstream content in PDF object");
+    let stream_caps = stream_re
+        .captures(&meta_obj)
+        .ok_or_else(|| ExtractionError::Parse("no stream content in XMP metadata object".into()))?;
     let stream_data = stream_caps[1].as_bytes();
 
     // Try to decompress if FlateDecode
     let xml_data = if meta_obj.to_uppercase().contains("FLATEDECODE") {
         let mut decoder = flate2::read::ZlibDecoder::new(stream_data);
         let mut buf = Vec::new();
-        decoder.read_to_end(&mut buf).ok()?;
+        decoder
+            .read_to_end(&mut buf)
+            .map_err(|e| ExtractionError::Parse(format!("failed to decompress XMP stream: {e}")))?;
         buf
     } else {
         stream_data.to_vec()
     };
 
-    let xml_str = std::str::from_utf8(&xml_data).ok()?;
+    let xml_str = std::str::from_utf8(&xml_data)
+        .map_err(|e| ExtractionError::Parse(format!("XMP stream is not valid UTF-8: {e}")))?;
 
     // Extract Dublin Core metadata from XMP
     let author = extract_xmp_field(xml_str, "creator");
     let title = extract_xmp_field(xml_str, "title");
-    let subject = extract_xmp_field(xml_str, "description");
     let date = extract_xmp_field(xml_str, "date");
 
-    Some(PdfMetadata {
+    Ok(Some(PdfMetadata {
         author: author.filter(|s| !s.is_empty()),
         title: title.filter(|s| !s.is_empty()),
-        subject: subject.filter(|s| !s.is_empty()),
         creator: None,
-        producer: None,
         creation_date: date.filter(|s| !s.is_empty()),
-        mod_date: None,
-    })
+    }))
 }
 
 /// Extract a field value from XMP XML by namespace.
 /// Handles: <dc:field>value</dc:field> and <dc:field><rdf:li>value</rdf:li></dc:field>
 fn extract_xmp_field(xml: &str, field: &str) -> Option<String> {
+    let escaped = regex::escape(field);
+
     // Try simple element: <dc:field>value</dc:field>
-    let simple_re = Regex::new(&format!(
-        r"<dc:{}[^>]*>([^<]+)</dc:{}>",
-        regex::escape(field),
-        regex::escape(field)
-    ))
-    .ok()?;
+    let simple_re = Regex::new(&format!(r"<dc:{}[^>]*>([^<]+)</dc:{}>", escaped, escaped))
+        .expect("valid regex: XMP simple field");
     if let Some(caps) = simple_re.captures(xml) {
         let val = caps[1].trim().to_string();
         if !val.is_empty() {
@@ -440,10 +495,9 @@ fn extract_xmp_field(xml: &str, field: &str) -> Option<String> {
     // Try RDF container: <dc:field><rdf:li>value</rdf:li></dc:field>
     let rdf_re = Regex::new(&format!(
         r"<dc:{}[^>]*>\s*<rdf:li[^>]*>([^<]+)</rdf:li>\s*</dc:{}>",
-        regex::escape(field),
-        regex::escape(field)
+        escaped, escaped,
     ))
-    .ok()?;
+    .expect("valid regex: XMP rdf field");
     if let Some(caps) = rdf_re.captures(xml) {
         let val = caps[1].trim().to_string();
         if !val.is_empty() {

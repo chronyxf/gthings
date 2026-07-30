@@ -13,10 +13,50 @@
 //! When adding new patterns here, add corresponding DOM / text selectors
 //! to the JS snippet so the early pre-check catches them too.
 
-use regex::Regex;
-use std::sync::OnceLock;
+use regex::{Regex, RegexSet};
+use std::sync::{LazyLock, OnceLock};
 
-use super::types::{ContentQuality, QualityReason};
+use super::types::{ContentQuality, QualityFlag, QualityReason};
+
+// ---------------------------------------------------------------------------
+// Shared pattern indices
+// ---------------------------------------------------------------------------
+
+const IDX_BOT: usize = 0;
+const IDX_PAYWALL: usize = 1;
+const IDX_CAPTCHA: usize = 2;
+const IDX_EMPTY_SHELL: usize = 3;
+
+/// All detection patterns compiled once into a single RegexSet.
+static ALL_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        // 0 — Bot challenge patterns
+        r"(?i)(checking your browser|cf-chl|turnstile|verify you are human|are you a human|browser integrity check|challenge-platform|datadome|just a moment\.\.\.|checking the browser|cloudflare)",
+        // 1 — Paywall / subscription prompt patterns
+        r"(?i)(subscribe(?: to)? (?:for|to read|to continue|now)|log in to (?:read|continue)|sign in to (?:read|continue)|you've read your free articles|this is a subscriber|subscription required|support our (?:journalism|newsroom)|become a subscriber|already a subscriber|read the full article.*subscribe|continue reading.*subscribe|unlimited (?:access|digital) access|paid (?:article|content)|this article is (?:behind a|exclusively for))",
+        // 2 — CAPTCHA patterns
+        r"(?i)(captcha|recaptcha|g-recaptcha|h-captcha|turnstile|cf-turnstile)",
+        // 3 — JavaScript-required empty shell
+        r"(?i)please enable javascript",
+    ])
+    .expect("valid RegexSet for ALL_PATTERNS")
+});
+
+// ---------------------------------------------------------------------------
+// Text-metric regexes (punctuation, long words, paragraphs)
+// ---------------------------------------------------------------------------
+
+const IDX_PUNCTUATION: usize = 0;
+const IDX_LONG_WORDS: usize = 1;
+const IDX_PARAGRAPHS: usize = 2;
+
+static TEXT_METRICS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
+    [
+        Regex::new(r"[.!?]").expect("valid regex: punctuation"),
+        Regex::new(r"\w{4,}").expect("valid regex: long words"),
+        Regex::new(r"\n\n").expect("valid regex: paragraphs"),
+    ]
+});
 
 impl ContentQuality {
     /// Error page patterns (shared with detect methods).
@@ -44,6 +84,37 @@ impl ContentQuality {
         })
     }
 
+    /// Detect all quality flags in a single pass over the text.
+    ///
+    /// Combines bot, captcha, paywall, and empty-shell detection into one
+    /// regex traversal, then applies length / word-count heuristics.
+    /// Returns the same flags as calling the four `detect_*` methods
+    /// individually, but with fewer passes over the content.
+    pub fn detect_all(text: &str) -> Vec<QualityFlag> {
+        let matched = ALL_PATTERNS.matches(text);
+        let mut flags = Vec::with_capacity(4);
+
+        if matched.matched(IDX_BOT) {
+            flags.push(QualityFlag::BotWall);
+        }
+        if matched.matched(IDX_PAYWALL) {
+            flags.push(QualityFlag::Paywall);
+        }
+        if matched.matched(IDX_CAPTCHA) {
+            flags.push(QualityFlag::Captcha);
+        }
+
+        // Empty shell: JS pattern, short length, or too few words
+        let empty_shell = matched.matched(IDX_EMPTY_SHELL)
+            || text.len() < 80
+            || text.split_whitespace().count() < 10;
+        if empty_shell {
+            flags.push(QualityFlag::EmptyShell);
+        }
+
+        flags
+    }
+
     /// Detect bot challenge pages (Cloudflare, DataDome, Turnstile, etc.).
     ///
     /// Returns `true` if any bot challenge pattern is found in the text.
@@ -56,49 +127,21 @@ impl ContentQuality {
     /// assert!(!ContentQuality::detect_bot("Normal article content here"));
     /// ```
     pub fn detect_bot(text: &str) -> bool {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| {
-            Regex::new(
-                "(?i)(checking your browser|cf-chl|turnstile|verify you are human|\
-                 are you a human|browser integrity check|challenge-platform|\
-                 datadome|just a moment\\.\\.\\.|checking the browser|cloudflare)",
-            )
-            .expect("valid regex")
-        });
-        re.is_match(text)
+        ALL_PATTERNS.matches(text).matched(IDX_BOT)
     }
 
     /// Detect CAPTCHA pages (reCAPTCHA, hCaptcha, Turnstile).
     ///
     /// Returns `true` if any CAPTCHA pattern is found in the text.
     pub fn detect_captcha(text: &str) -> bool {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| {
-            Regex::new("(?i)(captcha|recaptcha|g-recaptcha|h-captcha|turnstile|cf-turnstile)")
-                .expect("valid regex")
-        });
-        re.is_match(text)
+        ALL_PATTERNS.matches(text).matched(IDX_CAPTCHA)
     }
 
     /// Detect paywall / subscription prompts.
     ///
     /// Returns `true` if any paywall pattern is found in the text.
     pub fn detect_paywall(text: &str) -> bool {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| {
-            Regex::new(
-                "(?i)(subscribe( to)? (for|to read|to continue|now)|\
-                 log in to read|log in to continue|sign in to read|\
-                 sign in to continue|you've read your free articles|\
-                 this is a subscriber|subscription required|\
-                 support our (journalism|newsroom)|become a subscriber|\
-                 already a subscriber|read the full article.*subscribe|\
-                 continue reading.*subscribe|unlimited (access|digital) access|\
-                 paid (article|content)|this article is (behind a|exclusively for))",
-            )
-            .expect("valid regex")
-        });
-        re.is_match(text)
+        ALL_PATTERNS.matches(text).matched(IDX_PAYWALL)
     }
 
     /// Detect JS-required empty shells that render nothing useful.
@@ -109,43 +152,27 @@ impl ContentQuality {
         if text.len() < 80 {
             return true;
         }
-
-        // JS-required message
-        static JS_RE: OnceLock<Regex> = OnceLock::new();
-        let js_re =
-            JS_RE.get_or_init(|| Regex::new(r"(?i)please enable javascript").expect("valid regex"));
-        if js_re.is_match(text) {
+        if ALL_PATTERNS.matches(text).matched(IDX_EMPTY_SHELL) {
             return true;
         }
-
         // Fewer than 10 words — likely navigation chrome only
-        if text.split_whitespace().count() < 10 {
-            return true;
-        }
-
-        false
+        text.split_whitespace().count() < 10
     }
 }
 
 /// Check if text contains sentence-ending punctuation.
 pub(crate) fn regex_has_punctuation(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"[.!?]").expect("valid regex"));
-    re.is_match(text)
+    TEXT_METRICS[IDX_PUNCTUATION].is_match(text)
 }
 
 /// Check if text contains words with 4+ characters.
 pub(crate) fn regex_has_long_words(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\w{4,}").expect("valid regex"));
-    re.is_match(text)
+    TEXT_METRICS[IDX_LONG_WORDS].is_match(text)
 }
 
 /// Check if text contains paragraph breaks (double newline).
 pub(crate) fn regex_has_paragraphs(text: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\n\n").expect("valid regex"));
-    re.is_match(text)
+    TEXT_METRICS[IDX_PARAGRAPHS].is_match(text)
 }
 
 #[cfg(test)]

@@ -32,12 +32,7 @@ impl SourceType {
         if lower.contains("arxiv.org") {
             SourceType::Arxiv
         } else if lower.contains("github.com") {
-            // Check if it's a raw file URL or a repo URL
-            if lower.contains("raw.githubusercontent.com") || lower.contains("github.com") {
-                SourceType::GitHub
-            } else {
-                SourceType::Web
-            }
+            SourceType::GitHub
         } else if lower.ends_with(".pdf") || lower.contains("/pdf/") {
             SourceType::Pdf
         } else {
@@ -50,6 +45,7 @@ impl SourceType {
 ///
 /// Uses a curated list of academic, technical, news, and government domains.
 /// Unknown domains default to 0.5. The score helps AI agents assess source trustworthiness.
+#[allow(clippy::cast_precision_loss)]
 pub fn domain_authority(host: &str) -> f32 {
     authority_for_domain(host) as f32
 }
@@ -58,91 +54,95 @@ pub fn domain_authority(host: &str) -> f32 {
 fn authority_for_domain(domain: &str) -> f64 {
     let domain = domain.to_lowercase();
 
-    // High-authority academic/scholarly domains
-    let high: [&str; 16] = [
-        "arxiv.org",
-        "scholar.google.com",
-        "pubmed.ncbi.nlm.nih.gov",
-        "doi.org",
-        "ieeexplore.ieee.org",
-        "dl.acm.org",
-        "springer.com",
-        "elsevier.com",
-        "sciencedirect.com",
-        "nature.com",
-        "science.org",
-        "plos.org",
-        "wikipedia.org",
-        "wikidata.org",
-        "semanticscholar.org",
-        "cell.com",
+    // Consolidated authority tiers: (score, domain_list)
+    let tiers: &[(f64, &[&str])] = &[
+        // High-authority academic/scholarly domains — 0.9
+        (
+            0.9,
+            &[
+                "arxiv.org",
+                "scholar.google.com",
+                "pubmed.ncbi.nlm.nih.gov",
+                "doi.org",
+                "ieeexplore.ieee.org",
+                "dl.acm.org",
+                "springer.com",
+                "elsevier.com",
+                "sciencedirect.com",
+                "nature.com",
+                "science.org",
+                "plos.org",
+                "wikipedia.org",
+                "wikidata.org",
+                "semanticscholar.org",
+                "cell.com",
+            ],
+        ),
+        // Medium-high authority (technical, educational, government) — 0.8
+        (
+            0.8,
+            &[
+                "github.com",
+                "gitlab.com",
+                "bitbucket.org",
+                "docs.rs",
+                "crates.io",
+                "pypi.org",
+                "npmjs.com",
+                "stackoverflow.com",
+                "stackexchange.com",
+                "rust-lang.org",
+                "mozilla.org",
+                "chromium.org",
+                "openai.com",
+                "deepmind.com",
+                "research.google.com",
+                "mit.edu",
+                "stanford.edu",
+                "ox.ac.uk",
+                "cam.ac.uk",
+                "ibm.com",
+                "microsoft.com",
+                "google.com",
+                "apple.com",
+                "oracle.com",
+                "redhat.com",
+                "nginx.com",
+                "docker.com",
+                "cloudflare.com",
+            ],
+        ),
+        // News outlets — 0.7
+        (
+            0.7,
+            &[
+                "reuters.com",
+                "ap.org",
+                "bbc.com",
+                "bbc.co.uk",
+                "nytimes.com",
+                "wsj.com",
+                "economist.com",
+                "theguardian.com",
+                "washingtonpost.com",
+                "bloomberg.com",
+                "ft.com",
+                "npr.org",
+                "techcrunch.com",
+            ],
+        ),
     ];
 
-    // Medium-high authority (technical, educational, government)
-    let med_high: [&str; 28] = [
-        "github.com",
-        "gitlab.com",
-        "bitbucket.org",
-        "docs.rs",
-        "crates.io",
-        "pypi.org",
-        "npmjs.com",
-        "stackoverflow.com",
-        "stackexchange.com",
-        "rust-lang.org",
-        "mozilla.org",
-        "chromium.org",
-        "openai.com",
-        "deepmind.com",
-        "research.google.com",
-        "mit.edu",
-        "stanford.edu",
-        "ox.ac.uk",
-        "cam.ac.uk",
-        "ibm.com",
-        "microsoft.com",
-        "google.com",
-        "apple.com",
-        "oracle.com",
-        "redhat.com",
-        "nginx.com",
-        "docker.com",
-        "cloudflare.com",
-    ];
+    for (score, domains) in tiers {
+        if domains
+            .iter()
+            .any(|h| domain == *h || domain.ends_with(&format!(".{}", h)))
+        {
+            return *score;
+        }
+    }
 
-    // News outlets
-    let news: [&str; 13] = [
-        "reuters.com",
-        "ap.org",
-        "bbc.com",
-        "bbc.co.uk",
-        "nytimes.com",
-        "wsj.com",
-        "economist.com",
-        "theguardian.com",
-        "washingtonpost.com",
-        "bloomberg.com",
-        "ft.com",
-        "npr.org",
-        "techcrunch.com",
-    ];
-
-    if high
-        .iter()
-        .any(|h| domain == *h || domain.ends_with(&format!(".{}", h)))
-    {
-        0.9
-    } else if med_high
-        .iter()
-        .any(|h| domain == *h || domain.ends_with(&format!(".{}", h)))
-    {
-        0.8
-    } else if news
-        .iter()
-        .any(|h| domain == *h || domain.ends_with(&format!(".{}", h)))
-    {
-        0.7
-    } else if domain.ends_with(".edu") || domain.ends_with(".gov") || domain.ends_with(".ac.uk") {
+    if domain.ends_with(".edu") || domain.ends_with(".gov") || domain.ends_with(".ac.uk") {
         0.8
     } else {
         0.5
@@ -151,16 +151,21 @@ fn authority_for_domain(domain: &str) -> f64 {
 
 /// Compute a domain authority score (0.0-1.0) based on recognized domains.
 ///
-/// Uses a curated list of academic, technical, news, and government domains.
-/// Unknown domains default to 0.5. The score helps AI agents assess source trustworthiness.
-pub(crate) fn compute_domain_authority(url: &str) -> f64 {
-    let domain = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+/// Extracts the hostname from a URL and looks up its authority in a curated
+/// list of academic, technical, news, and government domains. Unknown domains
+/// default to 0.5. The score helps AI agents assess source trustworthiness.
+///
+/// This function is public so that other crates (e.g. search, dispatch) can
+/// reuse the same domain authority logic without duplicating the lookup.
+pub fn compute_domain_authority(url: &str) -> f64 {
+    let domain = gthings_common::url_normalizer::registered_domain(url).unwrap_or_else(|| {
+        url.trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_lowercase()
+    });
     authority_for_domain(&domain)
 }
 

@@ -47,7 +47,7 @@ impl ContentQuality {
         }
 
         // Paywall teaser: "Read More »" as entire content
-        if slice == "Read More \u{00bb}" {
+        if slice == super::types::READ_MORE_INDICATOR {
             reasons.push(QualityReason::PaywallTeaser);
             score -= 0.5;
         }
@@ -71,16 +71,7 @@ impl ContentQuality {
             score -= 0.1;
         }
 
-        // Bonus for natural language indicators
-        if regex_has_punctuation(slice) {
-            score += 0.05;
-        }
-        if regex_has_long_words(slice) {
-            score += 0.05;
-        }
-        if regex_has_paragraphs(slice) {
-            score += 0.05;
-        }
+        score = Self::apply_bonus_score(slice, score);
 
         score = score.clamp(0.0, 1.0);
 
@@ -106,6 +97,21 @@ impl ContentQuality {
             entropy_bits_per_char: entropy,
             flags,
         }
+    }
+
+    /// Apply bonus score for natural language indicators (punctuation, long words, paragraphs).
+    fn apply_bonus_score(text: &str, score: f64) -> f64 {
+        let mut bonus = score;
+        if regex_has_punctuation(text) {
+            bonus += 0.05;
+        }
+        if regex_has_long_words(text) {
+            bonus += 0.05;
+        }
+        if regex_has_paragraphs(text) {
+            bonus += 0.05;
+        }
+        bonus
     }
 }
 

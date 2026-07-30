@@ -1,3 +1,6 @@
+/// Shared constant for paywall teaser detection.
+pub const READ_MORE_INDICATOR: &str = "Read More \u{00bb}";
+
 /// Quality flag for domain-level reputation tracking.
 ///
 /// Re-exported from `gthings_common` to make it available under

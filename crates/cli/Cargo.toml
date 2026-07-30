@@ -15,7 +15,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
-gthings-extraction = { path = "../extraction", version = "0.5.2" }
+gthings-extraction = { path = "../extraction", version = "0.5.3" }
 reqwest = { workspace = true }
 
 [lints]

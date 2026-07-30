@@ -1,11 +1,36 @@
+use async_trait::async_trait;
 use gthings_common::pagination::ExtractParams;
 use gthings_common::provenance::{ExtractionMethod as ProvenanceMethod, Provenance};
+use reqwest::Response;
 use url::Url;
 
 use crate::article::{Article, ExtractionError, ExtractionMethod};
 use crate::extractor::{Extractor, SourceType};
 use crate::pdf::PdfExtractor;
 use crate::web::WebExtractor;
+
+/// Check if the HTTP response indicates rate-limiting (429) and return
+/// a `RateLimited` error with the parsed `Retry-After` header if so.
+pub(crate) fn check_rate_limit(resp: &Response, detail: String) -> Result<(), ExtractionError> {
+    if resp.status().as_u16() == 429 {
+        let retry_after = match resp.headers().get("retry-after") {
+            Some(v) => {
+                let s = v
+                    .to_str()
+                    .map_err(|_| ExtractionError::Parse("non-UTF8 Retry-After header".into()))?;
+                Some(s.parse::<u64>().map_err(|e| {
+                    ExtractionError::Parse(format!("invalid Retry-After value: {e}"))
+                })?)
+            }
+            None => None,
+        };
+        return Err(ExtractionError::RateLimited {
+            detail,
+            retry_after,
+        });
+    }
+    Ok(())
+}
 
 /// Auto-dispatches extraction to the right extractor based on URL.
 pub struct AutoExtractor {
@@ -16,8 +41,10 @@ pub struct AutoExtractor {
 }
 
 impl AutoExtractor {
-    /// Create a new AutoExtractor with shared HTTP client.
-    pub fn new(client: reqwest::Client) -> Self {
+    /// Create a new AutoExtractor with a shared HTTP client reference.
+    /// The client is cloned internally; callers can pass `http_client()` directly.
+    pub fn new(client: &reqwest::Client) -> Self {
+        let client = client.clone();
         let web = WebExtractor::new(client.clone());
         Self {
             client,
@@ -34,7 +61,7 @@ impl AutoExtractor {
     }
 
     /// Extract content from a URL, auto-detecting the source type.
-    pub async fn extract(
+    async fn dispatch_extract(
         &self,
         url: &str,
         params: ExtractParams,
@@ -72,7 +99,7 @@ impl AutoExtractor {
             .to_string();
 
         // Try to download and extract the PDF
-        let pdf_result = self.extract_pdf(&pdf_url, params.clone()).await;
+        let pdf_result = self.extract_pdf(&pdf_url, params).await;
 
         match pdf_result {
             Ok(mut article) => {
@@ -127,17 +154,7 @@ impl AutoExtractor {
 
         let status = resp.status();
         if !status.is_success() {
-            if status.as_u16() == 429 {
-                let retry_after = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-                return Err(ExtractionError::RateLimited {
-                    detail: format!("Rate limited while fetching PDF {url}"),
-                    retry_after,
-                });
-            }
+            check_rate_limit(&resp, format!("Rate limited while fetching PDF {url}"))?;
             return Err(ExtractionError::Http(format!("HTTP {status} for PDF")));
         }
 
@@ -228,17 +245,7 @@ impl AutoExtractor {
 
         let status = resp.status();
         if !status.is_success() {
-            if status.as_u16() == 429 {
-                let retry_after = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-                return Err(ExtractionError::RateLimited {
-                    detail: format!("Rate limited while fetching {raw_url}"),
-                    retry_after,
-                });
-            }
+            check_rate_limit(&resp, format!("Rate limited while fetching {raw_url}"))?;
             return Err(ExtractionError::Http(format!("GitHub HTTP {status}")));
         }
 
@@ -264,7 +271,8 @@ impl AutoExtractor {
             original_url,
             total_len,
             effective_len,
-        );
+        )
+        .map_err(|e| ExtractionError::Parse(e.to_string()))?;
 
         let now = chrono::Utc::now();
         let provenance = Provenance {
@@ -320,7 +328,7 @@ impl AutoExtractor {
 
     /// Detect programming language from file extension.
     fn detect_language(url: &str) -> String {
-        let path = url.split('?').next().unwrap_or(url);
+        let path = url.split('?').next().unwrap();
         if let Some(ext) = path.rsplit('.').next() {
             match ext {
                 "rs" => "rust".into(),
@@ -347,6 +355,23 @@ impl AutoExtractor {
         } else {
             "unknown".into()
         }
+    }
+}
+
+#[async_trait]
+impl Extractor for AutoExtractor {
+    type Input = String;
+
+    async fn extract(
+        &self,
+        input: String,
+        params: ExtractParams,
+    ) -> Result<Article, ExtractionError> {
+        self.dispatch_extract(&input, params).await
+    }
+
+    fn method(&self) -> ExtractionMethod {
+        ExtractionMethod::Readability
     }
 }
 
