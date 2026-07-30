@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.6] - 2026-07-30
+
+### Feat
+- Add UniversalFlags struct shared across all commands: --output, --query, --cdp-port, --timeout, -v, -q
+- Add gthings ax <url> command for accessibility tree extraction
+- Add gthings pdf-url and pdf-file commands
+- Add --strategy simple|parallel|harvest to search, replacing separate batch/harvest subcommands
+- Add 16 integration tests for new flags and ax command
+- Update README.md and all 4 skill files to match new CLI
+
+### Fix
+- Fix empty query panic (guard before queries[0] access)
+- Fix CDP port config silently ignored (merge_from propagates flags)
+- Fix --output text showing JSON instead of human-readable text
+- Fix e2e test and CLI test assertions for new output format
+
+
 ## [0.6.5] - 2026-07-29
 
 ### Fixed
