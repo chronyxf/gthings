@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.2] - 2026-07-30
+
+### Feat
+- Add ax_tree module: ax_tree(), ax_query(), compress_ax_tree(), ax_diff() with LCS diff
+- Add auto-reconnect with exponential backoff and WS URL detection cascade
+- Add with_isolated_tab() and run_in_tab() for per-operation tab isolation
+- Add create_background_tab() with CDP background flag
+- Convert dialog dismissal to async tokio; reduce MAX_ATTEMPTS 5->2
+- Add Connection::call() retry on ConnectionFailed
+- Add Drop impls for Connection and Session
+
+### Fix
+- Replace lock().unwrap() with lock().expect() for panic safety
+- Remove dead reconnect constants and reconnect_and_retry method
+
+
 ## [0.5.1] - 2026-07-29
 
 ### Fixed
