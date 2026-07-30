@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.2] - 2026-07-30
+
+### Feat
+- Add scroll-triggered lazy loading for more organic results
+- Add method-aware quality scoring (skip length checks for PDF/Arxiv)
+- Add result post-processing: junk URL filter, base URL dedup, title/snippet cleanup
+- Add UTF-8 safe safe_truncate_end() helper
+
+### Fix
+- Fix UTF-8 char boundary panic in snippet cleaning (byte slicing -> strip_suffix)
+- Fix domain_authority rounding to 2 decimal places
+
+
 ## [0.7.1] - 2026-07-29
 
 ### Added
