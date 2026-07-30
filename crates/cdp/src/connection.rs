@@ -90,7 +90,7 @@ impl Connection {
         tokio::time::timeout(CONNECTION_TIMEOUT, async {
             // Start connecting in background
             let ws_url_owned = ws_url.to_owned();
-            let connect_fut = tokio::spawn(async move {
+            let mut connect_fut = tokio::spawn(async move {
                 match tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url_owned)).await {
                     Ok(Ok(pair)) => Ok(pair),
                     Ok(Err(e)) => Err(e),
@@ -103,24 +103,34 @@ impl Connection {
                 }
             });
 
-            // Wait 600ms, then dismiss the Dia dialog (if on macOS).
-            // The dialog appears during the WebSocket handshake, so we must
-            // dismiss it *while* the connection is still in progress.
-            #[cfg(target_os = "macos")]
-            {
-                tokio::time::sleep(Duration::from_millis(600)).await;
-                dismiss_allow_debugging_dialog().await;
-            }
+            // Try the WebSocket first with a short timeout. If it connects
+            // quickly, no dialog is blocking the handshake and we skip the
+            // expensive osascript call entirely — saving ~1.6s per connection.
+            let (ws_stream, _) = match tokio::time::timeout(Duration::from_secs(3), &mut connect_fut).await {
+                Ok(Ok(Ok(pair))) => {
+                    // Fast path — connected without osascript
+                    pair
+                }
+                _ => {
+                    // First attempt failed or timed out; the browser debugging
+                    // dialog may be blocking the WebSocket handshake. Dismiss
+                    // it, then retry the original connection (still in flight).
+                    #[cfg(target_os = "macos")]
+                    {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        dismiss_allow_debugging_dialog().await;
+                    }
 
-            // Await the connection
-            let (ws_stream, _) = connect_fut
-                .await
-                .map_err(|e| CdpError::ConnectionFailed {
-                    detail: format!("task join: {e}"),
-                })?
-                .map_err(|e| CdpError::ConnectionFailed {
-                    detail: format!("WebSocket connect to {ws_url} failed: {e}"),
-                })?;
+                    connect_fut
+                        .await
+                        .map_err(|e| CdpError::ConnectionFailed {
+                            detail: format!("task join: {e}"),
+                        })?
+                        .map_err(|e| CdpError::ConnectionFailed {
+                            detail: format!("WebSocket connect to {ws_url} failed: {e}"),
+                        })?
+                }
+            };
 
             let (write_tx, write_rx) = mpsc::unbounded_channel::<InternalMessage>();
             let (events_tx, _) = broadcast::channel::<CdpEvent>(256);

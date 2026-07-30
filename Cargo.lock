@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "gthings"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "clap",
  "gthings-cdp",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "gthings-cdp"
-version = "0.5.1"
+version = "0.5.3"
 dependencies = [
  "futures-util",
  "gthings-common",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "gthings-extraction"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "gthings-search"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "gthings-cdp",

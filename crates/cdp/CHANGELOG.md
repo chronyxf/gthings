@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.3] - 2026-07-30
+
+### Fix
+- Reduce osascript dialog dismissal timeout (5s to 1s, 2 attempts to 1)
+- Try WebSocket connection first, skip osascript when dialog not present
+- Reduce per-command startup overhead from ~1.6s to ~0s in common case
+
+
 ## [0.5.2] - 2026-07-30
 
 ### Feat

@@ -162,8 +162,8 @@ pub async fn dismiss_allow_debugging_dialog() {
         return browserName
     end tell"#;
 
-    const OSASCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
-    const MAX_ATTEMPTS: u32 = 2;
+    const OSASCRIPT_TIMEOUT: Duration = Duration::from_secs(1);
+    const MAX_ATTEMPTS: u32 = 1;
 
     for attempt in 1..=MAX_ATTEMPTS {
         let script = SCRIPT.to_owned();
