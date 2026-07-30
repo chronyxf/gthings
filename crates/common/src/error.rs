@@ -18,12 +18,12 @@ pub enum GthingsError {
 
 impl From<String> for GthingsError {
     fn from(msg: String) -> Self {
-        GthingsError::Other(msg)
+        Self::Other(msg)
     }
 }
 
 impl From<&str> for GthingsError {
     fn from(msg: &str) -> Self {
-        GthingsError::Other(msg.to_string())
+        Self::Other(msg.to_string())
     }
 }

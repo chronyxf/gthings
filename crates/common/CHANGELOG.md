@@ -7,6 +7,22 @@
 
  — gthings-common
 
+## 0.3.7 (2026-07-30)
+
+### Fixes
+
+#### - refactor: rename Sha256DiskCache → DiskCache, add SHA-256 key hashing (cache.rs)
+
+- refactor: add in-memory domain reputation cache, extract helpers (domain_reputation.rs)
+- chore: add hex and psl deps to Cargo.toml
+- fix: use Self::Other in error.rs impls
+- refactor: add safe_truncate_end, disconnect_arc, quality_flag_is_blocking (lib.rs)
+- refactor: build_pagination returns Result, add EncodedToken struct (pagination.rs)
+- refactor: use Box<Self>, Eq derives, add doc fixes (provenance.rs)
+- refactor: add try_parse_url, strip_suffix, canonicalize_parsed_url helpers (url_normalizer.rs)
+- refactor: use psl crate for registered_domain instead of hardcoded TLD list
+- refactor: #[must_use] on all pure pub functions
+
 ## 0.3.5 (2026-07-26)
 
 ### Changed

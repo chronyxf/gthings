@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::GthingsError;
 
+/// Internal JSON structure for continuation token serialization.
+#[derive(Serialize, Deserialize)]
+struct EncodedToken {
+    url: String,
+    offset: usize,
+    max_chars: usize,
+}
+
 /// Parameters controlling extraction offset and maximum length.
 ///
 /// Passed to every `Extractor::extract()` call. Default values
@@ -26,7 +34,7 @@ impl Default for ExtractParams {
 ///
 /// Tells the consumer whether the content was truncated, what range
 /// was returned, and (optionally) how to fetch the next chunk.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pagination {
     pub offset: usize,
     pub returned_len: usize,
@@ -35,78 +43,80 @@ pub struct Pagination {
     pub continuation_token: Option<String>,
 }
 
-/// Encode a continuation token that captures URL, next offset, and max_chars.
+/// Encode a continuation token that captures URL, next offset, and `max_chars`.
 ///
 /// The token is a base64-encoded JSON object: `{"url":..., "offset":..., "max_chars":...}`.
-pub fn encode_continuation_token(url: &str, next_offset: usize, max_chars: usize) -> String {
-    let payload = serde_json::json!({
-        "url": url,
-        "offset": next_offset,
-        "max_chars": max_chars,
-    });
-    let json = serde_json::to_string(&payload).expect("continuation token serialization");
-    base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
+///
+/// # Errors
+///
+/// Returns a [`GthingsError::Parse`] if JSON serialization fails (should never
+/// happen for this plain data).
+pub fn encode_continuation_token(
+    url: &str,
+    next_offset: usize,
+    max_chars: usize,
+) -> Result<String, GthingsError> {
+    let token = EncodedToken {
+        url: url.to_string(),
+        offset: next_offset,
+        max_chars,
+    };
+    let json = serde_json::to_string(&token)
+        .map_err(|e| GthingsError::Parse(format!("continuation token serialization: {e}")))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(json.as_bytes()))
 }
 
 /// Decode a continuation token back into `(url, offset, max_chars)`.
+///
+/// # Errors
+///
+/// Returns [`GthingsError::Parse`] if the token is not valid base64,
+/// not valid UTF-8, or not valid JSON with the expected structure.
 pub fn decode_continuation_token(token: &str) -> Result<(String, usize, usize), GthingsError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(token)
         .map_err(|e| GthingsError::Parse(format!("invalid base64 continuation token: {e}")))?;
     let json = String::from_utf8(bytes)
         .map_err(|e| GthingsError::Parse(format!("invalid UTF-8 in continuation token: {e}")))?;
-    let parsed: serde_json::Value = serde_json::from_str(&json)
+    let token: EncodedToken = serde_json::from_str(&json)
         .map_err(|e| GthingsError::Parse(format!("invalid JSON in continuation token: {e}")))?;
-    let url = parsed
-        .get("url")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| GthingsError::Parse("missing 'url' in continuation token".into()))?
-        .to_string();
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "CLI tool; 32-bit platforms are not a supported target"
-    )]
-    let offset = parsed
-        .get("offset")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| GthingsError::Parse("missing 'offset' in continuation token".into()))?
-        as usize;
-    let max_chars = parsed
-        .get("max_chars")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| GthingsError::Parse("missing 'max_chars' in continuation token".into()))?
-        as usize;
-    Ok((url, offset, max_chars))
+    Ok((token.url, token.offset, token.max_chars))
 }
 
 /// Build a [`Pagination`] from extraction parameters and content lengths.
 ///
 /// Computes `truncated`, sets `returned_len`, and creates a continuation token
 /// when the content was truncated.
+///
+/// # Errors
+///
+/// Returns [`GthingsError::Parse`] if the continuation token cannot be
+/// serialized (should never happen for this plain data).
 pub fn build_pagination(
     params: &ExtractParams,
     url: &str,
     total_len: usize,
     returned_len: usize,
-) -> Pagination {
+) -> Result<Pagination, GthingsError> {
     let truncated =
         params.offset.saturating_add(params.max_chars) < total_len && params.max_chars > 0;
-    Pagination {
+    let continuation_token = if truncated {
+        let next_offset = params.offset.saturating_add(params.max_chars);
+        Some(encode_continuation_token(
+            url,
+            next_offset,
+            params.max_chars,
+        )?)
+    } else {
+        None
+    };
+    Ok(Pagination {
         offset: params.offset,
         returned_len,
         total_len: Some(total_len),
         truncated,
-        continuation_token: if truncated {
-            let next_offset = params.offset.saturating_add(params.max_chars);
-            Some(encode_continuation_token(
-                url,
-                next_offset,
-                params.max_chars,
-            ))
-        } else {
-            None
-        },
-    }
+        continuation_token,
+    })
 }
 
 #[cfg(test)]
@@ -115,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_roundtrip() {
-        let token = encode_continuation_token("https://example.com/article", 5000, 2000);
+        let token = encode_continuation_token("https://example.com/article", 5000, 2000).unwrap();
         let (url, offset, max_chars) = decode_continuation_token(&token).unwrap();
         assert_eq!(url, "https://example.com/article");
         assert_eq!(offset, 5000);
@@ -146,9 +156,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // build_pagination tests
-    // -----------------------------------------------------------------------
+    // -- build_pagination tests -------------------------------------------
 
     #[test]
     fn test_build_pagination_truncated() {
@@ -157,7 +165,7 @@ mod tests {
             offset: 0,
             max_chars: 100,
         };
-        let result = build_pagination(&params, "https://example.com", 1000, 100);
+        let result = build_pagination(&params, "https://example.com", 1000, 100).unwrap();
         assert!(result.truncated);
         assert!(result.continuation_token.is_some());
         assert_eq!(result.offset, 0);
@@ -172,7 +180,7 @@ mod tests {
             offset: 0,
             max_chars: 1000,
         };
-        let result = build_pagination(&params, "https://example.com", 100, 100);
+        let result = build_pagination(&params, "https://example.com", 100, 100).unwrap();
         assert!(!result.truncated);
         assert!(result.continuation_token.is_none());
     }
@@ -184,7 +192,7 @@ mod tests {
             offset: 0,
             max_chars: 500,
         };
-        let result = build_pagination(&params, "https://example.com/page", 2000, 500);
+        let result = build_pagination(&params, "https://example.com/page", 2000, 500).unwrap();
         let token = result.continuation_token.unwrap();
         let (url, next_offset, max_chars) = decode_continuation_token(&token).unwrap();
         assert_eq!(url, "https://example.com/page");
@@ -199,7 +207,7 @@ mod tests {
             offset: usize::MAX - 10,
             max_chars: 20,
         };
-        let result = build_pagination(&params, "https://example.com", usize::MAX, 20);
+        let result = build_pagination(&params, "https://example.com", usize::MAX, 20).unwrap();
         // Should not panic; truncated should be false since we got everything
         assert!(!result.truncated);
     }

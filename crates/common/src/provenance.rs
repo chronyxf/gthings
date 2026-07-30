@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 
 /// Method used to discover or acquire the content.
 ///
-/// Distinct from the extraction technique (e.g. Readability vs PdfText);
+/// Distinct from the extraction technique (e.g. Readability vs `PdfText`);
 /// this describes *how the agent found the content*.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ExtractionMethod {
     #[default]
     Follow,
@@ -30,7 +30,7 @@ pub struct Provenance {
     #[serde(default = "Utc::now")]
     pub accessed_at: DateTime<Utc>,
     pub duration_ms: u64,
-    pub derived_from: Option<Box<Provenance>>,
+    pub derived_from: Option<Box<Self>>,
 }
 
 impl Default for Provenance {

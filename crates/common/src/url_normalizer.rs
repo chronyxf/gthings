@@ -2,6 +2,8 @@
 // URL canonicalization and normalisation
 // ---------------------------------------------------------------------------
 
+use std::borrow::Cow;
+
 use url::Url;
 
 // ---------------------------------------------------------------------------
@@ -23,13 +25,6 @@ const TRACKING_PARAMS: &[&str] = &[
     "mc_eid",
 ];
 
-/// Known multi-part TLDs that need special handling for registered-domain
-/// extraction.
-const MULTI_PART_TLDS: &[&str] = &[
-    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.nz", "org.nz", "co.jp",
-    "com.br", "co.kr", "co.in", "com.mx", "co.za", "com.ar", "com.cn",
-];
-
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -38,35 +33,110 @@ fn is_tracking_param(key: &str) -> bool {
     TRACKING_PARAMS.contains(&key)
 }
 
-/// Build a percent-encoded query string from sorted key-value pairs.
-fn build_query_string(pairs: &[(String, String)]) -> String {
-    pairs
-        .iter()
-        .map(|(k, v)| {
-            let encoded_k: String = url::form_urlencoded::byte_serialize(k.as_bytes()).collect();
-            if v.is_empty() {
-                encoded_k
-            } else {
-                let encoded_v: String =
-                    url::form_urlencoded::byte_serialize(v.as_bytes()).collect();
-                format!("{}={}", encoded_k, encoded_v)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("&")
+/// Build a percent-encoded query string from key-value pairs.
+///
+/// Avoids allocating an intermediate `Vec<String>` — writes directly into
+/// a single `String` buffer.
+fn build_query_string<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> String {
+    let mut result = String::new();
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            result.push('&');
+        }
+        result.extend(url::form_urlencoded::byte_serialize(k.as_ref().as_bytes()));
+        if !v.as_ref().is_empty() {
+            result.push('=');
+            result.extend(url::form_urlencoded::byte_serialize(v.as_ref().as_bytes()));
+        }
+    }
+    result
 }
 
 /// Normalise a URL path:
-/// - lowercase
+/// - lowercase (ASCII-only — safe for URL paths)
 /// - collapse `//` → `/`
 /// - strip trailing `/` (except root `/`)
+///
+/// Single-pass, single-allocation: writes directly into a `String` buffer,
+/// avoiding intermediate `Vec<&str>` and `join`/`format!` overhead.
 fn normalize_path(path: &str) -> String {
-    let lower = path.to_lowercase();
-    let segments: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        "/".to_string()
+    let mut result = String::with_capacity(path.len());
+    let mut first = true;
+    for segment in path.split('/') {
+        if !segment.is_empty() {
+            if !first {
+                result.push('/');
+            }
+            first = false;
+            for c in segment.chars() {
+                result.push(c.to_ascii_lowercase());
+            }
+        }
+    }
+    if first {
+        result.push('/');
+    }
+    result
+}
+
+/// Filter tracking query parameters and build a query string.
+///
+/// Returns the percent-encoded query string, or an empty string when no
+/// non-tracking parameters remain.
+fn filter_and_build_query(url: &Url) -> String {
+    let pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> = url
+        .query_pairs()
+        .filter(|(k, _)| !is_tracking_param(k))
+        .collect();
+    build_query_string(&pairs)
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a URL string, returning `None` for unparseable inputs.
+fn try_parse_url(url: &str) -> Option<Url> {
+    Url::parse(url).ok()
+}
+
+/// Strip a suffix pattern from a URL string, respecting UTF-8 boundaries.
+#[allow(clippy::incompatible_msrv)]
+fn strip_suffix(url: &str, pattern: &str) -> String {
+    if let Some(pos) = url.find(pattern) {
+        url[..url.floor_char_boundary(pos)].to_string()
     } else {
-        format!("/{}", segments.join("/"))
+        url.to_string()
+    }
+}
+
+/// Lowercase host, normalise path, strip tracking params, sort remaining
+/// query parameters — all in-place on a mutable [`Url`].
+fn canonicalize_parsed_url(parsed: &mut Url) {
+    // Lowercase host (ASCII — safe for DNS names).
+    if let Some(host) = parsed.host_str() {
+        let lower_host = host.to_ascii_lowercase();
+        // Note: set_host always succeeds because lower_host comes from the parsed URL's own host_str
+        let _ = parsed.set_host(Some(&lower_host));
+    }
+
+    // Normalise path
+    let normalized_path = normalize_path(parsed.path());
+    parsed.set_path(&normalized_path);
+
+    // Strip tracking params and sort remaining query params.
+    // Keep `Cow<str>` to avoid cloning until we build the final query string.
+    let mut pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> = parsed
+        .query_pairs()
+        .filter(|(k, _)| !is_tracking_param(k))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if pairs.is_empty() {
+        parsed.set_query(None);
+    } else {
+        let query_str = build_query_string(&pairs);
+        parsed.set_query(Some(&query_str));
     }
 }
 
@@ -75,45 +145,33 @@ fn normalize_path(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Strip Google text fragment identifiers (`#:~:text=...`) from a URL.
+#[must_use]
 pub fn strip_google_fragment(url: &str) -> String {
-    if let Some(pos) = url.find("#:~:text=") {
-        url[..pos].to_string()
-    } else {
-        url.to_string()
-    }
+    strip_suffix(url, "#:~:text=")
 }
 
 /// Strip all URL fragments (`#` and everything after).
+#[must_use]
 pub fn strip_all_fragments(url: &str) -> String {
-    if let Some(pos) = url.find('#') {
-        url[..pos].to_string()
-    } else {
-        url.to_string()
-    }
+    strip_suffix(url, "#")
 }
 
 /// Strip common tracking query parameters from a URL.
 ///
 /// This does **not** perform any other canonicalization (no lowercasing,
 /// no path normalisation, no fragment removal).
+#[must_use]
 pub fn strip_tracking_params(url: &str) -> String {
-    let mut parsed = match Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return url.to_string(),
+    let Some(mut parsed) = try_parse_url(url) else {
+        return url.to_string();
     };
 
-    let pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .filter(|(k, _)| !is_tracking_param(k))
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-
-    let query_str = if pairs.is_empty() {
-        None
+    let query_str = filter_and_build_query(&parsed);
+    if query_str.is_empty() {
+        parsed.set_query(None);
     } else {
-        Some(build_query_string(&pairs))
-    };
-    parsed.set_query(query_str.as_deref());
+        parsed.set_query(Some(&query_str));
+    }
 
     parsed.as_str().to_string()
 }
@@ -127,38 +185,13 @@ pub fn strip_tracking_params(url: &str) -> String {
 /// - Collapse `//` → `/` in path
 /// - Preserve fragment (for display)
 /// - Sort remaining query parameters alphabetically
+#[must_use]
 pub fn canonicalize_url(url: &str) -> String {
-    let mut parsed = match Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return url.to_string(),
+    let Some(mut parsed) = try_parse_url(url) else {
+        return url.to_string();
     };
 
-    // Lowercase host
-    if let Some(host) = parsed.host_str() {
-        let lower_host = host.to_lowercase();
-        // Note: set_host always succeeds because lower_host comes from the parsed URL's own host_str
-        let _ = parsed.set_host(Some(&lower_host));
-    }
-
-    // Normalise path
-    let normalized_path = normalize_path(parsed.path());
-    parsed.set_path(&normalized_path);
-
-    // Strip tracking params and sort remaining query params
-    let pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .filter(|(k, _)| !is_tracking_param(k))
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-
-    if pairs.is_empty() {
-        parsed.set_query(None);
-    } else {
-        let mut sorted = pairs;
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let query_str = build_query_string(&sorted);
-        parsed.set_query(Some(&query_str));
-    }
+    canonicalize_parsed_url(&mut parsed);
 
     // Fragment is preserved for display
     parsed.as_str().to_string()
@@ -169,6 +202,7 @@ pub fn canonicalize_url(url: &str) -> String {
 /// Like [`canonicalize_url`] but:
 /// - Fragment is **always** stripped
 /// - Google `#:~:text=...` fragments are stripped first
+#[must_use]
 pub fn dedup_key(url: &str) -> String {
     let url = strip_google_fragment(url);
     let url = strip_all_fragments(&url);
@@ -180,13 +214,17 @@ pub fn dedup_key(url: &str) -> String {
 /// Returns `true` when:
 /// - The path ends with `.pdf` (case-insensitive), **or**
 /// - It is an `arxiv.org/pdf/...` URL.
+#[must_use]
+#[allow(clippy::incompatible_msrv)]
 pub fn is_pdf_url(url: &str) -> bool {
-    let parsed = match Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return false,
+    let Some(parsed) = try_parse_url(url) else {
+        return false;
     };
 
-    if parsed.path().to_lowercase().ends_with(".pdf") {
+    let pdf_path = parsed.path();
+    if pdf_path.len() >= 4
+        && pdf_path[pdf_path.floor_char_boundary(pdf_path.len() - 4)..].eq_ignore_ascii_case(".pdf")
+    {
         return true;
     }
 
@@ -198,10 +236,10 @@ pub fn is_pdf_url(url: &str) -> bool {
 }
 
 /// Check if a URL looks like an arXiv abstract or PDF page.
+#[must_use]
 pub fn is_arxiv_url(url: &str) -> bool {
-    let parsed = match Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return false,
+    let Some(parsed) = try_parse_url(url) else {
+        return false;
     };
 
     if is_arxiv_host(parsed.host_str()) {
@@ -214,28 +252,16 @@ pub fn is_arxiv_url(url: &str) -> bool {
 
 /// Extract the registered domain (e.g. `"example.com"` from
 /// `"sub.example.com"`, or `"example.co.uk"` from `"sub.example.co.uk"`).
+///
+/// Uses the [Public Suffix List](https://publicsuffix.org/) via the `psl` crate,
+/// replacing a previously hardcoded and incomplete multi-part TLD table.
+///
+/// Returns `None` when the URL cannot be parsed or has no host.
+#[must_use]
 pub fn registered_domain(url: &str) -> Option<String> {
-    let parsed = Url::parse(url).ok()?;
+    let parsed = try_parse_url(url)?;
     let host = parsed.host_str()?;
-    let parts: Vec<&str> = host.split('.').collect();
-
-    if parts.len() < 2 {
-        return None;
-    }
-
-    // Check whether the final two parts form a known multi-part TLD.
-    let take_three = if parts.len() >= 3 {
-        let candidate = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
-        MULTI_PART_TLDS.contains(&candidate.as_str())
-    } else {
-        false
-    };
-
-    if take_three {
-        Some(parts[parts.len() - 3..].join("."))
-    } else {
-        Some(parts[parts.len() - 2..].join("."))
-    }
+    psl::domain_str(host).map(ToString::to_string)
 }
 
 // ---------------------------------------------------------------------------

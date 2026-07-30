@@ -1,10 +1,10 @@
 [package]
 name = "gthings-common"
-version = "0.3.6"
+version = "0.3.7"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Shared utilities for gthings: SHA-256 disk cache, config, tracing, agent telemetry"
+description = "Shared utilities for gthings: disk cache, config, tracing, agent telemetry"
 
 [dependencies]
 serde = { workspace = true }
@@ -12,9 +12,11 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 chrono = { workspace = true }
 base64 = "0.21"
 url = { workspace = true }
+psl = { workspace = true }
 
 tokio = { workspace = true }
 
