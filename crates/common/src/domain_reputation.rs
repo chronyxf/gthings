@@ -2,7 +2,7 @@
 //!
 //! Stores known-bad domains on disk so subsequent requests can short-circuit
 //! before opening a CDP tab. Uses the same atomic temp+rename write pattern
-//! as [`DiskCache`](crate::cache::DiskCache).
+//! as [`crate::atomic_write`].
 //!
 //! # Cache key format
 //!

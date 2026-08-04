@@ -1,14 +1,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-pub mod cache;
 pub mod domain_reputation;
 pub mod error;
 pub mod pagination;
 pub mod provenance;
 pub mod url_normalizer;
 
-pub use cache::DiskCache;
 pub use domain_reputation::{DomainRecord, DomainReputation, QualityFlag};
 pub use error::GthingsError;
 pub use pagination::{ExtractParams, Pagination};

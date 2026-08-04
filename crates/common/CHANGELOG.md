@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.8 (2026-08-04)
+
+### Fixes
+
+#### - refactor: remove DiskCache module (crates/common/src/cache.rs:1)
+
+- chore: update doc comment to reference atomic_write (crates/common/src/domain_reputation.rs:5)
+- refactor: remove cache module re-export from lib.rs (crates/common/src/lib.rs:1)
+
 ## 0.3.7 (2026-07-30)
 
 ### Fixes
