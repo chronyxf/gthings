@@ -82,14 +82,43 @@ pub async fn connect(ws_url: &str) -> Result<Connection> {
     Connection::connect(ws_url, None).await
 }
 
+/// Retry parameters for dismissing the macOS "Allow remote debugging?"
+/// dialog via `osascript`.
+///
+/// Worst-case dialog budget when the dialog never appears:
+/// `max_attempts × (osascript_timeout + inter_attempt_sleep)` =
+/// 1 × (1s + 1s) ≈ **2s**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DialogDismissParams {
+    /// Per-attempt timeout for a single `osascript` invocation.
+    pub(crate) osascript_timeout: Duration,
+    /// Maximum number of `osascript` dismiss attempts.
+    pub(crate) max_attempts: u32,
+    /// Sleep between attempts, giving the dialog time to appear.
+    pub(crate) inter_attempt_sleep: Duration,
+}
+
+impl DialogDismissParams {
+    /// Default parameters: 1 attempt, 1s `osascript` timeout, 1s sleep
+    /// between attempts — worst-case budget ≈ 1 × (1s + 1s) ≈ 2s.
+    pub(crate) const fn default_params() -> Self {
+        Self {
+            osascript_timeout: Duration::from_secs(1),
+            max_attempts: 1,
+            inter_attempt_sleep: Duration::from_secs(1),
+        }
+    }
+}
+
 /// Dismiss the macOS "Allow remote debugging connection?" dialog that appears
 /// as a **sheet** in Dia and other Chromium-based browsers when a CDP
 /// connection is first attempted.
 ///
 /// Uses `osascript`/System Events to detect the dialog sheet and click the
-/// "Allow" button. Polls every 500 ms for up to ~10 seconds (20 attempts)
-/// since the dialog may take 1–3 seconds to appear. Logs a warning if the
-/// dialog is never found — the WebSocket handshake may still proceed.
+/// "Allow" button. Runs at most [`DialogDismissParams::default_params`]
+/// attempts (1 × 1s timeout, 1s sleep between attempts — worst-case budget
+/// ≈ 2s) since the dialog may take 1–3 seconds to appear. Logs a warning if
+/// the dialog is never found — the WebSocket handshake may still proceed.
 #[cfg(target_os = "macos")]
 pub async fn dismiss_allow_debugging_dialog() {
     /// AppleScript that checks each known browser process for a sheet dialog
@@ -162,13 +191,12 @@ pub async fn dismiss_allow_debugging_dialog() {
         return browserName
     end tell"#;
 
-    const OSASCRIPT_TIMEOUT: Duration = Duration::from_secs(1);
-    const MAX_ATTEMPTS: u32 = 20;
+    let params = DialogDismissParams::default_params();
 
-    for attempt in 1..=MAX_ATTEMPTS {
+    for attempt in 1..=params.max_attempts {
         let script = SCRIPT.to_owned();
 
-        let result = tokio::time::timeout(OSASCRIPT_TIMEOUT, async {
+        let result = tokio::time::timeout(params.osascript_timeout, async {
             tokio::process::Command::new("osascript")
                 .args(["-e", &script])
                 .output()
@@ -192,19 +220,23 @@ pub async fn dismiss_allow_debugging_dialog() {
             }
             Err(_) => {
                 tracing::warn!(
-                    "osascript timed out after {OSASCRIPT_TIMEOUT:?} (attempt {attempt})"
+                    "osascript timed out after {:?} (attempt {attempt})",
+                    params.osascript_timeout
                 );
                 // Timeout dropped the future, which drops the Child process,
                 // killing the osascript process. Continue to next attempt.
             }
         }
 
-        if attempt < MAX_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        if attempt < params.max_attempts {
+            tokio::time::sleep(params.inter_attempt_sleep).await;
         }
     }
 
-    tracing::warn!("Remote debugging dialog not found after {MAX_ATTEMPTS} attempts — continuing");
+    tracing::warn!(
+        "Remote debugging dialog not found after {} attempts — continuing",
+        params.max_attempts
+    );
 }
 
 /// Non-macOS: no-op.
@@ -467,5 +499,27 @@ mod tests {
         );
         assert_eq!(parsed["browser"].as_str(), Some("Chrome"));
         assert_eq!(parsed["version"].as_str(), Some("130.0.0.0"));
+    }
+
+    #[test]
+    fn test_dialog_dismiss_params_defaults() {
+        let p = DialogDismissParams::default_params();
+        assert_eq!(
+            p.max_attempts, 1,
+            "max_attempts should be 1"
+        );
+        assert_eq!(
+            p.osascript_timeout,
+            Duration::from_secs(1),
+            "osascript_timeout should be 1s"
+        );
+        assert_eq!(
+            p.inter_attempt_sleep,
+            Duration::from_secs(1),
+            "inter_attempt_sleep should be 1s"
+        );
+        // Worst-case dialog budget ≈ 1 × (1s + 1s) ≈ 2s
+        let budget = u64::from(p.max_attempts) * (p.osascript_timeout + p.inter_attempt_sleep).as_secs();
+        assert_eq!(budget, 2, "worst-case dialog budget should be ~2s");
     }
 }

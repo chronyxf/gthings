@@ -10,7 +10,7 @@ pub use browser::{DetectedBrowser, connect, detect, dismiss_allow_debugging_dial
 pub use connection::{CdpEvent, Connection};
 pub use error::{CdpError, Result};
 pub use session::Session;
-pub use tab::Tab;
+pub use tab::{Tab, TabGuard};
 
 /// The `about:blank` URL constant used for background tab creation.
 pub const ABOUT_BLANK: &str = "about:blank";

@@ -27,7 +27,7 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Error message for WS connection timeouts.
 const WS_CONNECT_TIMEOUT_MSG: &str = "WebSocket connection timed out after 10s";
 
-/// Overall connection timeout (15 seconds).
+/// Overall connection timeout (30 seconds).
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounded channel capacity for CDP commands and events.
@@ -256,13 +256,25 @@ impl Connection {
         })
         .await
         .map_err(|_| CdpError::ConnectionFailed {
-            detail: "Connection timed out after 15s".into(),
+            detail: format!("Connection timed out after {}s", CONNECTION_TIMEOUT.as_secs()),
         })?
     }
 
-    /// Try a fast WebSocket connect with a short 3-second timeout. If it fails,
-    /// the macOS "Allow remote debugging?" dialog may be blocking — dismiss it
-    /// and retry the original (still in-flight) connection.
+    /// Connect to the CDP WebSocket endpoint, preferring a socket-first
+    /// strategy and only falling back to the macOS dialog dismissal.
+    ///
+    /// Strategy:
+    /// 1. **Socket/WebSocket first (3 × 3s)**: probe the DevTools WebSocket
+    ///    with a 3s timeout, up to 3 attempts, with a brief ~500ms sleep
+    ///    between probe failures. If any probe succeeds, the connection is
+    ///    established without ever running osascript.
+    /// 2. **osascript dismiss fallback (1 × 1s)**: only after all 3 probes
+    ///    fail, the macOS "Allow remote debugging?" dialog may be blocking
+    ///    the handshake — try to dismiss it, then do one more probe.
+    /// 3. **Post-osascript probe (1 × 3s)**: one final WebSocket probe in
+    ///    case the user clicked "Allow" during the osascript call.
+    /// 4. **Descriptive error**: if the final connection still fails, return
+    ///    a descriptive error instead of panicking.
     #[allow(clippy::type_complexity)]
     async fn connect_with_dialog(
         mut connect_fut: tokio::task::JoinHandle<
@@ -274,37 +286,74 @@ impl Connection {
                 CdpError,
             >,
         >,
-        ws_url: &str,
+        _ws_url: &str,
     ) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
-        // Try the WebSocket first with a short timeout. If it connects
-        // quickly, no dialog is blocking the handshake and we skip the
-        // expensive osascript call entirely — saving ~1.6s per connection.
-        match tokio::time::timeout(Duration::from_secs(3), &mut connect_fut).await {
-            Ok(Ok(Ok(pair))) => {
-                // Fast path — connected without osascript
-                Ok(pair.0)
-            }
-            _ => {
-                // First attempt failed or timed out; the browser debugging
-                // dialog may be blocking the WebSocket handshake. Dismiss
-                // it, then retry the original connection (still in flight).
-                #[cfg(target_os = "macos")]
-                {
-                    tokio::time::sleep(Duration::from_millis(600)).await;
-                    dismiss_allow_debugging_dialog().await;
-                }
+        // Socket-first: probe the DevTools WebSocket up to 3 times with a 3s
+        // timeout, sleeping ~500ms between failures. If the handshake
+        // completes quickly, no dialog is blocking it and we skip the
+        // expensive osascript call entirely.
+        const WS_PROBE_ATTEMPTS: u32 = 3;
+        const WS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+        const WS_PROBE_RETRY_SLEEP: Duration = Duration::from_millis(500);
 
-                let (ws_stream, _) = connect_fut
-                    .await
-                    .map_err(|e| CdpError::ConnectionFailed {
-                        detail: format!("task join: {e}"),
-                    })?
-                    .map_err(|e| CdpError::ConnectionFailed {
-                        detail: format!("WebSocket connect to {ws_url} failed: {e}"),
-                    })?;
-                Ok(ws_stream)
+        for attempt in 1..=WS_PROBE_ATTEMPTS {
+            match tokio::time::timeout(WS_PROBE_TIMEOUT, &mut connect_fut).await {
+                Ok(Ok(Ok(pair))) => {
+                    // Fast path — connected via WebSocket, no osascript needed
+                    tracing::debug!("connected via WebSocket probe (attempt {attempt})");
+                    return Ok(pair.0);
+                }
+                Ok(Ok(Err(e))) => {
+                    tracing::debug!("ws probe {attempt}/{WS_PROBE_ATTEMPTS} failed: {e}");
+                }
+                Ok(Err(_)) => {
+                    tracing::debug!(
+                        "ws probe {attempt}/{WS_PROBE_ATTEMPTS} timed out after {WS_PROBE_TIMEOUT:?}"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!("ws probe {attempt}/{WS_PROBE_ATTEMPTS} join error");
+                }
+            }
+
+            if attempt < WS_PROBE_ATTEMPTS {
+                tokio::time::sleep(WS_PROBE_RETRY_SLEEP).await;
             }
         }
+
+        // All probes failed; the browser debugging dialog may be blocking the
+        // WebSocket handshake. Try to dismiss it via osascript (best-effort).
+        #[cfg(target_os = "macos")]
+        {
+            dismiss_allow_debugging_dialog().await;
+        }
+
+        // One more probe in case the user clicked "Allow" during osascript.
+        match tokio::time::timeout(WS_PROBE_TIMEOUT, &mut connect_fut).await {
+            Ok(Ok(Ok(pair))) => {
+                tracing::debug!("connected via WebSocket probe after osascript dismiss");
+                return Ok(pair.0);
+            }
+            Ok(Ok(Err(e))) => {
+                tracing::debug!("post-osascript probe failed: {e}");
+            }
+            Ok(Err(_)) => {
+                tracing::debug!(
+                    "post-osascript probe timed out after {WS_PROBE_TIMEOUT:?}"
+                );
+            }
+            Err(_) => {
+                tracing::debug!("post-osascript probe join error");
+            }
+        }
+
+        // Final attempt — return a descriptive error on failure.
+        Err(CdpError::ConnectionFailed {
+            detail: format!(
+                "WebSocket connection failed after {WS_PROBE_ATTEMPTS} probes \
+                 and osascript dismiss attempt"
+            ),
+        })
     }
 
     /// Route an incoming JSON message: either a response (has "id") or an event (has "method").

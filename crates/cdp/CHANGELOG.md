@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.5 (2026-08-04)
+
+### Features
+
+#### - refactor: make dialog dismiss params configurable, reduce attempts (browser.rs:85)
+
+- refactor: socket-first connect strategy with ws probes before osascript fallback (connection.rs:259)
+- feat: export TabGuard (lib.rs:13)
+- feat: add RAII TabGuard that closes tab on drop incl. cancellation (tab.rs:203)
+
 ## 0.5.4 (2026-07-30)
 
 ### Fixes
