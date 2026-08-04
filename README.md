@@ -9,7 +9,7 @@ AI Agent → gthings CLI
                │
                ├── Persistent Dia/Chrome (port 9222)
                ├── Tab create → navigate → extract → tab close
-               └── --json output, --trace logging
+               └── --json output
 ```
 
 ## Install
@@ -64,9 +64,7 @@ Requires Rust 1.85+ and a Chromium-based browser (Dia, Chrome, Brave, Edge).
 ./target/release/gthings update
 ```
 
-Add `--trace /tmp/trace.jsonl` to every command for step-level debugging.
-
-All commands accept `--output text|json|nd-json` (or legacy `--json`) and `--query <JMESPath>` for field filtering.
+All commands accept `--output text|json|nd-json` (or legacy `--json`) and `--query <dot-notation>` for field filtering (a custom dot-notation subset, e.g. `.data`, `.[].url`, `.results[].snippet` — not full JMESPath).
 
 ## For AI Agents
 
@@ -87,9 +85,9 @@ Then agents load it via `skill gthings`. The skill provides:
 
 | Command | Description | JSON Output |
 |---------|-------------|-------------|
-| `search <q> --strategy simple` | Google search | `[{title, url, snippet, position}]` |
-| `search <q1> <q2> --strategy parallel` | Multi-query parallel search | `{queries: [{query, results}]}` |
-| `search <q1>... --strategy harvest --follow-top M` | Search + follow pipeline | `{results[], summary}` |
+| `search <q> --strategy simple` | Google search | `{"results": [...], "query": "..."}` |
+| `search <q1> <q2> --strategy parallel` | Multi-query parallel search | `{"results": [...]}` |
+| `search <q1>... --strategy harvest --follow-top M` | Search + follow pipeline | `{"results": [...], "summary": {...}}` |
 | `extract <url>` | HTTP/Readability extraction (auto-detects PDF, arXiv, GitHub) | `{title, body, quality, provenance}` |
 | `ax <url>` | Accessibility tree | `{tree, url, total_nodes, truncated}` |
 | `pdf-url <url>` | PDF from URL | `{Pdf:{pages, text}, quality}` |
@@ -97,4 +95,40 @@ Then agents load it via `skill gthings`. The skill provides:
 | `status` | Browser connection check | `{browser, status, version}` |
 | `update` | Update gthings to latest version | version info |
 
-All commands support `--output text|json|nd-json` (or `--json` for JSON output), `--query <JMESPath>` for field filtering, and `--trace <file>` for step-level JSONL logging.
+All commands support `--output text|json|nd-json` (or `--json` for JSON output) and `--query <dot-notation>` for field filtering (a custom dot-notation subset, not JMESPath).
+
+## Output Envelope
+
+Every command emits a `{status, data, error}` envelope so agents have one parse path regardless of success or failure:
+
+```json
+{
+  "status": "ok" | "error",
+  "data": <command-specific result>,
+  "error": {
+    "code": "ERROR_CODE",
+    "detail": "human-readable detail",
+    "hint": "recovery hint"
+  }
+}
+```
+
+On success `status` is `"ok"` and `error` is `null`; on failure `status` is `"error"` and `data` is `null`. Use `--query .data` to unwrap the payload.
+
+## Search Operators
+
+Queries support standard search operators (rewritten per-engine; unsupported operators are stripped rather than failing):
+
+| Operator | Example | Meaning |
+|----------|---------|---------|
+| `site:` | `rust site:github.com` | Restrict to a domain |
+| `-exclusion` | `rust -tutorial` | Exclude a term |
+| `"quoted"` | `"borrow checker"` | Exact phrase |
+| `filetype:` | `rust filetype:pdf` | Restrict to a file type |
+| `intitle:` | `intitle:async rust` | Term in page title |
+| `inurl:` | `inurl:docs rust` | Term in URL |
+| `AROUND(n)` | `docker AROUND(3) compose` | Terms within n words |
+| `before:` / `after:` | `rust after:2024` | Date range filter |
+| `OR` / `AND`, `(...)` | `(docker OR podman) compose` | Boolean grouping |
+
+`--engine auto|brave|bing|google` selects the search engine. Brave and Bing are plain-HTTP (no browser needed); Google requires a CDP browser; `auto` degrades to HTTP engines when no browser is available.

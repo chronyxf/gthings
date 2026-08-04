@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-SKILL_SOURCE="$(cd "$(dirname "$0")/../skills/gthings" && pwd)"
+SKILL_SOURCE="$(cd "$(dirname "$0")/../crates/cli/resources/skills/agents/gthings" && pwd)"
 PREFIX="${1:-$HOME/.agents}"
 SKILL_DEST="$PREFIX/skills/gthings"
 

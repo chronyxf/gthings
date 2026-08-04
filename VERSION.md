@@ -86,8 +86,8 @@ gthings-cdp: patch
 ```
 
 Rules:
-- First line after `---` must be `"<package>": <bump>`
-- Package names with hyphens MUST be quoted.
+- First line after `---` must be `<package>: <bump>`
+- Package names MUST be unquoted (e.g. `gthings-common: patch`, not `"gthings-common"`). Quoting the name makes knope treat it as a literal quoted string that won't match the `[packages]` key in `knope.toml`, so the changeset is ignored.
 - Body bullets must match Step 1 exactly (paste them).
 - File name: `<crate-shortname>-<kebab-description>.md` (e.g. `cdp-session-id-filter.md`).
 
