@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.4 (2026-08-04)
+
+### Features
+
+#### - refactor: delegate domain-authority lookup to single source (extractor.rs:154)
+
+- refactor: move detection patterns out of detection.rs into validate.rs (detection.rs:1)
+- refactor: fold entropy metric into quality/mod.rs (entropy.rs:1)
+- refactor: consolidate shared types and entropy into quality/mod.rs (mod.rs:1)
+- refactor: fold types.rs definitions into quality/mod.rs (types.rs:1)
+- feat: add empty-shell band, nav-dense, and boilerplate detection (validate.rs:11)
+
 ## 0.5.3 (2026-07-30)
 
 ### Fixes

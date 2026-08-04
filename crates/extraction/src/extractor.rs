@@ -151,9 +151,9 @@ fn authority_for_domain(domain: &str) -> f64 {
 
 /// Compute a domain authority score (0.0-1.0) based on recognized domains.
 ///
-/// Extracts the hostname from a URL and looks up its authority in a curated
-/// list of academic, technical, news, and government domains. Unknown domains
-/// default to 0.5. The score helps AI agents assess source trustworthiness.
+/// Extracts the hostname from a URL and delegates to [`domain_authority`] for
+/// the lookup, so there is a single authority source. Unknown domains default
+/// to 0.5. The score helps AI agents assess source trustworthiness.
 ///
 /// This function is public so that other crates (e.g. search, dispatch) can
 /// reuse the same domain authority logic without duplicating the lookup.
@@ -166,7 +166,7 @@ pub fn compute_domain_authority(url: &str) -> f64 {
             .unwrap_or("")
             .to_lowercase()
     });
-    authority_for_domain(&domain)
+    domain_authority(&domain) as f64
 }
 
 #[cfg(test)]
