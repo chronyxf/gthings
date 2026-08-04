@@ -50,7 +50,7 @@ jobs:
           set -euo pipefail
           # cargo package --workspace is not supported on stable; verify each crate.
           for crate in crates/*/; do
-            name=$(basename "$crate")
-            echo "Verifying package: $name"
-            cargo package -p "$name" --list > /dev/null
+            pkg=$(grep -m1 '^name' "$crate/Cargo.toml" | sed 's/name *= *"\(.*\)"/\1/')
+            echo "Verifying package: $pkg"
+            cargo package -p "$pkg" --list > /dev/null
           done
