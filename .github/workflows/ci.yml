@@ -33,30 +33,6 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  changeset:
-    name: changeset enforcement
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Require changeset when crates change
-        run: |
-          set -euo pipefail
-          # Files changed under crates/ relative to the PR base.
-          changed=$(git diff --name-only origin/main...HEAD -- crates/ || true)
-          if [ -n "$changed" ]; then
-            if ! compgen -G ".changeset/*.md" > /dev/null; then
-              echo "::error::Crates changed but no .changeset/*.md file found. Add a changeset for this PR."
-              exit 1
-            fi
-            echo "Crates changed; changeset present."
-          else
-            echo "No crates changed; changeset not required."
-          fi
-
   package:
     name: package verification
     runs-on: ubuntu-latest

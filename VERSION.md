@@ -71,39 +71,9 @@ Types:
 | `minor` | any feat             | Add CAPTCHA/Sorry page detection            |
 | `major` | breaking API change  | Rename `Browser::new()` to `Browser::launch`|
 
-### Step 3 — Changeset
+### Step 3 — knope derives version + changelog from Conventional Commits
 
-Create `.changeset/<crate>-<desc>.md` with YAML frontmatter.
-
-Use the helper script (recommended):
-
-```bash
-bash scripts/create-changeset.sh <package> <bump> "<description>" <type>
-# e.g.
-bash scripts/create-changeset.sh gthings-cdp patch "add session_id filter to lifecycle event predicate" fix
-```
-
-Or create it manually. Format (knope 0.23):
-
-```
----
-gthings-cdp: patch
----
-
-- fix: add session_id filter to lifecycle event predicate
-```
-
-Rules:
-- First line after `---` must be `<package>: <bump>`
-- Package names MUST be unquoted (e.g. `gthings-common: patch`, not `"gthings-common"`). Quoting the name makes knope treat it as a literal quoted string that won't match the `[packages]` key in `knope.toml`, so the changeset is ignored.
-- Body bullets must match Step 1 exactly (paste them).
-- File name: `<crate-shortname>-<kebab-description>.md` (e.g. `cdp-session-id-filter.md`).
-
-Validate/list the pending changesets:
-
-```bash
-bash scripts/consume-changesets.sh
-```
+Version bumps and the CHANGELOG are derived by knope directly from the Conventional Commits commit message (with crate scope). There is no changeset file. The commit message IS the change record.
 
 ### Step 4 — knope release
 
@@ -111,18 +81,17 @@ bash scripts/consume-changesets.sh
 knope release
 ```
 
-- If it succeeds: Cargo.toml bumped, CHANGELOG.md updated, changeset deleted.
+- If it succeeds: Cargo.toml bumped, CHANGELOG.md updated.
 - If it fails: try once more. If it fails twice, fall back to manual:
   1. Edit `crates/<crate>/Cargo.toml` — bump `version` field.
   2. Edit `crates/<crate>/CHANGELOG.md` — add entry under `## [new-version]`.
-  3. Delete the changeset file manually.
 
 ### Step 5 — Commit (one line only)
 
 Use Conventional Commits with a crate-name scope. The scope is the crate's short name (e.g. `gthings-cdp`, `gthings-common`).
 
 ```bash
-git add crates/<crate>/ CHANGELOG.md Cargo.toml Cargo.lock .changeset/
+git add crates/<crate>/ CHANGELOG.md Cargo.toml Cargo.lock
 git commit -m "feat(gthings-cdp): add session_id filter to lifecycle event predicate"
 ```
 
@@ -172,8 +141,6 @@ cargo publish -p <package>
 [ ] git diff --stat -- crates/<crate>/
 [ ] Write bullet points from diff (read output, do not guess)
 [ ] Bump type: patch | minor | major
-[ ] Create .changeset/<crate>-<desc>.md with YAML frontmatter (or bash scripts/create-changeset.sh)
-[ ] Validate changesets: bash scripts/consume-changesets.sh
 [ ] knope release (or manual fallback after 2 failures)
 [ ] git commit -m "type(crate): description"  (must pass pre-commit hook)
 [ ] git status --short                         (must be clean)

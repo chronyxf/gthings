@@ -1,6 +1,3 @@
-[changes]
-ignore_conventional_commits = true
-
 [packages.gthings-common]
 versioned_files = ["crates/common/Cargo.toml", "Cargo.lock"]
 changelog = "crates/common/CHANGELOG.md"
@@ -41,9 +38,3 @@ name = "release"
 
 [[workflows.steps]]
 type = "Release"
-
-[[workflows]]
-name = "document-change"
-
-[[workflows.steps]]
-type = "CreateChangeFile"

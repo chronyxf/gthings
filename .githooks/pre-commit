@@ -2,12 +2,10 @@
 # Pre-commit hook enforcing VERSION.md workflow
 set -euo pipefail
 
-CHANGESETS_DIR=".changeset"
-
-# Detect changes that require a changeset
+# Detect code changes that trigger pre-commit checks
 STAGED_FILES=$(git diff --cached --name-only)
 
-# Files that trigger changeset requirement
+# Files that trigger pre-commit checks
 CODE_PATTERNS=('\.rs$' 'Cargo\.toml' 'Cargo\.lock' '^crates/')
 needs_changeset=0
 for file in $STAGED_FILES; do
@@ -52,34 +50,6 @@ cargo_toml_changes=$(echo "$STAGED_FILES" | grep -c 'Cargo\.toml' || true)
 changelog_changes=$(echo "$STAGED_FILES" | grep -c 'CHANGELOG\.md' || true)
 if [ "$rs_changes" = "0" ] && [ "$cargo_toml_changes" -ge "1" ] && [ "$changelog_changes" -ge "1" ]; then
     exit 0
-fi
-
-# Check for changesets
-if [ "$needs_changeset" = "1" ]; then
-    has_changeset=0
-    if ls "$CHANGESETS_DIR"/*.md >/dev/null 2>&1; then
-        has_changeset=1
-    fi
-
-    if [ "$has_changeset" = "0" ]; then
-        echo ""
-        echo "[FAIL] Commit contains code changes but no changeset found in .changeset/"
-        echo ""
-        echo "Follow the VERSION.md workflow:"
-        echo ""
-        echo "  1. Create a changeset:"
-        echo "     bash scripts/create-changeset.sh"
-        echo "     OR manually create .changeset/<name>.md"
-        echo ""
-        echo "  2. Run consume script:"
-        echo "     bash scripts/consume-changesets.sh"
-        echo ""
-        echo "  3. Stage and commit:"
-        echo "     git add -A"
-        echo "     git commit ..."
-        echo ""
-        exit 1
-    fi
 fi
 
 exit 0
