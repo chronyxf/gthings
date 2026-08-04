@@ -4,11 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
-use gthings_cdp::{CdpError, Session};
+use gthings_cdp::{CdpError, Session, TabGuard};
 use gthings_common::domain_reputation::DomainReputation;
 use gthings_common::pagination::ExtractParams;
-use gthings_common::provenance::{ExtractionMethod, Provenance};
+use gthings_common::provenance::Provenance;
 use gthings_common::url_normalizer::{
     canonicalize_url, dedup_key, is_arxiv_url, is_pdf_url, registered_domain,
 };
@@ -16,9 +15,10 @@ use gthings_extraction::article::QualityScore;
 use tokio::task::JoinSet;
 
 use crate::SearchResult;
-use crate::follow::TimedSearchOutcome;
+use crate::engine::router::{SearchRouter, map_engine_results};
+use crate::engine::EngineChoice;
 
-use super::quality::{compute_quality, extract_sections};
+use super::quality::{compute_quality_with_flags, extract_sections, is_nav_heavy};
 use super::ranking::{dedup_results, rank_results};
 use super::types::*;
 
@@ -36,12 +36,17 @@ fn classify_body_status(fr: &crate::follow::FollowResult, quality: &QualityScore
         BodyStatus::ChromeOrEmpty
     } else if !fr.error.is_empty() {
         BodyStatus::ExtractFailed
-    } else if quality.score < 0.3
+    } else if !quality.is_ok
         && quality
             .reasons
             .iter()
             .any(|r| r.contains("too_short") || r.contains("nav") || r.contains("chrome"))
+        && is_nav_heavy(&fr.content)
     {
+        // Only drop as ChromeOrEmpty when the content is genuinely pure
+        // navigation chrome. Dense/repetitive raw prose is never nav-heavy,
+        // so it is always kept even if it carries some boilerplate or low
+        // entropy.
         BodyStatus::ChromeOrEmpty
     } else if !quality.is_ok
         && quality
@@ -59,36 +64,78 @@ fn classify_body_status(fr: &crate::follow::FollowResult, quality: &QualityScore
 // Phase 1: Parallel search
 // ---------------------------------------------------------------------------
 
-/// Execute all search queries in parallel using a [`JoinSet`], one tab per query.
+/// Execute all search queries in parallel using a [`JoinSet`] and the shared
+/// [`SearchRouter`].
 ///
-/// Each task creates a tab, runs [`crate::search::search`] with a 30-second
-/// per-task timeout, and always closes the tab on every exit path (success,
-/// timeout, error). Timeouts produce empty result vectors for that query.
+/// The router is built once per call (with the shared session) and cloned into
+/// each task. Every task runs [`SearchRouter::search_with_fallback`] with a
+/// 30-second per-task timeout. Timeouts and per-query engine failures degrade
+/// gracefully to empty result vectors for that query, so one failing engine
+/// never kills the harvest.
 async fn phase_search(
     session: Arc<Session>,
-    queries: &[String],
+    req: &BatchHarvestRequest,
 ) -> Result<Vec<(String, SearchResult)>, CdpError> {
+    // Build the router once per phase_search call and derive the engine choice.
+    let router = Arc::new(SearchRouter::new(Some(Arc::clone(&session))));
+    let choice = match req.engine {
+        Some(e) => EngineChoice::Pin(e),
+        None => EngineChoice::Auto,
+    };
+
     let mut search_join_set: JoinSet<Result<(String, Vec<SearchResult>), CdpError>> =
         JoinSet::new();
     let count = 10;
     let search_timeout = Duration::from_secs(30);
 
-    tracing::info!("harvest search: spawning {} parallel tabs", queries.len());
+    // Cap the number of in-flight searches so queries dispatch in waves rather
+    // than all at once. With in-memory pacing and Brave's 60s interval, only a
+    // few queries can dispatch per window; a semaphore lets the rest queue and
+    // run as permits free up instead of all failing at once.
+    let search_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
 
-    for query in queries {
-        let session = Arc::clone(&session);
+    tracing::info!("harvest search: spawning {} parallel queries", req.queries.len());
+
+    for query in &req.queries {
+        let router = Arc::clone(&router);
         let query = query.clone();
+        let semaphore = Arc::clone(&search_semaphore);
 
         search_join_set.spawn(async move {
-            // Use shared helper: create tab → timed search → close tab
-            match crate::follow::search_with_tab(&session, &query, count, search_timeout).await {
-                Ok(TimedSearchOutcome::Success(results)) => Ok((query, results)),
-                Ok(TimedSearchOutcome::Error(e)) => Err(e),
-                Ok(TimedSearchOutcome::Timeout) => {
+            // Acquire a permit before dispatching; released when the task ends.
+            // Bound the wait so queued tasks give up rather than waiting
+            // unboundedly behind the 4-permit cap.
+            let _permit = match tokio::time::timeout(search_timeout, semaphore.acquire()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    tracing::warn!("search semaphore closed for query: {query}");
+                    return Ok((query, Vec::new()));
+                }
+                Err(_) => {
+                    tracing::warn!("search semaphore acquire timed out for query: {query}");
+                    return Ok((query, Vec::new()));
+                }
+            };
+            let started = std::time::Instant::now();
+            match tokio::time::timeout(
+                search_timeout,
+                router.search_with_fallback(&query, count, choice),
+            )
+            .await
+            {
+                Ok(Ok(engine_results)) => {
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    let results = map_engine_results(engine_results, &query, duration_ms);
+                    Ok((query, results))
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("phase_search: query {query:?} failed: {e}");
+                    Ok((query, Vec::new()))
+                }
+                Err(_) => {
                     tracing::warn!("harvest search timed out for query: {query}");
                     Ok((query, Vec::new()))
                 }
-                Err(e) => Err(e),
             }
         });
     }
@@ -130,7 +177,31 @@ pub(crate) fn is_junk_url(url: &str) -> bool {
     {
         return true;
     }
+    // Generic sign-in / login / auth URLs
+    if lower.contains("/signin")
+        || lower.contains("/sign-in")
+        || lower.contains("/login")
+        || lower.contains("/log-in")
+        || lower.contains("/auth/")
+        || lower.contains("/auth?")
+        || lower.ends_with("/auth")
+    {
+        return true;
+    }
     false
+}
+
+/// Junk title patterns to exclude from follow (sign-in / login prompts).
+pub(crate) fn is_junk_title(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    lower.contains("sign in to continue")
+        || lower.contains("log in to continue")
+        || lower.contains("sign in to read")
+        || lower.contains("log in to read")
+        || lower.contains("please sign in")
+        || lower.contains("please log in")
+        || lower.contains("sign in required")
+        || lower.contains("log in required")
 }
 
 // ---------------------------------------------------------------------------
@@ -142,33 +213,45 @@ pub(crate) fn is_junk_url(url: &str) -> bool {
 /// 2. Per-query minimum — try include ≥1 hit from each query
 /// 3. Per-canonical-host cap — max 2 follows per registered domain
 /// 4. Remove known junk (google.com/accounts/*, google.com/support/*, etc.)
+///
+/// Returns the selected candidates together with the set of registered domains
+/// among them (computed in the same pass, so callers need not recompute).
 fn select_follow_candidates(
     ranked: Vec<(String, SearchResult)>,
     max: usize,
-) -> Vec<(String, SearchResult)> {
+) -> (Vec<(String, SearchResult)>, HashSet<String>) {
     if max == 0 || ranked.is_empty() {
-        return Vec::new();
+        return (Vec::new(), HashSet::new());
     }
 
     // Stage 1: dedup on dedup_key() and remove known junk
     let mut seen_key = HashSet::new();
     let deduped: Vec<(String, SearchResult)> = ranked
         .into_iter()
-        .filter(|(_, r)| !is_junk_url(&r.url) && seen_key.insert(dedup_key(&r.url)))
+        .filter(|(_, r)| {
+            !is_junk_url(&r.url) && !is_junk_title(&r.title) && seen_key.insert(dedup_key(&r.url))
+        })
         .collect();
 
     if max >= deduped.len() {
-        return deduped;
+        let domains = deduped
+            .iter()
+            .filter_map(|(_, r)| registered_domain(&r.url))
+            .collect();
+        return (deduped, domains);
     }
 
-    // Stage 2: group by query for diversity picking
-    let mut by_query: HashMap<String, Vec<(String, SearchResult)>> = HashMap::new();
-    for item in deduped {
-        by_query.entry(item.0.clone()).or_default().push(item);
+    // Stage 2: group by query for diversity picking. Each item carries its
+    // registered domain precomputed ONCE so we never recompute it per pick.
+    let mut by_query: HashMap<String, Vec<(String, SearchResult, String)>> = HashMap::new();
+    for (q, r) in deduped {
+        let domain = registered_domain(&r.url).unwrap_or_default();
+        by_query.entry(q.clone()).or_default().push((q, r, domain));
     }
     let query_keys: Vec<String> = by_query.keys().cloned().collect();
 
     let mut selected: Vec<(String, SearchResult)> = Vec::with_capacity(max);
+    let mut selected_domains: HashSet<String> = HashSet::new();
     let mut domain_count: HashMap<String, usize> = HashMap::new();
 
     // First pass: round-robin — pick one per query respecting domain cap
@@ -180,8 +263,9 @@ fn select_follow_candidates(
                 break;
             }
             if let Some(items) = by_query.get_mut(qk) {
-                if let Some(item) = pick_one(items, &mut domain_count) {
-                    selected.push(item);
+                if let Some((q, r, domain)) = pick_one(items, &mut domain_count) {
+                    selected_domains.insert(domain);
+                    selected.push((q, r));
                     any_picked = true;
                 }
             }
@@ -194,31 +278,31 @@ fn select_follow_candidates(
             break;
         }
         if let Some(items) = by_query.get_mut(qk) {
-            while let Some(item) = pick_one(items, &mut domain_count) {
+            while let Some((q, r, domain)) = pick_one(items, &mut domain_count) {
                 if selected.len() >= max {
                     break;
                 }
-                selected.push(item);
+                selected_domains.insert(domain);
+                selected.push((q, r));
             }
         }
     }
 
-    selected
+    (selected, selected_domains)
 }
 
 /// Pick one item from `items` whose domain is under the per-domain cap.
-/// Returns `None` if no eligible item remains.
+/// Returns `None` if no eligible item remains. Uses `swap_remove` to avoid the
+/// O(n) shift of `remove(pos)`.
 fn pick_one(
-    items: &mut Vec<(String, SearchResult)>,
+    items: &mut Vec<(String, SearchResult, String)>,
     domain_count: &mut HashMap<String, usize>,
-) -> Option<(String, SearchResult)> {
-    let pos = items.iter().position(|(_, r)| {
-        let domain = registered_domain(&r.url).unwrap_or_default();
-        *domain_count.get(&domain).unwrap_or(&0) < 2
-    })?;
-    let item = items.remove(pos);
-    let domain = registered_domain(&item.1.url).unwrap_or_default();
-    *domain_count.entry(domain).or_insert(0) += 1;
+) -> Option<(String, SearchResult, String)> {
+    let pos = items
+        .iter()
+        .position(|(_, _, domain)| *domain_count.get(domain).unwrap_or(&0) < 2)?;
+    let item = items.swap_remove(pos);
+    *domain_count.entry(item.2.clone()).or_insert(0) += 1;
     Some(item)
 }
 
@@ -258,14 +342,7 @@ fn make_error_result(
     HarvestedResult {
         search_result,
         followed_content: None,
-        provenance: Provenance {
-            source_url: url,
-            method: ExtractionMethod::Follow,
-            agent: gthings_common::GTHINGS_AGENT.into(),
-            accessed_at: Utc::now(),
-            duration_ms: 0,
-            derived_from: None,
-        },
+        provenance: crate::follow::error_provenance(&url, 0),
         pagination: None,
         quality: Some(QualityScore {
             score: 0.0,
@@ -304,6 +381,9 @@ async fn phase_follow(
     let mut harvested: Vec<HarvestedResult> = Vec::with_capacity(ranked.len());
     let follow_count = follow_top_n.min(ranked.len());
     let mut follow_join_set: JoinSet<(usize, HarvestedResult)> = JoinSet::new();
+
+    // Cap concurrent CDP tabs so they open in waves rather than all at once.
+    let follow_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
 
     if follow_count > 0 {
         tracing::info!("harvest follow: spawning {follow_count} parallel tabs");
@@ -344,8 +424,39 @@ async fn phase_follow(
             let params = params.clone();
             let rep = rep_outer.clone();
             let q_task = q;
+            let semaphore = Arc::clone(&follow_semaphore);
 
             follow_join_set.spawn(async move {
+                // Acquire a permit before opening a tab; released when the task ends.
+                // Bound the wait so queued tasks give up rather than waiting
+                // unboundedly behind the 4-permit cap.
+                let _permit = match tokio::time::timeout(Duration::from_secs(30), semaphore.acquire()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        return (
+                            idx,
+                            make_error_result(
+                                search_result,
+                                url,
+                                url_canonical,
+                                q_task,
+                                "follow semaphore closed",
+                            ),
+                        );
+                    }
+                    Err(_) => {
+                        return (
+                            idx,
+                            make_error_result(
+                                search_result,
+                                url,
+                                url_canonical,
+                                q_task,
+                                "follow semaphore acquire timed out",
+                            ),
+                        );
+                    }
+                };
                 let tab = match session.create_background_tab().await {
                     Ok(t) => t,
                     Err(e) => {
@@ -362,15 +473,15 @@ async fn phase_follow(
                     }
                 };
 
+                // RAII guard: closes the tab on ALL exit paths, including task
+                // cancellation/abort. The guard drops when the task ends.
+                let _guard = TabGuard::new(&session, tab.clone());
+
                 let result = tokio::time::timeout(
                     Duration::from_secs(30),
                     crate::follow::follow(&session, &tab, &url, params, rep.as_deref()),
                 )
                 .await;
-
-                if let Err(e) = session.close_tab(tab).await {
-                    tracing::warn!("failed to close tab: {e}");
-                }
 
                 let harvest_result = match result {
                     Ok(Ok(fr)) => {
@@ -379,7 +490,7 @@ async fn phase_follow(
                             gthings_common::provenance::ExtractionMethod::Pdf
                                 | gthings_common::provenance::ExtractionMethod::Arxiv
                         );
-                        let quality = compute_quality(&fr.content, skip_len);
+                        let quality = compute_quality_with_flags(&fr.content, skip_len, &fr.quality_flags);
                         let sections = extract_sections(&fr.content);
                         let body_status = classify_body_status(&fr, &quality);
                         HarvestedResult {
@@ -453,7 +564,8 @@ fn empty_summary(total_queries: usize) -> HarvestRunSummary {
 
 /// Run the full research pipeline: search → dedup → rank → follow.
 ///
-/// 1. **Search** — Runs all queries in parallel using [`JoinSet`], one tab per query.
+/// 1. **Search** — Runs all queries in parallel using [`JoinSet`] through the
+///    multi-engine [`SearchRouter`] (auto fallback or pinned engine).
 /// 2. **Dedup** — Removes duplicate normalized URLs, keeping first occurrence.
 /// 3. **Rank** — Orders results by the chosen [`RankStrategy`].
 /// 4. **Follow** — Follows the top `follow_top_n` results in parallel using [`JoinSet`].
@@ -468,7 +580,7 @@ pub async fn harvest(
     req: BatchHarvestRequest,
 ) -> Result<(Vec<HarvestedResult>, HarvestRunSummary), CdpError> {
     // Phase 1: Parallel search
-    let raw = phase_search(Arc::clone(&session), &req.queries).await?;
+    let raw = phase_search(Arc::clone(&session), &req).await?;
 
     if raw.is_empty() {
         let empty_summary = empty_summary(req.queries.len());
@@ -480,15 +592,9 @@ pub async fn harvest(
     let ranked = rank_results(deduped, &req.rank_by);
 
     // Phase 2b: Select follow candidates with diversity
-    let selected = select_follow_candidates(ranked, req.follow_top_n);
+    let (selected, domains_selected) = select_follow_candidates(ranked, req.follow_top_n);
 
     // Check if all selected candidates come from the same domain
-    let mut domains_selected: HashSet<String> = HashSet::new();
-    for (_, r) in &selected {
-        if let Some(d) = registered_domain(&r.url) {
-            domains_selected.insert(d);
-        }
-    }
     let mut warnings: Vec<HarvestWarning> = Vec::new();
     if domains_selected.len() <= 1 && selected.len() > 1 {
         warnings.push(HarvestWarning::FollowBudgetCollapsedToOneSite);
@@ -562,6 +668,7 @@ pub async fn harvest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FollowResult;
     use crate::SearchResult;
     use chrono::Utc;
     use gthings_common::provenance::{ExtractionMethod, Provenance};
@@ -581,7 +688,8 @@ mod tests {
                 duration_ms: 100,
                 derived_from: None,
             },
-            domain_authority: authority,
+            domain_authority: authority as f64,
+            source_type: "web".into(),
         }
     }
 
@@ -605,7 +713,8 @@ mod tests {
                 duration_ms: 100,
                 derived_from: None,
             },
-            domain_authority: authority,
+            domain_authority: authority as f64,
+            source_type: "web".into(),
         }
     }
 
@@ -707,10 +816,76 @@ mod tests {
         assert_eq!(urls.len(), 9, "all 9 URLs must be distinct");
     }
 
+    #[tokio::test]
+    async fn test_search_semaphore_caps_concurrency_at_four() {
+        // Mirrors the phase_search concurrency cap: a 4-permit semaphore must
+        // limit in-flight searches to 4 even when many tasks are spawned.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let tasks = 12;
+        let mut join_set: JoinSet<usize> = JoinSet::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for _ in 0..tasks {
+            let semaphore = Arc::clone(&semaphore);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            join_set.spawn(async move {
+                let _permit = semaphore.acquire().await.expect("semaphore closed");
+                let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                // Simulate a search taking some time.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                1
+            });
+        }
+
+        let mut total = 0;
+        while let Some(res) = join_set.join_next().await {
+            total += res.expect("task should not panic");
+        }
+        assert_eq!(total, tasks, "all tasks must complete");
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "concurrency must never exceed the 4-permit cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_semaphore_acquire_times_out() {
+        // Mirrors the phase_search acquire-timeout degradation: when a task
+        // cannot obtain a permit within the bounded window, it must give up and
+        // degrade to an empty result instead of waiting unboundedly.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        // Hold the only permit so queued tasks cannot acquire.
+        let _held = semaphore.clone().acquire_owned().await.unwrap();
+        let acquire_timeout = Duration::from_millis(20);
+
+        let mut join_set: JoinSet<Vec<String>> = JoinSet::new();
+        for _ in 0..3 {
+            let semaphore = Arc::clone(&semaphore);
+            join_set.spawn(async move {
+                match tokio::time::timeout(acquire_timeout, semaphore.acquire()).await {
+                    Ok(Ok(_permit)) => vec!["acquired".to_string()],
+                    Ok(Err(_)) | Err(_) => Vec::new(), // degrade to empty
+                }
+            });
+        }
+
+        let mut total = 0;
+        while let Some(res) = join_set.join_next().await {
+            total += res.expect("task should not panic").len();
+        }
+        assert_eq!(
+            total, 0,
+            "all queued tasks should time out and degrade to empty results"
+        );
+    }
+
     #[test]
-    fn test_follow_failure_preserves_search_hits() {
-        let sr = make_result("https://example.com/page", 1, "snippet", 0.5);
-        let provenance = sr.provenance.clone();
+    fn test_follow_failure_preserves_search_hits() {        let sr = make_result("https://example.com/page", 1, "snippet", 0.5);        let provenance = sr.provenance.clone();
 
         // Simulate a followed result (success)
         let success = HarvestedResult {
@@ -781,7 +956,7 @@ mod tests {
                 make_result("https://example.com/page#section1", 3, "s3", 0.5),
             ),
         ];
-        let selected = select_follow_candidates(results, 10);
+        let (selected, _) = select_follow_candidates(results, 10);
         assert_eq!(
             selected.len(),
             1,
@@ -823,7 +998,7 @@ mod tests {
             ),
             ("q3".into(), make_result("https://iota.com/c", 3, "s9", 0.5)),
         ];
-        let selected = select_follow_candidates(results, 4);
+        let (selected, _) = select_follow_candidates(results, 4);
         let queries: HashSet<&str> = selected.iter().map(|(q, _)| q.as_str()).collect();
         assert!(
             queries.contains("q1"),
@@ -875,7 +1050,7 @@ mod tests {
             ),
         ];
         // Use max=3 — less than deduped count (6), so domain cap logic activates
-        let selected = select_follow_candidates(results, 3);
+        let (selected, _) = select_follow_candidates(results, 3);
         assert!(
             selected.len() <= 2,
             "at most 2 results from same domain (domain cap), got {}",
@@ -904,7 +1079,7 @@ mod tests {
                 make_result("https://example.com/real-content", 4, "s4", 0.5),
             ),
         ];
-        let selected = select_follow_candidates(results, 10);
+        let (selected, _) = select_follow_candidates(results, 10);
         assert_eq!(
             selected.len(),
             1,
@@ -927,10 +1102,29 @@ mod tests {
         assert!(is_junk_url("https://example.com/track?foo=1"));
         assert!(is_junk_url("https://doubleclick.net/ads"));
         assert!(is_junk_url("https://pagead2.googlesyndication.com/test"));
+        // Generic sign-in / login / auth URLs
+        assert!(is_junk_url("https://example.com/signin"));
+        assert!(is_junk_url("https://example.com/sign-in"));
+        assert!(is_junk_url("https://example.com/login"));
+        assert!(is_junk_url("https://example.com/log-in"));
+        assert!(is_junk_url("https://example.com/auth"));
+        assert!(is_junk_url("https://example.com/auth/continue"));
         // These should NOT be junk
         assert!(!is_junk_url("https://en.wikipedia.org/wiki/Entropy"));
         assert!(!is_junk_url("https://arxiv.org/abs/2112.06034"));
         assert!(!is_junk_url("https://example.com/page"));
+        assert!(!is_junk_url("https://example.com/author"));
+    }
+
+    #[test]
+    fn test_is_junk_title_detection() {
+        assert!(is_junk_title("Sign in to continue"));
+        assert!(is_junk_title("Log in to continue reading"));
+        assert!(is_junk_title("Please sign in to view this article"));
+        assert!(is_junk_title("Sign in required"));
+        // Legitimate article titles mentioning login must NOT be junk
+        assert!(!is_junk_title("How to build a login system in Rust"));
+        assert!(!is_junk_title("Understanding OAuth authentication flows"));
     }
 
     // ── phase_follow PDF tests ──────────────────────────────────────────
@@ -1113,7 +1307,7 @@ mod tests {
                 make_result("https://actix.rs", 1, "s3", 0.6),
             ),
         ];
-        let selected = select_follow_candidates(results, 10);
+        let (selected, _) = select_follow_candidates(results, 10);
         let queries: HashSet<&str> = selected.iter().map(|(q, _)| q.as_str()).collect();
         assert!(
             queries.contains("rust"),
@@ -1132,13 +1326,148 @@ mod tests {
 
     #[test]
     fn test_select_follow_candidates_empty() {
-        let selected = select_follow_candidates(vec![], 10);
+        let (selected, domains) = select_follow_candidates(vec![], 10);
         assert!(selected.is_empty(), "empty input must produce empty output");
+        assert!(domains.is_empty(), "empty input must produce empty domain set");
 
-        let selected = select_follow_candidates(vec![], 0);
+        let (selected, _) = select_follow_candidates(vec![], 0);
         assert!(
             selected.is_empty(),
             "empty input with max=0 must produce empty output"
+        );
+    }
+
+    #[test]
+    fn test_classify_body_status_keeps_dense_prose() {
+        // A dense/repetitive article with real paragraphs must be kept (Ok),
+        // even if it carries low-entropy / boilerplate signals.
+        let content = "The core thesis of this report is that the market will continue to grow. \
+                       The market grows because demand grows, and demand grows because adoption \
+                       grows. We repeat this point many times throughout the report to emphasize \
+                       the importance of growth in the market. Share this article with your \
+                       colleagues and listen to our podcast for more analysis. The market grows, \
+                       demand grows, adoption grows, and the report repeats these themes over and \
+                       over again to make the central argument unmistakably clear to every reader.";
+        let fr = FollowResult {
+            url: "https://example.com/a".into(),
+            title: "t".into(),
+            content: content.into(),
+            error: String::new(),
+            provenance: Provenance {
+                source_url: "https://www.google.com/search?q=test".into(),
+                method: ExtractionMethod::Search,
+                agent: gthings_common::GTHINGS_AGENT.into(),
+                accessed_at: Utc::now(),
+                duration_ms: 100,
+                derived_from: None,
+            },
+            pagination: None,
+            quality_flags: vec![],
+        };
+        let quality = compute_quality_with_flags(&fr.content, false, &fr.quality_flags);
+        let status = classify_body_status(&fr, &quality);
+        assert!(
+            matches!(status, BodyStatus::Ok),
+            "dense prose must be kept as Ok, got {:?} (quality {:?})",
+            status,
+            quality
+        );
+    }
+
+    #[test]
+    fn test_classify_body_status_keeps_long_article_with_nav_tokens() {
+        // A long article (15k chars) that happens to contain nav-menu tokens
+        // must be kept as Ok, never dropped as ChromeOrEmpty.
+        let mut content = String::new();
+        while content.len() < 15_000 {
+            content.push_str(
+                "This is a real paragraph of article prose discussing the topic at length. \
+                 The blog and pricing pages are mentioned in passing, but the bulk of this \
+                 text is genuine content that a reader would want to consume. ",
+            );
+        }
+        let fr = FollowResult {
+            url: "https://example.com/article".into(),
+            title: "t".into(),
+            content: content.clone().into(),
+            error: String::new(),
+            provenance: Provenance {
+                source_url: "https://www.google.com/search?q=test".into(),
+                method: ExtractionMethod::Search,
+                agent: gthings_common::GTHINGS_AGENT.into(),
+                accessed_at: Utc::now(),
+                duration_ms: 100,
+                derived_from: None,
+            },
+            pagination: None,
+            quality_flags: vec![],
+        };
+        let quality = compute_quality_with_flags(&fr.content, false, &fr.quality_flags);
+        let status = classify_body_status(&fr, &quality);
+        assert!(
+            matches!(status, BodyStatus::Ok),
+            "long article with nav tokens must be kept as Ok, got {:?} (quality {:?})",
+            status,
+            quality
+        );
+    }
+
+    #[test]
+    fn test_classify_body_status_drops_nav_only() {
+        // A genuinely nav-only page (repeated menu tokens, no prose) must be
+        // dropped as ChromeOrEmpty.
+        let content = "About Us Contact Us Privacy Policy Terms of Service Careers Pricing Blog \
+                       Sign In Log In FAQ Help Center Get Started About Us Contact Us Privacy \
+                       Policy Terms of Service Careers Pricing Blog Sign In Log In FAQ Help Center";
+        let fr = FollowResult {
+            url: "https://example.com/nav".into(),
+            title: "t".into(),
+            content: content.into(),
+            error: String::new(),
+            provenance: Provenance {
+                source_url: "https://www.google.com/search?q=test".into(),
+                method: ExtractionMethod::Search,
+                agent: gthings_common::GTHINGS_AGENT.into(),
+                accessed_at: Utc::now(),
+                duration_ms: 100,
+                derived_from: None,
+            },
+            pagination: None,
+            quality_flags: vec![],
+        };
+        let quality = compute_quality_with_flags(&fr.content, false, &fr.quality_flags);
+        let status = classify_body_status(&fr, &quality);
+        assert!(
+            matches!(status, BodyStatus::ChromeOrEmpty),
+            "nav-only page must be dropped as ChromeOrEmpty, got {:?}",
+            status
+        );
+    }
+
+    #[test]
+    fn test_classify_body_status_drops_empty() {
+        let fr = FollowResult {
+            url: "https://example.com/empty".into(),
+            title: "t".into(),
+            content: String::new(),
+            error: String::new(),
+            provenance: Provenance {
+                source_url: "https://www.google.com/search?q=test".into(),
+                method: ExtractionMethod::Search,
+                agent: gthings_common::GTHINGS_AGENT.into(),
+                accessed_at: Utc::now(),
+                duration_ms: 100,
+                derived_from: None,
+            },
+            pagination: None,
+            quality_flags: vec![],
+        };
+        let quality = compute_quality_with_flags(&fr.content, false, &fr.quality_flags);
+        let status = classify_body_status(&fr, &quality);
+        assert!(
+            matches!(status, BodyStatus::ChromeOrEmpty),
+            "empty content must be dropped as ChromeOrEmpty, got {:?}",
+            status
         );
     }
 
@@ -1164,15 +1493,9 @@ mod tests {
             ),
         ];
         // Use max=3 (< deduped count of 4) so domain-cap logic activates
-        let selected = select_follow_candidates(results, 3);
+        let (selected, domains_selected) = select_follow_candidates(results, 3);
 
-        // Replicate harvest() warning logic
-        let mut domains_selected: HashSet<String> = HashSet::new();
-        for (_, r) in &selected {
-            if let Some(d) = registered_domain(&r.url) {
-                domains_selected.insert(d);
-            }
-        }
+        // The returned domain set is computed in the same pass as selection
         assert!(
             domains_selected.len() <= 1 && selected.len() > 1,
             "all selected from same domain with >1 selected should trigger warning condition"

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.8.0 (2026-08-04)
+
+### Breaking Changes
+
+#### - feat: add multi-engine search facade with router, types, and shared HTTP (engine/mod.rs:22)
+
+- feat: add Brave and Bing plain-HTTP search backends (engine/brave.rs:1, engine/bing.rs:1)
+- feat: add CDP Google search backend (engine/google.rs:1)
+- feat: add in-memory engine pacing and cooldown store (engine/pacing.rs:1)
+- feat: add budget-aware search router with auto fallback and pinning (engine/router.rs:412)
+- feat: add per-engine search-operator rewriting (engine/technique.rs:1)
+- feat: add shared HTML decoding and whitespace helpers (engine/html.rs:1)
+- feat: change search() to multi-engine auto mode with engine pinning (search.rs:47)
+- feat: add source_type classification and widen domain_authority to f64 (search.rs:28)
+- refactor: batch queries share one router and fault-isolate per query (batch.rs:49)
+- feat: auto-close tabs on all exit paths via TabGuard (batch.rs:210, search.rs:120)
+- feat: strip boilerplate and leading title from followed content (follow.rs:128)
+- feat: add quality_flags to FollowResult shared across single scan (follow.rs:37)
+- feat: add junk-title and sign-in/auth URL filtering to harvest (orchestrator.rs:177)
+- feat: add nav-heavy detection and concurrency semaphores to harvest (quality.rs:1, orchestrator.rs:84)
+- chore: add engine selection field to BatchHarvestRequest (harvest/types.rs:27)
+- feat: export engine module and search_with_engine API (lib.rs:6)
+- refactor: simplify domain authority in ranking (harvest/ranking.rs:71)
+- feat: preserve paragraph breaks in extraction JS DOM walk (follow_extract.js:1)
+- feat: filter Google nav/utility URLs in search extract JS (search_extract.js:1)
+- chore: update tests for new result fields and concurrency caps (tests/integration.rs:31)
+- chore: add regex, reqwest, thiserror deps (Cargo.toml:20)
+
 ## 0.7.3 (2026-07-30)
 
 ### Fixes

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::SearchResult;
+use crate::engine::SearchEngine;
 use gthings_common::domain_reputation::DomainReputation;
 use gthings_common::pagination::{ExtractParams, Pagination};
 use gthings_common::provenance::Provenance;
@@ -26,6 +27,10 @@ pub struct BatchHarvestRequest {
     /// are skipped without CDP navigation and quality flags are written
     /// back after extraction.
     pub reputation: Option<Arc<DomainReputation>>,
+    /// Search engine selection for the search phase. `None` uses the router's
+    /// auto mode (priority fallback across engines); `Some(e)` pins exactly
+    /// one engine with no fallback.
+    pub engine: Option<SearchEngine>,
 }
 
 impl std::fmt::Debug for BatchHarvestRequest {
@@ -37,6 +42,7 @@ impl std::fmt::Debug for BatchHarvestRequest {
             .field("follow_top_n", &self.follow_top_n)
             .field("extract_params", &self.extract_params)
             .field("reputation", &self.reputation.as_ref().map(|_| "Some(...)"))
+            .field("engine", &self.engine)
             .finish()
     }
 }

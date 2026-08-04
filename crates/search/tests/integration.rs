@@ -31,6 +31,7 @@ fn test_search_result_serde() {
         position: 1,
         domain_authority: 0.0,
         provenance: test_provenance(),
+        source_type: "web".into(),
     };
 
     let json = serde_json::to_string(&result).unwrap();
@@ -54,6 +55,7 @@ fn test_search_result_ordering() {
             position: 3,
             domain_authority: 0.0,
             provenance: test_provenance(),
+            source_type: "web".into(),
         },
         SearchResult {
             title: "A".into(),
@@ -62,6 +64,7 @@ fn test_search_result_ordering() {
             position: 1,
             domain_authority: 0.0,
             provenance: test_provenance(),
+            source_type: "web".into(),
         },
         SearchResult {
             title: "B".into(),
@@ -70,6 +73,7 @@ fn test_search_result_ordering() {
             position: 2,
             domain_authority: 0.0,
             provenance: test_provenance(),
+            source_type: "web".into(),
         },
     ];
 
@@ -173,6 +177,7 @@ fn test_follow_result_serde() {
         error: String::new(),
         provenance: test_provenance(),
         pagination: pagination.clone(),
+        quality_flags: Vec::new(),
     };
 
     let json = serde_json::to_string(&result).unwrap();

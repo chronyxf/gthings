@@ -3,11 +3,11 @@
 //! Navigates to a URL, waits for network idle, then extracts title and body
 //! text via in-browser JavaScript evaluation.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
-use std::time::Duration;
-
 use chrono::Utc;
+use regex::Regex;
 use gthings_cdp::{CdpError, Session, Tab};
 use gthings_common::domain_reputation::{DomainReputation, QualityFlag};
 use gthings_common::pagination::{ExtractParams, Pagination};
@@ -34,6 +34,10 @@ pub struct FollowResult {
     pub provenance: Provenance,
     /// Pagination state.
     pub pagination: Option<Pagination>,
+    /// Quality flags detected on the extracted content (single scan, shared
+    /// with the reputation write-back and downstream quality scoring).
+    #[serde(default)]
+    pub quality_flags: Vec<QualityFlag>,
 }
 
 /// Follow a URL and extract page content via CDP.
@@ -124,6 +128,17 @@ pub async fn follow(
     });
     let mut follow_result: FollowResult = parse_follow_json(json_str).map_err(|e| *e)?;
     follow_result.url = url.to_string();
+    // Post-extraction content cleaning:
+    // 1) Strip only unambiguous image-view chrome (Medium image captions).
+    //    Real prose is preserved verbatim — no boilerplate phrases that could
+    //    appear in genuine article text are removed.
+    // 2) Collapse whitespace while preserving paragraph structure: runs of
+    //    spaces/tabs within a line become a single space, but newlines are
+    //    kept as paragraph breaks (2+ consecutive newlines collapse to one).
+    // 3) Remove a leading run of title text duplicated at the top of the body.
+    let cleaned = strip_boilerplate(&follow_result.content);
+    let cleaned = strip_leading_title(&cleaned, &follow_result.title);
+    follow_result.content = cleaned;
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let content_len = follow_result.content.len();
@@ -139,10 +154,13 @@ pub async fn follow(
     prov.accessed_at = Utc::now();
     prov.duration_ms = duration_ms;
 
-    // ── Post-extraction: detect quality flags and update reputation ──
+    // ── Post-extraction: detect quality flags ONCE and share the result ──
+    // A single full-text scan feeds both the reputation write-back below and
+    // the downstream quality scoring (via `FollowResult::quality_flags`).
+    let detected = detect_quality_flags(&follow_result.content);
+    follow_result.quality_flags = detected.clone();
     if let Some(rep) = reputation {
         if !host.is_empty() {
-            let detected = detect_quality_flags(&follow_result.content);
             if !detected.is_empty() {
                 rep.write(&host, &detected).await;
             } else {
@@ -171,6 +189,107 @@ fn detect_quality_flags(content: &str) -> Vec<QualityFlag> {
     gthings_extraction::ContentQuality::detect_all(content)
 }
 
+/// Boilerplate phrases removed from extracted content (case-insensitively,
+/// wherever they appear). Only unambiguous image-view chrome is stripped —
+/// phrases that could appear in genuine article prose (e.g. "view categories",
+/// "listen share") are deliberately NOT included so raw content is preserved.
+const BOILERPLATE_PHRASES: [&str; 2] = [
+    "press enter or click to view image in full size",
+    "press enter or click to view the image in full size",
+];
+
+/// Compile the boilerplate phrases into a single case-insensitive regex.
+///
+/// This replaces the previous per-phrase `find_ci` O(n*m) loop (which re-scanned
+/// the whole content for each of the 7 phrases) with one regex traversal over
+/// the content, avoiding O(phrases * n) rescans.
+fn boilerplate_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let pattern = BOILERPLATE_PHRASES
+            .iter()
+            .map(|p| regex::escape(p))
+            .collect::<Vec<_>>()
+            .join("|");
+        Regex::new(&format!("(?i){pattern}")).expect("valid boilerplate regex")
+    })
+}
+
+/// Strip known boilerplate noise phrases from extracted page content.
+///
+/// Removes, case-insensitively, only unambiguous image-view chrome: Medium
+/// image captions ("Press enter or click to view image in full size", plus
+/// the "view the image" variant). Real prose is preserved verbatim. Resulting
+/// whitespace is collapsed while preserving paragraph structure (newlines are
+/// kept as paragraph breaks).
+fn strip_boilerplate(content: &str) -> String {
+    let out = boilerplate_regex().replace_all(content, "");
+    collapse_whitespace(&out)
+}
+
+/// Collapse runs of spaces/tabs within a line to a single space, but keep
+/// newlines as paragraph breaks (2+ consecutive newlines collapse to one).
+/// This preserves readable paragraph structure instead of producing one dense
+/// single-line blob.
+fn collapse_whitespace(content: &str) -> String {
+    static SPACES: OnceLock<Regex> = OnceLock::new();
+    static NEWLINES: OnceLock<Regex> = OnceLock::new();
+    let spaces = SPACES.get_or_init(|| Regex::new(r"[ \t]+").expect("valid spaces regex"));
+    let newlines = NEWLINES.get_or_init(|| Regex::new(r"\n{2,}").expect("valid newlines regex"));
+    let out = spaces.replace_all(content, " ");
+    newlines.replace_all(&out, "\n").trim().to_string()
+}
+
+/// Remove a leading run of title text from the content.
+///
+/// Extracted pages frequently repeat the `<title>` at the top of the body
+/// (e.g. an `<h1>` mirroring it). When the content begins with text equal —
+/// case-insensitively, after trimming — to the search-result title, that
+/// leading run is removed.
+fn strip_leading_title(content: &str, title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        return content.to_string();
+    }
+    match find_ci(content, title) {
+        Some((0, end)) => content[end..].trim_start().to_string(),
+        _ => content.to_string(),
+    }
+}
+
+/// Case-insensitive substring search.
+///
+/// Returns the byte range `(start, end)` of the first occurrence of `needle`
+/// in `haystack`, or `None`. Matching compares per-character lowercase forms,
+/// so returned offsets always refer to the original string.
+fn find_ci(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return Some((0, 0));
+    }
+    let needle_lower: Vec<char> = needle.to_lowercase().chars().collect();
+    // (original byte index, lowercase char, original char)
+    let hay_lower: Vec<(usize, char, char)> = haystack
+        .char_indices()
+        .map(|(idx, c)| (idx, c.to_lowercase().next().unwrap_or(c), c))
+        .collect();
+    let n = hay_lower.len();
+    let m = needle_lower.len();
+    if m > n {
+        return None;
+    }
+    'outer: for i in 0..=(n - m) {
+        for j in 0..m {
+            if hay_lower[i + j].1 != needle_lower[j] {
+                continue 'outer;
+            }
+        }
+        let start = hay_lower[i].0;
+        let end = hay_lower[i + m - 1].0 + hay_lower[i + m - 1].2.len_utf8();
+        return Some((start, end));
+    }
+    None
+}
+
 /// Outcome of a timed search inside a temporary tab.
 pub(crate) enum TimedSearchOutcome {
     /// Search succeeded.
@@ -181,47 +300,31 @@ pub(crate) enum TimedSearchOutcome {
     Timeout,
 }
 
-/// Create a background tab, run `crate::search::search` with a per-task timeout,
-/// always close the tab, and return the outcome.
-///
-/// Errors from tab creation bubble up; tab-close failures are logged but not
-/// propagated. Timeout is returned as [`TimedSearchOutcome::Timeout`] so the
-/// caller can decide how to handle it (empty results vs. hard error).
-pub(crate) async fn search_with_tab(
-    session: &Session,
-    query: &str,
-    count: usize,
-    timeout: Duration,
-) -> Result<TimedSearchOutcome, CdpError> {
-    let tab = session.create_background_tab().await?;
-    let result =
-        tokio::time::timeout(timeout, crate::search::search(session, &tab, query, count)).await;
-    if let Err(e) = session.close_tab(tab).await {
-        tracing::warn!("failed to close tab: {e}");
-    }
-    match result {
-        Ok(Ok(results)) => Ok(TimedSearchOutcome::Success(results)),
-        Ok(Err(e)) => Ok(TimedSearchOutcome::Error(e)),
-        Err(_) => Ok(TimedSearchOutcome::Timeout),
-    }
-}
-
 /// Build a boilerplate [`FollowResult`] for early-exit error paths.
-fn make_error_result(url: &str, error: &str, duration_ms: u64) -> FollowResult {
+pub(crate) fn make_error_result(url: &str, error: &str, duration_ms: u64) -> FollowResult {
     FollowResult {
         url: url.to_string(),
         title: String::new(),
         content: String::new(),
         error: error.to_string(),
-        provenance: Provenance {
-            source_url: url.to_string(),
-            method: ExtractionMethod::Follow,
-            agent: gthings_common::GTHINGS_AGENT.into(),
-            accessed_at: Utc::now(),
-            duration_ms,
-            derived_from: None,
-        },
+        provenance: error_provenance(url, duration_ms),
         pagination: None,
+        quality_flags: Vec::new(),
+    }
+}
+
+/// Build the [`Provenance`] shared by all error-result paths.
+///
+/// Extracted so both `follow.rs` and `harvest/orchestrator.rs` construct the
+/// error provenance identically instead of duplicating the field list.
+pub(crate) fn error_provenance(url: &str, duration_ms: u64) -> Provenance {
+    Provenance {
+        source_url: url.to_string(),
+        method: ExtractionMethod::Follow,
+        agent: gthings_common::GTHINGS_AGENT.into(),
+        accessed_at: Utc::now(),
+        duration_ms,
+        derived_from: None,
     }
 }
 
@@ -263,6 +366,181 @@ mod tests {
     fn test_detect_quality_flags_captcha() {
         let flags = detect_quality_flags("reCAPTCHA verification required");
         assert!(flags.contains(&QualityFlag::Captcha));
+    }
+
+    // ── Boilerplate stripping ─────────────────────────────────────────
+
+    #[test]
+    fn test_strip_boilerplate_image_caption() {
+        let out = strip_boilerplate(
+            "The picture above is great. Press enter or click to view image in full size. Keep reading.",
+        );
+        assert!(!out.to_lowercase().contains("view image in full size"));
+        assert!(out.contains("The picture above is great."));
+        assert!(out.contains("Keep reading."));
+    }
+
+    #[test]
+    fn test_strip_boilerplate_image_caption_variant() {
+        let out = strip_boilerplate(
+            "Press enter or click to view the image in full size, it shows every detail.",
+        );
+        assert!(!out.to_lowercase().contains("full size"));
+        assert!(out.contains("it shows every detail"));
+    }
+
+    #[test]
+    fn test_strip_boilerplate_listen_share_kept() {
+        // "Listen Share" is real prose and must NOT be stripped.
+        assert_eq!(strip_boilerplate("Listen Share"), "Listen Share");
+        let out = strip_boilerplate("Listen Share Introduction Text");
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            vec!["Listen", "Share", "Introduction", "Text"]
+        );
+    }
+
+    #[test]
+    fn test_strip_boilerplate_listen_share_separators_kept() {
+        let out = strip_boilerplate("Listen · Share Some article text");
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            vec!["Listen", "·", "Share", "Some", "article", "text"]
+        );
+        let out = strip_boilerplate("Listen | Share Body starts here");
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            vec!["Listen", "|", "Share", "Body", "starts", "here"]
+        );
+    }
+
+    #[test]
+    fn test_strip_boilerplate_leading_featured_kept() {
+        // A leading "Featured" label can be part of real content and must be kept.
+        let out = strip_boilerplate("Featured The latest news roundup");
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            vec!["Featured", "The", "latest", "news", "roundup"]
+        );
+        let out = strip_boilerplate("Featured: Today in tech");
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            vec!["Featured:", "Today", "in", "tech"]
+        );
+    }
+
+    #[test]
+    fn test_strip_boilerplate_featured_mid_prose_kept() {
+        let content = "The site featured our article prominently";
+        assert_eq!(strip_boilerplate(content), content);
+    }
+
+    #[test]
+    fn test_strip_boilerplate_nav_phrases_kept() {
+        // "View Categories" / "View All Learning Resources" are real prose and
+        // must NOT be stripped.
+        let out = strip_boilerplate(
+            "View Categories View All Learning Resources The article body",
+        );
+        assert!(out.to_lowercase().contains("view categories"));
+        assert!(out.to_lowercase().contains("view all learning resources"));
+        assert!(out.contains("The article body"));
+    }
+
+    #[test]
+    fn test_strip_boilerplate_normal_prose_untouched() {
+        let prose = "This article explains the share economy and how to listen \
+                     to featured podcasts. Press enter to continue reading.";
+        assert_eq!(strip_boilerplate(prose), prose);
+    }
+
+    #[test]
+    fn test_strip_boilerplate_no_double_spaces() {
+        let out = strip_boilerplate("Lead in Listen Share view categories trailing");
+        assert!(!out.contains("  "), "no double spaces: {out:?}");
+    }
+
+    #[test]
+    fn test_strip_boilerplate_regex_only_image_chrome_case_insensitive() {
+        // Only the unambiguous image-view chrome is stripped; all other phrases
+        // are preserved as real prose.
+        let out = strip_boilerplate(
+            "PRESS ENTER OR CLICK TO VIEW IMAGE IN FULL SIZE Listen · Share \
+             VIEW CATEGORIES view all learning resources Body text",
+        );
+        assert!(!out.to_lowercase().contains("view image in full size"));
+        assert!(out.to_lowercase().contains("listen · share"));
+        assert!(out.to_lowercase().contains("view categories"));
+        assert!(out.to_lowercase().contains("view all learning resources"));
+        assert!(out.contains("Body text"));
+    }
+
+    #[test]
+    fn test_strip_boilerplate_regex_the_variant() {
+        let out = strip_boilerplate(
+            "Press Enter or Click to View the Image in Full Size Listen | Share Intro",
+        );
+        assert!(!out.to_lowercase().contains("full size"));
+        assert!(out.contains("Listen | Share"));
+        assert!(out.contains("Intro"));
+    }
+
+    // ── Paragraph preservation ────────────────────────────────────────
+
+    #[test]
+    fn test_collapse_whitespace_preserves_paragraphs() {
+        let content = "First paragraph line one.\n\nSecond paragraph.\n\n\nThird.";
+        let out = collapse_whitespace(content);
+        // Newlines are kept as paragraph breaks (2+ collapse to one).
+        assert_eq!(out, "First paragraph line one.\nSecond paragraph.\nThird.");
+    }
+
+    #[test]
+    fn test_collapse_whitespace_collapses_inline_spaces() {
+        let content = "Line   with\t\ttabs   and  spaces\nNext line";
+        let out = collapse_whitespace(content);
+        assert_eq!(out, "Line with tabs and spaces\nNext line");
+    }
+
+    #[test]
+    fn test_strip_boilerplate_preserves_paragraphs() {
+        let content = "Intro paragraph.\n\nPress enter or click to view image in full size.\n\nBody paragraph.";
+        let out = strip_boilerplate(content);
+        assert!(!out.to_lowercase().contains("view image in full size"));
+        // Paragraph breaks (newlines) are preserved, not collapsed to one line.
+        assert!(out.contains('\n'), "newlines must be preserved: {out:?}");
+        assert!(out.contains("Intro paragraph."));
+        assert!(out.contains("Body paragraph."));
+    }
+
+    // ── Leading title strip ───────────────────────────────────────────
+
+    #[test]
+    fn test_strip_leading_title_removes_duplicate() {
+        let out = strip_leading_title(
+            "My Great Article Hello world body",
+            "My Great Article",
+        );
+        assert_eq!(out, "Hello world body");
+    }
+
+    #[test]
+    fn test_strip_leading_title_case_insensitive() {
+        let out = strip_leading_title("MY GREAT ARTICLE body text", "My Great Article");
+        assert_eq!(out, "body text");
+    }
+
+    #[test]
+    fn test_strip_leading_title_no_match_untouched() {
+        let content = "A completely different opening paragraph";
+        assert_eq!(strip_leading_title(content, "Some Title"), content);
+    }
+
+    #[test]
+    fn test_strip_leading_title_empty_title() {
+        let content = "Just body text";
+        assert_eq!(strip_leading_title(content, ""), content);
+        assert_eq!(strip_leading_title(content, "   "), content);
     }
 
     // ── Reputation early-exit (pure host-extraction check) ────────────
@@ -345,38 +623,69 @@ mod tests {
             "JS must contain async/await in polling loop"
         );
         assert!(
-            js.contains("_text = _cl.textContent"),
+            js.contains("_cl.textContent"),
             "JS must have textContent fallback"
         );
     }
 
-    /// Verify that when `isMain` is true, chrome elements are stripped;
-    /// when falling back to body, nav/footer/header are preserved.
+    /// Verify that the chrome stripping query removes nav/footer/header.
+    /// The stripping is consolidated into a single query applied to the
+    /// cloned container regardless of branch.
     #[test]
     fn test_extraction_js_conditional_stripping_main() {
         let js = include_str!("../templates/follow_extract.js")
             .replace("__OFFSET__", "0")
             .replace("__MAX_CHARS__", "5000");
-        // The full JS must contain the chrome-rich stripping query
+        // The stripping query must include nav, footer, header.
         assert!(
             js.contains("script,style,noscript,svg,iframe,nav,footer,header"),
-            "Main-branch stripping must include nav, footer, header"
+            "JS must strip nav, footer, header"
         );
-        // And also the body-branch stripping query (without nav/footer/header)
-        assert!(
-            js.contains("script,style,noscript,svg,iframe"),
-            "JS must contain the body-branch stripping query"
-        );
-        // Ensure we have exactly two distinct stripping queries.
+        // The chrome-rich query appears once (consolidated single stripping).
         let with_chrome = js.match_indices("nav,footer,header").count();
-        let without_nav = js.match_indices("script,style,noscript,svg,iframe").count();
+        let minimal = js.match_indices("script,style,noscript,svg,iframe").count();
         assert_eq!(
             with_chrome, 1,
-            "nav,footer,header should appear exactly once (main branch)"
+            "nav,footer,header should appear once (consolidated stripping query)"
         );
         assert_eq!(
-            without_nav, 2,
-            "the minimal stripping query should appear twice (once in each branch)"
+            minimal, 1,
+            "the minimal stripping query should appear once (consolidated)"
+        );
+    }
+
+    /// Verify the JS walks the DOM and inserts newlines at block-element
+    /// boundaries so JS-rendered pages keep their paragraph breaks.
+    #[test]
+    fn test_extraction_js_block_boundary_newlines() {
+        let js = include_str!("../templates/follow_extract.js")
+            .replace("__OFFSET__", "0")
+            .replace("__MAX_CHARS__", "5000");
+        // The DOM-walk must exist and append a newline after block elements.
+        assert!(
+            js.contains("function _extractText(root)"),
+            "JS must define a DOM-walk extraction function"
+        );
+        assert!(
+            js.contains("_out.push('\\n')"),
+            "JS must insert a newline after block-level elements"
+        );
+        // Every required block element must be handled.
+        for tag in [
+            "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "br",
+            "section", "article", "blockquote", "pre", "td", "tr", "ul", "ol", "table",
+        ] {
+            assert!(
+                js.contains(&format!("'{}'", tag)),
+                "JS must treat <{}> as a block element that gets a newline",
+                tag
+            );
+        }
+        // Whitespace normalization must preserve newlines (collapse 2+ to one),
+        // never collapse everything to a single line.
+        assert!(
+            js.contains(r"replace(/\n{2,}/g, '\n')"),
+            "JS must collapse 2+ newlines to a single paragraph break"
         );
     }
 

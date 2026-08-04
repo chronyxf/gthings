@@ -1,17 +1,22 @@
-//! Google search implementation via CDP.
+//! Multi-engine search facade.
 //!
-//! Uses attribute-based selectors (`a[href]` filtered by hostname) resilient
-//! to Google class name changes.
+//! Routes queries through the [`SearchRouter`](crate::engine::router::SearchRouter),
+//! which tries engines in priority order — Brave → Bing → Google —
+//! with per-engine cooldowns (after rate-limits/captchas), query budgets
+//! (minimum interval between queries), and automatic fallback on failure.
 
-use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
-use gthings_cdp::{CdpError, Session, Tab};
-use gthings_common::provenance::{ExtractionMethod, Provenance};
-use gthings_common::safe_truncate_end;
+use gthings_cdp::{CdpError, Session, TabGuard};
+use gthings_common::provenance::Provenance;
 use serde::{Deserialize, Serialize};
-/// A single Google search result with provenance metadata.
+
+use crate::engine::router::{map_engine_results, SearchRouter};
+use crate::engine::{EngineChoice, SearchEngineError};
+use crate::follow::TimedSearchOutcome;
+
+/// A single search result with provenance metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub title: String,
@@ -23,212 +28,127 @@ pub struct SearchResult {
     pub provenance: Provenance,
     /// Domain authority score (0.0–1.0) for the result URL's host.
     #[serde(default)]
-    pub domain_authority: f32,
+    pub domain_authority: f64,
+    /// Coarse source classification derived from the result URL
+    /// (e.g. "github", "paper", "pdf", or "web").
+    #[serde(default)]
+    pub source_type: String,
 }
 
-/// Execute a Google search via CDP.
+/// Execute a search in multi-engine auto mode.
 ///
-/// Navigates to Google SERP, waits for network idle via lifecycle events,
-/// then extracts organic results using in-browser JavaScript with
-/// attribute-based selectors.
-///
-/// If the search returns zero results, the query is **retried once** with a
-/// trailing space appended. Google sometimes penalizes bare queries; the
-/// trailing space can bypass this.
+/// Builds a [`SearchRouter`] with browser backends (Bing, Google) enabled via
+/// `session`, then runs [`SearchRouter::search_with_fallback`] with
+/// [`EngineChoice::Auto`]: engines are tried in priority order
+/// (Brave → Bing → Google), skipping any that are cooling down
+/// or over budget, and falling back to the next engine on failure. The first
+/// successful engine's results win.
 ///
 /// # Arguments
 ///
-/// * `session` — The CDP session managing the browser connection.
-/// * `tab` — An already-created tab. Will be navigated to the SERP.
+/// * `session` — The CDP session managing the browser connection (enables the
+///   Bing and Google backends, which manage their own background tabs).
 /// * `query` — The search query string.
 /// * `count` — Maximum number of search results to return.
 pub async fn search(
-    session: &Session,
-    tab: &Tab,
+    session: &Arc<Session>,
     query: &str,
     count: usize,
-) -> Result<Vec<SearchResult>, CdpError> {
-    let results = search_once(session, tab, query, count).await?;
-    if results.is_empty() {
-        // Retry ONCE with trailing space — Google sometimes returns zero
-        // results for bare queries that work with a trailing space.
-        let spaced = if !query.ends_with(' ') {
-            format!("{query} ")
-        } else {
-            query.to_string()
-        };
-        search_once(session, tab, &spaced, count).await
-    } else {
-        Ok(results)
-    }
+) -> Result<Vec<SearchResult>, SearchEngineError> {
+    search_with_engine(Some(session), query, count, EngineChoice::Auto).await
 }
 
-/// Inner search function (single attempt, no retry).
-#[allow(clippy::incompatible_msrv)]
-async fn search_once(
-    session: &Session,
-    tab: &Tab,
+/// Execute a search with an explicit engine choice.
+///
+/// When `session` is `None`, only the plain-HTTP engines (Brave)
+/// are available; browser-only engines (Bing, Google) are skipped in
+/// [`EngineChoice::Auto`] mode, and pinning one fails with
+/// [`SearchEngineError::Unavailable`].
+///
+/// # Arguments
+///
+/// * `session` — Optional CDP session; `None` builds a router with no browser
+///   engines (HTTP only).
+/// * `query` — The search query string.
+/// * `count` — Maximum number of search results to return.
+/// * `choice` — [`EngineChoice::Auto`] (priority-order fallback) or
+///   [`EngineChoice::Pin`] (single engine attempt, no fallback).
+pub async fn search_with_engine(
+    session: Option<&Arc<Session>>,
     query: &str,
     count: usize,
-) -> Result<Vec<SearchResult>, CdpError> {
+    choice: EngineChoice,
+) -> Result<Vec<SearchResult>, SearchEngineError> {
+    // Pinning a browser engine without a session can never succeed — reject up front.
+    if let EngineChoice::Pin(engine) = choice {
+        if session.is_none() && engine.requires_browser() {
+            return Err(SearchEngineError::Unavailable {
+                engine,
+                detail: "browser session required".to_string(),
+            });
+        }
+    }
+
+    let router = SearchRouter::new(session.cloned());
+    search_with_router(&router, query, count, choice).await
+}
+
+/// Run a search through a caller-provided router.
+///
+/// Used by the batch path so all queries in a batch share ONE router (and
+/// thus one in-memory [`PacingStore`]), letting pacing coordinate across the
+/// whole batch. The single-query path constructs its own router as before.
+///
+/// # Arguments
+///
+/// * `router` — The shared [`SearchRouter`] to dispatch through.
+/// * `query` — The search query string.
+/// * `count` — Maximum number of search results to return.
+/// * `choice` — [`EngineChoice::Auto`] (priority-order fallback) or
+///   [`EngineChoice::Pin`] (single engine attempt, no fallback).
+pub async fn search_with_router(
+    router: &SearchRouter,
+    query: &str,
+    count: usize,
+    choice: EngineChoice,
+) -> Result<Vec<SearchResult>, SearchEngineError> {
     let start = Instant::now();
-
-    let params: String = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("q", query)
-        .append_pair("num", &(count * 2).max(10).to_string())
-        .append_pair("hl", "en")
-        .finish();
-    let url = format!("https://www.google.com/search?{params}");
-
-    tab.navigate(session, &url).await?;
-
-    // Check for Google CAPTCHA/Sorry block
-    {
-        let page_url = tab.evaluate(session, "window.location.href").await?;
-        let current_url = page_url
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if current_url.contains("/sorry/") || current_url.contains("google.com/sorry") {
-            tracing::warn!("Google CAPTCHA/Sorry page detected at: {current_url}");
-            return Err(CdpError::CaptchaBlocked {
-                detail: format!(
-                    "Google served CAPTCHA page instead of search results: {current_url}"
-                ),
-            });
-        }
-
-        // Also check for "Accessibility help" or "Learn more" in page title
-        let page_title = tab.evaluate(session, "document.title").await?;
-        let title = page_title
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if title.contains("Accessibility") || title.contains("Learn more") {
-            tracing::warn!("Google access-denied page detected: {title}");
-            return Err(CdpError::CaptchaBlocked {
-                detail: format!(
-                    "Google returned access-denied page '{title}' instead of search results"
-                ),
-            });
-        }
-    }
-
-    // Scroll down to trigger lazy loading of more organic results.
-    // Google SERP only renders ~2-3 results initially; the rest are
-    // loaded dynamically when the user scrolls.
-    // 200ms sleep per iteration is empirically sufficient for
-    // lazy-loading Google SERP results on modern connections;
-    // originally 500ms — reduced as a simple latency optimization.
-    let scroll_iterations = count.max(3);
-    for _ in 0..scroll_iterations {
-        tab.evaluate(session, "window.scrollBy(0, 800)").await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    // In-browser JS: iterate all links, skip self-hosted, extract snippet
-    // via attribute-based selectors (no brittle class-name dependency).
-    // Includes timing measurement and resilient selector fallbacks.
-    let js =
-        include_str!("../templates/search_extract.js").replace("__COUNT__", &count.to_string());
-
-    let result = tab.evaluate(session, &js).await?;
-    let raw = result["result"]["value"].as_str();
-    let json_str = raw.unwrap_or("[]");
-    let mut items: Vec<SearchResult> = serde_json::from_str(json_str).map_err(|e| {
-        let preview = &json_str[..json_str.floor_char_boundary(json_str.len().min(200))];
-        tracing::warn!("search: failed to parse results JSON: {e} (preview: {preview:?})");
-        CdpError::Json(e)
-    })?;
-
+    let results = router.search_with_fallback(query, count, choice).await?;
     let duration_ms = start.elapsed().as_millis() as u64;
-    let now = Utc::now();
 
-    for item in &mut items {
-        let host = gthings_common::extract_host(&item.url).unwrap_or_default();
-        item.domain_authority = gthings_extraction::domain_authority(&host);
-        item.provenance = Provenance {
-            source_url: url.clone(),
-            method: ExtractionMethod::Search,
-            agent: gthings_common::GTHINGS_AGENT.into(),
-            accessed_at: now,
-            duration_ms,
-            derived_from: None,
-        };
-    }
-
-    post_process_search_results(&mut items);
-
-    Ok(items)
+    Ok(map_engine_results(results, query, duration_ms))
 }
 
-/// Post-process search results: filter junk URLs, deduplicate by base URL,
-/// clean snippets/titles, re-number positions, and round authority scores.
-#[allow(clippy::incompatible_msrv)]
-fn post_process_search_results(items: &mut Vec<SearchResult>) {
-    // Filter junk, fragments, and short snippets, then dedup by base URL
-    let mut seen_bases: HashSet<String> = HashSet::new();
-    items.retain(|r| {
-        if r.url.contains("#:~:text=") {
-            return false;
-        }
-        if crate::harvest::is_junk_url(&r.url) {
-            return false;
-        }
-        if r.snippet.trim().is_empty() {
-            return false;
-        }
-        let base = r.url.split('#').next().unwrap_or(&r.url).to_string();
-        seen_bases.insert(base)
-    });
-
-    // Combine snippet cleaning, title cleaning, re-numbering, and rounding
-    for (i, item) in items.iter_mut().enumerate() {
-        // Clean snippet: strip trailing "Read more" and "...Read more"
-        let snip = &item.snippet;
-        if snip.ends_with("...Read more") {
-            item.snippet = safe_truncate_end(snip, "...Read more");
-        } else if snip.ends_with("Read more") {
-            item.snippet = safe_truncate_end(snip, "Read more");
-        }
-
-        // Clean title: strip inline URLs and appended domain patterns
-        for prefix in &["https://", "http://"] {
-            if let Some(pos) = item.title.find(prefix) {
-                let safe_pos = item.title.floor_char_boundary(pos);
-                item.title = item.title[..safe_pos].trim().to_string();
-            }
-        }
-        // Detect appended domain at title end (e.g. "TitleWikipedia")
-        // Scan forward to find the last lowercase→uppercase transition where
-        // the uppercase suffix is 3-25 chars long.
-        let mut truncate_at: Option<usize> = None;
-        for (i, c) in item.title.char_indices() {
-            if i == 0 || !c.is_uppercase() {
-                continue;
-            }
-            let prev = item.title[..i].chars().last().unwrap();
-            if !(prev.is_lowercase() || prev == ')') {
-                continue;
-            }
-            let suffix = &item.title[i..];
-            if (3..=25).contains(&suffix.len()) {
-                truncate_at = Some(i);
-            }
-        }
-        if let Some(pos) = truncate_at {
-            item.title = item.title[..pos].trim().to_string();
-        }
-        item.title = item.title.trim().to_string();
-
-        // Re-number position sequentially
-        item.position = i + 1;
-
-        // Round domain_authority to 2 decimal places
-        item.domain_authority = (item.domain_authority * 100.0).round() / 100.0;
+/// Run a search through a shared router inside a temporary tab with a
+/// per-query timeout (batch path).
+///
+/// Mirrors the single-query timed-tab search but threads the shared router
+/// so all queries in a batch dispatch through the same instance — and thus
+/// share a single in-memory [`PacingStore`], letting pacing coordinate across
+/// the batch. Errors from tab creation bubble up; tab-close failures are
+/// logged but not propagated. Timeout is returned as
+/// [`TimedSearchOutcome::Timeout`].
+pub(crate) async fn search_with_router_tab(
+    router: &SearchRouter,
+    session: &Arc<Session>,
+    query: &str,
+    count: usize,
+    timeout: Duration,
+) -> Result<TimedSearchOutcome, CdpError> {
+    let tab = session.create_background_tab().await?;
+    // RAII guard closes the tab on ALL exit paths (success, error, cancellation).
+    let _guard = TabGuard::new(session, tab);
+    let result = tokio::time::timeout(
+        timeout,
+        search_with_router(router, query, count, EngineChoice::Auto),
+    )
+    .await;
+    match result {
+        Ok(Ok(results)) => Ok(TimedSearchOutcome::Success(results)),
+        Ok(Err(e)) => Ok(TimedSearchOutcome::Error(CdpError::CdpCallFailed {
+            method: "search".into(),
+            detail: e.to_string(),
+        })),
+        Err(_) => Ok(TimedSearchOutcome::Timeout),
     }
 }
