@@ -295,7 +295,11 @@ mod tests {
             "dense repetitive prose must not be dropped, got reasons: {:?}",
             q.reasons
         );
-        assert!(q.score >= 0.5, "dense prose score should be >= 0.5, got {}", q.score);
+        assert!(
+            q.score >= 0.5,
+            "dense prose score should be >= 0.5, got {}",
+            q.score
+        );
     }
 
     #[test]
@@ -325,7 +329,10 @@ mod tests {
                  text is genuine content that a reader would want to consume. ",
             );
         }
-        assert!(long.len() > 1000, "test content must exceed the length guard");
+        assert!(
+            long.len() > 1000,
+            "test content must exceed the length guard"
+        );
         assert!(
             !is_nav_heavy(&long),
             "long article with nav tokens must not be nav-heavy"
@@ -415,7 +422,11 @@ mod tests {
             "valid short prose should not be empty_shell, got: {:?}",
             q.reasons
         );
-        assert!((q.score - 1.0).abs() < 1e-9, "score should be 1.0, got: {}", q.score);
+        assert!(
+            (q.score - 1.0).abs() < 1e-9,
+            "score should be 1.0, got: {}",
+            q.score
+        );
     }
 
     #[test]

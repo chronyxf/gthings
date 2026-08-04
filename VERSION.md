@@ -6,7 +6,7 @@ Each crate versioned independently. One crate per commit. Never batch.
 
 1. **Diff overview**: `git diff --stat` — read the full list. Do not skip this step.
 2. **Map files to crates** using the crate-prefix table below.
-3. **Blockers**: `cargo test --workspace` and `cargo clippy --workspace -D warnings` MUST pass first. If either fails, stop. Do not proceed until fixed.
+3. **Blockers**: `cargo test --workspace`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo fmt --all -- --check` MUST pass first. If any fails, stop. Do not proceed until fixed.
 
 ### Crate-prefix table
 
@@ -75,7 +75,15 @@ Types:
 
 Create `.changeset/<crate>-<desc>.md` with YAML frontmatter.
 
-Format (knope 0.23):
+Use the helper script (recommended):
+
+```bash
+bash scripts/create-changeset.sh <package> <bump> "<description>" <type>
+# e.g.
+bash scripts/create-changeset.sh gthings-cdp patch "add session_id filter to lifecycle event predicate" fix
+```
+
+Or create it manually. Format (knope 0.23):
 
 ```
 ---
@@ -91,6 +99,12 @@ Rules:
 - Body bullets must match Step 1 exactly (paste them).
 - File name: `<crate-shortname>-<kebab-description>.md` (e.g. `cdp-session-id-filter.md`).
 
+Validate/list the pending changesets:
+
+```bash
+bash scripts/consume-changesets.sh
+```
+
 ### Step 4 — knope release
 
 ```bash
@@ -105,22 +119,31 @@ knope release
 
 ### Step 5 — Commit (one line only)
 
+Use Conventional Commits with a crate-name scope. The scope is the crate's short name (e.g. `gthings-cdp`, `gthings-common`).
+
 ```bash
 git add crates/<crate>/ CHANGELOG.md Cargo.toml Cargo.lock .changeset/
-git commit -m "type(crate): description"
+git commit -m "feat(gthings-cdp): add session_id filter to lifecycle event predicate"
 ```
 
+Examples:
+- `feat(gthings-cdp): ...`
+- `fix(gthings-common): ...`
+- `refactor(gthings-extraction): ...`
+- `chore(gthings): ...`
+
 - One line. No body. No trailing period.
-- If a pre-commit hook blocks: `git commit --no-verify` (this is a version-bump commit — exempt per project policy).
+- The commit MUST pass the pre-commit hook (fmt + clippy + build + test). If the hook blocks, fix the code (run `cargo fmt --all` and fix clippy), do NOT bypass it.
 - Keep Cargo.lock committed — its changes are normal and expected.
 
 ### Step 6 — Verify
 
 ```bash
 git status --short
+cargo fmt --all -- --check
 ```
 
-Must be clean. If not clean, investigate and fix before proceeding.
+Must be clean and formatted. If not, investigate and fix before proceeding.
 
 ### Step 7 — Publish
 
@@ -137,7 +160,7 @@ cargo publish -p <package>
 
 - **Cargo.lock changes are normal**: `cargo publish` and `knope release` both update it. Always stage and commit Cargo.lock. Do not discard it.
 - **Git tags**: knope creates tags. Verify they are ancestors of HEAD: `git merge-base --is-ancestor <tag> HEAD`. If a tag is detached, do not push.
-- **Pre-commit hook exemption**: Version-bump commits (Steps 4-5) are exempt from pre-commit checks. Use `git commit --no-verify` if the hook blocks. This is by design — the diff has already been validated in Steps 1-4.
+- **fmt + clippy must pass**: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` MUST pass before any commit. The pre-commit hook is the enforcement — do not bypass it.
 - **Manual fallback**: If `knope release` fails twice, do not keep retrying. Switch to manual edits (Step 4 fallback). After manual edits, still commit, verify, and publish normally.
 - **Root package `gthings-tests`** has `publish = false` — never touched.
 
@@ -149,9 +172,10 @@ cargo publish -p <package>
 [ ] git diff --stat -- crates/<crate>/
 [ ] Write bullet points from diff (read output, do not guess)
 [ ] Bump type: patch | minor | major
-[ ] Create .changeset/<crate>-<desc>.md with YAML frontmatter
+[ ] Create .changeset/<crate>-<desc>.md with YAML frontmatter (or bash scripts/create-changeset.sh)
+[ ] Validate changesets: bash scripts/consume-changesets.sh
 [ ] knope release (or manual fallback after 2 failures)
-[ ] git commit -m "type(crate): description"  (--no-verify if needed)
+[ ] git commit -m "type(crate): description"  (must pass pre-commit hook)
 [ ] git status --short                         (must be clean)
 [ ] cargo publish -p <package>                 (skip if no token)
 ```

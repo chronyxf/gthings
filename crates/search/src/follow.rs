@@ -7,11 +7,11 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use chrono::Utc;
-use regex::Regex;
 use gthings_cdp::{CdpError, Session, Tab};
 use gthings_common::domain_reputation::{DomainReputation, QualityFlag};
 use gthings_common::pagination::{ExtractParams, Pagination};
 use gthings_common::provenance::{ExtractionMethod, Provenance};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// Result of following a URL and extracting its content.
@@ -439,9 +439,7 @@ mod tests {
     fn test_strip_boilerplate_nav_phrases_kept() {
         // "View Categories" / "View All Learning Resources" are real prose and
         // must NOT be stripped.
-        let out = strip_boilerplate(
-            "View Categories View All Learning Resources The article body",
-        );
+        let out = strip_boilerplate("View Categories View All Learning Resources The article body");
         assert!(out.to_lowercase().contains("view categories"));
         assert!(out.to_lowercase().contains("view all learning resources"));
         assert!(out.contains("The article body"));
@@ -517,10 +515,7 @@ mod tests {
 
     #[test]
     fn test_strip_leading_title_removes_duplicate() {
-        let out = strip_leading_title(
-            "My Great Article Hello world body",
-            "My Great Article",
-        );
+        let out = strip_leading_title("My Great Article Hello world body", "My Great Article");
         assert_eq!(out, "Hello world body");
     }
 
@@ -672,8 +667,25 @@ mod tests {
         );
         // Every required block element must be handled.
         for tag in [
-            "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "br",
-            "section", "article", "blockquote", "pre", "td", "tr", "ul", "ol", "table",
+            "p",
+            "div",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "li",
+            "br",
+            "section",
+            "article",
+            "blockquote",
+            "pre",
+            "td",
+            "tr",
+            "ul",
+            "ol",
+            "table",
         ] {
             assert!(
                 js.contains(&format!("'{}'", tag)),

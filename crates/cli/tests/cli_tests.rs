@@ -226,7 +226,8 @@ fn test_max_chars_flag_parses() {
 
     // The flag must parse a custom value; runtime may fail (no browser) but
     // clap must accept the argument before reaching the handler.
-    let (_stdout, _stderr, status) = run_cli(&["extract", "http://example.com", "--max-chars", "100000"]);
+    let (_stdout, _stderr, status) =
+        run_cli(&["extract", "http://example.com", "--max-chars", "100000"]);
     assert!(
         status.code().is_some(),
         "--max-chars 100000 should be a recognized flag/value"
@@ -245,13 +246,20 @@ fn test_describe_outputs_valid_json_with_expected_keys() {
         _stderr
     );
 
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("describe --output json should emit valid JSON: {e}\nstdout={stdout}"));
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("describe --output json should emit valid JSON: {e}\nstdout={stdout}")
+    });
 
     let obj = parsed
         .as_object()
         .unwrap_or_else(|| panic!("describe output should be a JSON object: {stdout}"));
-    for key in ["subcommands", "strategies", "engines", "operators", "output_schema"] {
+    for key in [
+        "subcommands",
+        "strategies",
+        "engines",
+        "operators",
+        "output_schema",
+    ] {
         assert!(
             obj.contains_key(key),
             "describe output should contain key '{key}'"
@@ -260,19 +268,31 @@ fn test_describe_outputs_valid_json_with_expected_keys() {
 
     // Spot-check the content of a few keys.
     assert!(
-        parsed["strategies"].as_object().map(|s| s.contains_key("harvest")).unwrap_or(false),
+        parsed["strategies"]
+            .as_object()
+            .map(|s| s.contains_key("harvest"))
+            .unwrap_or(false),
         "strategies should include 'harvest'"
     );
     assert!(
-        parsed["engines"].as_object().map(|e| e.contains_key("google")).unwrap_or(false),
+        parsed["engines"]
+            .as_object()
+            .map(|e| e.contains_key("google"))
+            .unwrap_or(false),
         "engines should include 'google'"
     );
     assert!(
-        parsed["operators"].as_object().map(|o| o.contains_key("site:")).unwrap_or(false),
+        parsed["operators"]
+            .as_object()
+            .map(|o| o.contains_key("site:"))
+            .unwrap_or(false),
         "operators should include 'site:'"
     );
     assert!(
-        parsed["output_schema"].as_object().map(|o| o.contains_key("status")).unwrap_or(false),
+        parsed["output_schema"]
+            .as_object()
+            .map(|o| o.contains_key("status"))
+            .unwrap_or(false),
         "output_schema should include 'status'"
     );
 }

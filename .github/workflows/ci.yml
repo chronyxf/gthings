@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: fmt + clippy + build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+  changeset:
+    name: changeset enforcement
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require changeset when crates change
+        run: |
+          set -euo pipefail
+          # Files changed under crates/ relative to the PR base.
+          changed=$(git diff --name-only origin/main...HEAD -- crates/ || true)
+          if [ -n "$changed" ]; then
+            if ! compgen -G ".changeset/*.md" > /dev/null; then
+              echo "::error::Crates changed but no .changeset/*.md file found. Add a changeset for this PR."
+              exit 1
+            fi
+            echo "Crates changed; changeset present."
+          else
+            echo "No crates changed; changeset not required."
+          fi
+
+  package:
+    name: package verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify packages (dry-run)
+        run: |
+          set -euo pipefail
+          # cargo package --workspace is not supported on stable; verify each crate.
+          for crate in crates/*/; do
+            name=$(basename "$crate")
+            echo "Verifying package: $name"
+            cargo package -p "$name" --list > /dev/null
+          done

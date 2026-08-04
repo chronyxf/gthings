@@ -18,20 +18,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gthings_common::provenance::{ExtractionMethod, Provenance};
 use gthings_common::GTHINGS_AGENT;
+use gthings_common::provenance::{ExtractionMethod, Provenance};
 use tokio::sync::Notify;
 
+use crate::SearchResult;
 use crate::engine::bing::BingBackend;
 use crate::engine::brave::BraveBackend;
 use crate::engine::google::GoogleBackend;
 use crate::engine::html::collapse_whitespace;
+use crate::engine::pacing::{PacingStore, global_pacing};
 use crate::engine::technique;
-use crate::engine::pacing::{global_pacing, PacingStore};
 use crate::engine::{
     EngineChoice, EngineSearchResult, SearchEngine, SearchEngineBackend, SearchEngineError,
 };
-use crate::SearchResult;
 
 /// Minimum interval between Brave queries.
 ///
@@ -65,7 +65,8 @@ const MAX_AUTO_WAIT: Duration = Duration::from_secs(10);
 
 /// Sleep granularity of the auto-mode wait loop: every pass re-reads the
 /// persisted pacing state and re-checks eligibility.
-const WAIT_POLL: Duration = Duration::from_millis(500);/// Thread-safe router state shared across concurrent queries.
+const WAIT_POLL: Duration = Duration::from_millis(500);
+/// Thread-safe router state shared across concurrent queries.
 ///
 /// - `cooldowns`: engine → instant at which its block (rate-limit/captcha)
 ///   expires; the engine is skipped until that instant.
@@ -122,11 +123,7 @@ fn next_engine(
             let now_ms = unix_now_ms();
             for engine in SearchEngine::PRIORITY {
                 if engine_ready(state, engine, now)
-                    && pacing_ready(
-                        pacing.last_call_ms(engine),
-                        min_interval(engine),
-                        now_ms,
-                    )
+                    && pacing_ready(pacing.last_call_ms(engine), min_interval(engine), now_ms)
                 {
                     return Ok(engine);
                 }
@@ -888,7 +885,9 @@ fn normalize_base_url(url: &str) -> String {
 /// `github` for GitHub, `paper` for arXiv, `pdf` for direct PDF links, and
 /// `web` for everything else.
 fn classify_source_type(url: &str) -> String {
-    let host = gthings_common::extract_host(url).unwrap_or_default().to_lowercase();
+    let host = gthings_common::extract_host(url)
+        .unwrap_or_default()
+        .to_lowercase();
     if host == "github.com" || host.ends_with(".github.com") {
         "github".to_string()
     } else if host == "arxiv.org" || host.ends_with(".arxiv.org") {
@@ -953,9 +952,10 @@ mod tests {
     #[test]
     fn skips_engine_in_captcha_cooldown() {
         let mut state = cold_state();
-        state
-            .cooldowns
-            .insert(SearchEngine::Brave, Instant::now() + Duration::from_secs(30 * 60));
+        state.cooldowns.insert(
+            SearchEngine::Brave,
+            Instant::now() + Duration::from_secs(30 * 60),
+        );
         assert_eq!(
             next_engine(&state, &cold_pacing(), &EngineChoice::Auto).unwrap(),
             SearchEngine::Bing
@@ -998,11 +998,21 @@ mod tests {
     fn pin_forces_pinned_engine_even_when_not_first() {
         let state = cold_state();
         assert_eq!(
-            next_engine(&state, &cold_pacing(), &EngineChoice::Pin(SearchEngine::Google)).unwrap(),
+            next_engine(
+                &state,
+                &cold_pacing(),
+                &EngineChoice::Pin(SearchEngine::Google)
+            )
+            .unwrap(),
             SearchEngine::Google
         );
         assert_eq!(
-            next_engine(&state, &cold_pacing(), &EngineChoice::Pin(SearchEngine::Bing)).unwrap(),
+            next_engine(
+                &state,
+                &cold_pacing(),
+                &EngineChoice::Pin(SearchEngine::Bing)
+            )
+            .unwrap(),
             SearchEngine::Bing
         );
     }
@@ -1023,11 +1033,20 @@ mod tests {
     #[test]
     fn pacing_remaining_waits_until_interval_elapsed() {
         // 3s elapsed, 4s interval → wait 1s.
-        assert_eq!(pacing_remaining_ms(Some(1_000_000), 4000, 1_003_000), Some(1000));
+        assert_eq!(
+            pacing_remaining_ms(Some(1_000_000), 4000, 1_003_000),
+            Some(1000)
+        );
         // Zero elapsed → wait the full interval.
-        assert_eq!(pacing_remaining_ms(Some(1_000_000), 4000, 1_000_000), Some(4000));
+        assert_eq!(
+            pacing_remaining_ms(Some(1_000_000), 4000, 1_000_000),
+            Some(4000)
+        );
         // A timestamp in the future (clock skew) → wait the full interval.
-        assert_eq!(pacing_remaining_ms(Some(2_000_000), 4000, 1_000_000), Some(4000));
+        assert_eq!(
+            pacing_remaining_ms(Some(2_000_000), 4000, 1_000_000),
+            Some(4000)
+        );
     }
 
     #[test]
@@ -1196,7 +1215,10 @@ mod tests {
             state
         });
         let pacing = Mutex::new(cold_pacing());
-        pacing.lock().unwrap().record(SearchEngine::Bing, unix_now_ms());
+        pacing
+            .lock()
+            .unwrap()
+            .record(SearchEngine::Bing, unix_now_ms());
         let notify = Notify::new();
         let engine = wait_for_available_engine(
             &state,
@@ -1315,7 +1337,10 @@ mod tests {
             state
         });
         let pacing = Mutex::new(cold_pacing());
-        pacing.lock().unwrap().record(SearchEngine::Bing, unix_now_ms());
+        pacing
+            .lock()
+            .unwrap()
+            .record(SearchEngine::Bing, unix_now_ms());
         let notify = Notify::new();
         let start = Instant::now();
         let engine = wait_for_available_engine(
@@ -1416,12 +1441,14 @@ mod tests {
     #[test]
     fn auto_mode_exhaustion_with_errors_yields_all_engines_failed() {
         let mut accum = FallbackAccum::default();
-        assert!(accum
-            .record(Err(SearchEngineError::RateLimited {
-                engine: SearchEngine::Brave,
-                detail: "HTTP 429".to_string(),
-            }))
-            .is_none());
+        assert!(
+            accum
+                .record(Err(SearchEngineError::RateLimited {
+                    engine: SearchEngine::Brave,
+                    detail: "HTTP 429".to_string(),
+                }))
+                .is_none()
+        );
         match accum.exhausted().unwrap_err() {
             SearchEngineError::AllEnginesFailed(errors) => assert_eq!(errors.len(), 1),
             other => panic!("expected AllEnginesFailed, got {other:?}"),
@@ -1471,7 +1498,10 @@ mod tests {
         let (engine, until_ms) = record_outcome(&mut state, SearchEngine::Brave, &error)
             .expect("rate limit must report a persisted cooldown");
         assert_eq!(engine, SearchEngine::Brave);
-        assert!(until_ms > unix_now_ms(), "cooldown until-ms must be in the future");
+        assert!(
+            until_ms > unix_now_ms(),
+            "cooldown until-ms must be in the future"
+        );
         // In-memory cooldown still set (existing behavior unchanged).
         assert_eq!(
             next_engine(&state, &cold_pacing(), &EngineChoice::Auto).unwrap(),
@@ -1562,8 +1592,16 @@ mod tests {
     #[test]
     fn map_engine_results_drops_non_latin_titles() {
         let results = vec![
-            engine_result("中国 百度百科", "https://baike.baidu.com/item/x", "中文结果"),
-            engine_result("한국어 위키백과", "https://ko.wikipedia.org/wiki/러스트", "한국어"),
+            engine_result(
+                "中国 百度百科",
+                "https://baike.baidu.com/item/x",
+                "中文结果",
+            ),
+            engine_result(
+                "한국어 위키백과",
+                "https://ko.wikipedia.org/wiki/러스트",
+                "한국어",
+            ),
             engine_result(
                 "Rust (programming language) - Wikipedia",
                 "https://en.wikipedia.org/wiki/Rust",
@@ -1572,11 +1610,11 @@ mod tests {
         ];
         let mapped = map_engine_results(results, "https://example.com/search?q=test", 7);
         assert_eq!(mapped.len(), 1, "localized (non-Latin) titles dropped");
+        assert_eq!(mapped[0].title, "Rust (programming language) - Wikipedia");
         assert_eq!(
-            mapped[0].title,
-            "Rust (programming language) - Wikipedia"
+            mapped[0].position, 1,
+            "positions renumbered after filtering"
         );
-        assert_eq!(mapped[0].position, 1, "positions renumbered after filtering");
     }
 
     #[test]
@@ -1607,7 +1645,11 @@ mod tests {
             ),
         ];
         let mapped = map_engine_results(results, "https://example.com/search?q=test", 7);
-        assert_eq!(mapped.len(), 1, "non-Latin snippets dropped even with English titles");
+        assert_eq!(
+            mapped.len(),
+            1,
+            "non-Latin snippets dropped even with English titles"
+        );
         assert_eq!(mapped[0].title, "Kept");
     }
 
@@ -1717,21 +1759,29 @@ mod tests {
     #[test]
     fn map_engine_results_filters_dedups_and_renumbers() {
         let results = vec![
+            engine_result("Junk", "https://accounts.google.com/signin", "junk result"),
             engine_result(
-                "Junk",
-                "https://accounts.google.com/signin",
-                "junk result",
+                "Frag",
+                "https://example.com/doc#:~:text=hi",
+                "fragment link",
             ),
-            engine_result("Frag", "https://example.com/doc#:~:text=hi", "fragment link"),
             engine_result("Empty", "https://example.org/empty", "   "),
             engine_result("Dup A", "https://example.com/doc#section1", "same base"),
-            engine_result("Dup B", "https://example.com/doc#section2", "same base again"),
+            engine_result(
+                "Dup B",
+                "https://example.com/doc#section2",
+                "same base again",
+            ),
             engine_result("  Kept  ", "https://en.wikipedia.org/kept", "kept snippet"),
         ];
 
         let mapped = map_engine_results(results, "https://example.com/search?q=test", 42);
 
-        assert_eq!(mapped.len(), 2, "junk, fragment, empty snippet, and dup filtered");
+        assert_eq!(
+            mapped.len(),
+            2,
+            "junk, fragment, empty snippet, and dup filtered"
+        );
         // First base-URL occurrence wins; positions are renumbered 1-based.
         assert_eq!(mapped[0].title, "Dup A");
         assert_eq!(mapped[0].url, "https://example.com/doc#section1");
@@ -1740,7 +1790,10 @@ mod tests {
         assert_eq!(mapped[1].position, 2);
 
         // Provenance: source_url is the result URL, method is Search.
-        assert_eq!(mapped[1].provenance.source_url, "https://en.wikipedia.org/kept");
+        assert_eq!(
+            mapped[1].provenance.source_url,
+            "https://en.wikipedia.org/kept"
+        );
         assert_eq!(mapped[1].provenance.method, ExtractionMethod::Search);
         assert_eq!(mapped[1].provenance.agent, GTHINGS_AGENT);
         assert_eq!(mapped[1].provenance.duration_ms, 42);
@@ -1764,9 +1817,16 @@ mod tests {
         let mapped = map_engine_results(results, "https://example.com/search?q=test", 7);
         // www/non-www + trailing slash + tracking query collapse to one base;
         // the two duplicate-title results collapse to one.
-        assert_eq!(mapped.len(), 3, "www, trailing slash, tracking, and dup titles deduped");
+        assert_eq!(
+            mapped.len(),
+            3,
+            "www, trailing slash, tracking, and dup titles deduped"
+        );
         assert_eq!(mapped[0].title, "Same");
-        assert_eq!(mapped[1].title, "Duplicate Title", "title trimmed + collapsed");
+        assert_eq!(
+            mapped[1].title, "Duplicate Title",
+            "title trimmed + collapsed"
+        );
         assert_eq!(mapped[2].title, "Unique");
     }
 
@@ -1803,7 +1863,10 @@ mod tests {
         let q = "(docker OR podman) compose AROUND(3)";
         // Bing does not support parens or AROUND(n): both are stripped, the
         // rest kept in order.
-        assert_eq!(effective_query(SearchEngine::Bing, q), "docker OR podman compose");
+        assert_eq!(
+            effective_query(SearchEngine::Bing, q),
+            "docker OR podman compose"
+        );
         // Google supports parens and AROUND(n): untouched.
         assert_eq!(effective_query(SearchEngine::Google, q), q);
     }
@@ -1811,8 +1874,16 @@ mod tests {
     #[test]
     fn effective_query_passthrough_without_operators() {
         let q = "redis streams";
-        for engine in [SearchEngine::Brave, SearchEngine::Bing, SearchEngine::Google] {
-            assert_eq!(effective_query(engine, q), q, "no-operator query must be unchanged");
+        for engine in [
+            SearchEngine::Brave,
+            SearchEngine::Bing,
+            SearchEngine::Google,
+        ] {
+            assert_eq!(
+                effective_query(engine, q),
+                q,
+                "no-operator query must be unchanged"
+            );
         }
     }
 
@@ -1830,7 +1901,10 @@ mod tests {
             state
         });
         let pacing = Arc::new(Mutex::new(cold_pacing()));
-        pacing.lock().unwrap().record(SearchEngine::Bing, unix_now_ms());
+        pacing
+            .lock()
+            .unwrap()
+            .record(SearchEngine::Bing, unix_now_ms());
         let notify = Arc::new(Notify::new());
 
         // A sibling task "dispatches" Bing after 100ms: stamps a fresh
@@ -1838,7 +1912,9 @@ mod tests {
         let (p2, n2) = (pacing.clone(), notify.clone());
         let waker = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            p2.lock().unwrap().record(SearchEngine::Bing, unix_now_ms() - 2000);
+            p2.lock()
+                .unwrap()
+                .record(SearchEngine::Bing, unix_now_ms() - 2000);
             n2.notify_waiters();
         });
 
@@ -1873,7 +1949,11 @@ mod tests {
         let r2 = SearchRouter::with_pacing(None, pacing.clone());
         r1.record_pacing(SearchEngine::Bing);
         assert!(
-            r2.pacing.lock().unwrap().last_call_ms(SearchEngine::Bing).is_some(),
+            r2.pacing
+                .lock()
+                .unwrap()
+                .last_call_ms(SearchEngine::Bing)
+                .is_some(),
             "router 2 must observe router 1's pacing stamp via the shared store"
         );
     }
@@ -1886,7 +1966,11 @@ mod tests {
         let r2 = SearchRouter::new(None);
         r1.record_pacing(SearchEngine::Bing);
         assert!(
-            r2.pacing.lock().unwrap().last_call_ms(SearchEngine::Bing).is_some(),
+            r2.pacing
+                .lock()
+                .unwrap()
+                .last_call_ms(SearchEngine::Bing)
+                .is_some(),
             "routers built via new() must share the global pacing store"
         );
     }

@@ -20,7 +20,7 @@
 //! with the same block shape when the Cookie header is sent.
 
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 
 use super::html::{body_has_block_markers, collapse_whitespace, decode_entities, strip_tags};
 use super::{EngineSearchResult, SearchEngine, SearchEngineBackend, SearchEngineError};
@@ -95,11 +95,9 @@ impl SearchEngineBackend for BraveBackend {
             });
         }
 
-        let html = resp.text().await.map_err(|e| {
-            SearchEngineError::Network {
-                engine: SearchEngine::Brave,
-                detail: format!("failed to read response body: {e}"),
-            }
+        let html = resp.text().await.map_err(|e| SearchEngineError::Network {
+            engine: SearchEngine::Brave,
+            detail: format!("failed to read response body: {e}"),
         })?;
 
         let results = parse_results(&html, count)?;
@@ -186,9 +184,11 @@ pub(crate) fn parse_results(
         let title = caps
             .get(2)
             .map(|m| collapse_whitespace(&decode_entities(&strip_tags(m.as_str()))));
-        let snippet = caps
-            .get(3)
-            .map(|m| strip_date_prefix(&collapse_whitespace(&decode_entities(&strip_tags(m.as_str())))));
+        let snippet = caps.get(3).map(|m| {
+            strip_date_prefix(&collapse_whitespace(&decode_entities(&strip_tags(
+                m.as_str(),
+            ))))
+        });
 
         match (title, url, snippet) {
             (Some(title), Some(url), Some(snippet))
@@ -241,11 +241,7 @@ fn extract_blocks(html: &str) -> Vec<String> {
                 if after == Some('>') || after == Some(' ') {
                     depth -= 1;
                     if depth == 0 {
-                        let end = 5
-                            + rest[next + 5..]
-                                .find('>')
-                                .map(|p| p + 1)
-                                .unwrap_or(0);
+                        let end = 5 + rest[next + 5..].find('>').map(|p| p + 1).unwrap_or(0);
                         blocks.push(html[start..i + next + end].to_string());
                         idx = i + next + end;
                         break;
@@ -383,9 +379,8 @@ mod tests {
 
     #[test]
     fn empty_on_no_blocks() {
-        let results =
-            parse_results("<html><body><p>no results here</p></body></html>", 10)
-                .expect("plain body should parse to empty");
+        let results = parse_results("<html><body><p>no results here</p></body></html>", 10)
+            .expect("plain body should parse to empty");
         assert!(results.is_empty());
     }
 
@@ -413,10 +408,7 @@ mod tests {
             strip_date_prefix("1 week ago -Rust began as a personal project"),
             "Rust began as a personal project"
         );
-        assert_eq!(
-            strip_date_prefix("2 days ago -Some text"),
-            "Some text"
-        );
+        assert_eq!(strip_date_prefix("2 days ago -Some text"), "Some text");
         assert_eq!(
             strip_date_prefix("3 months ago-No space after dash"),
             "No space after dash"
@@ -444,6 +436,9 @@ mod tests {
         assert!(url.starts_with("https://search.brave.com/search?"));
         assert!(url.contains("q=rust+lang"), "query must be form-encoded");
         assert!(url.contains("source=web"), "existing params preserved");
-        assert!(url.contains("hl=en"), "English language hint must be present");
+        assert!(
+            url.contains("hl=en"),
+            "English language hint must be present"
+        );
     }
 }

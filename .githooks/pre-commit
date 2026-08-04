@@ -1,7 +1,6 @@
 #!/bin/bash
 # Pre-commit hook enforcing VERSION.md workflow
 set -euo pipefail
-if [ "${SKIP_CHECKS:-0}" = "1" ]; then exit 0; fi
 
 CHANGESETS_DIR=".changeset"
 

@@ -2,8 +2,8 @@
 
 use gthings_search::{BatchProcessor, BatchSearchConfig};
 
-use crate::commands::{UniversalFlags, emit_output, with_session};
 use crate::EngineFlag;
+use crate::commands::{UniversalFlags, emit_output, with_session};
 
 /// Batch: detect → connect → batch → disconnect → output.
 ///
@@ -20,7 +20,9 @@ pub(crate) async fn cmd_batch(
     engine: EngineFlag,
 ) -> i32 {
     if !matches!(engine, EngineFlag::Auto) {
-        eprintln!("gthings: --engine is ignored for the parallel (batch) strategy; batch always auto-routes");
+        eprintln!(
+            "gthings: --engine is ignored for the parallel (batch) strategy; batch always auto-routes"
+        );
     }
     let config = BatchSearchConfig {
         follow_results: extract_results,

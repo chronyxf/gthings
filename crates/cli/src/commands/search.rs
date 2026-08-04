@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use gthings_search::search_with_engine;
 
-use crate::commands::{UniversalFlags, connect, disconnect_session, emit_output};
 use crate::EngineFlag;
+use crate::commands::{UniversalFlags, connect, disconnect_session, emit_output};
 
 /// Search: detect → connect (only when a browser engine needs it) → search
 /// (engine facade) → disconnect (only when connected) → output.

@@ -279,8 +279,8 @@ impl ContentQuality {
 
         // Navigation chrome: short content with no natural language (no quotes),
         // or longer content that is link-dense boilerplate (nav menu text)
-        let is_link_dense = (slice.len() >= 100 && is_nav_link_dense(slice))
-            || is_github_spa_nav(slice);
+        let is_link_dense =
+            (slice.len() >= 100 && is_nav_link_dense(slice)) || is_github_spa_nav(slice);
         if (slice.len() < 100 && !slice.contains('"')) || is_link_dense {
             reasons.push(QualityReason::NavigationChrome);
             score -= 0.3;

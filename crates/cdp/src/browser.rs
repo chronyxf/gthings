@@ -504,10 +504,7 @@ mod tests {
     #[test]
     fn test_dialog_dismiss_params_defaults() {
         let p = DialogDismissParams::default_params();
-        assert_eq!(
-            p.max_attempts, 1,
-            "max_attempts should be 1"
-        );
+        assert_eq!(p.max_attempts, 1, "max_attempts should be 1");
         assert_eq!(
             p.osascript_timeout,
             Duration::from_secs(1),
@@ -519,7 +516,8 @@ mod tests {
             "inter_attempt_sleep should be 1s"
         );
         // Worst-case dialog budget ≈ 1 × (1s + 1s) ≈ 2s
-        let budget = u64::from(p.max_attempts) * (p.osascript_timeout + p.inter_attempt_sleep).as_secs();
+        let budget =
+            u64::from(p.max_attempts) * (p.osascript_timeout + p.inter_attempt_sleep).as_secs();
         assert_eq!(budget, 2, "worst-case dialog budget should be ~2s");
     }
 }

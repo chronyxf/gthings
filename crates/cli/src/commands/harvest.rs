@@ -8,8 +8,8 @@ use gthings_common::domain_reputation::DomainReputation;
 use gthings_common::pagination::ExtractParams;
 use gthings_search::harvest::{BatchHarvestRequest, DedupStrategy, RankStrategy, harvest};
 
-use crate::commands::{UniversalFlags, emit_output, with_session};
 use crate::EngineFlag;
+use crate::commands::{UniversalFlags, emit_output, with_session};
 
 /// Harvest: detect → connect → harvest → disconnect → output.
 #[allow(clippy::too_many_arguments)]

@@ -13,9 +13,23 @@ use super::SearchEngine;
 
 /// Keyword operators recognized as `keyword:value` pairs, case-insensitive.
 const KEYVALUE_KEYWORDS: &[&str] = &[
-    "site", "filetype", "intitle", "allintitle", "inurl", "allinurl", "intext",
-    "related", "cache", "define", "before", "after", "near", "inanchor", "inbody",
-    "loc", "language",
+    "site",
+    "filetype",
+    "intitle",
+    "allintitle",
+    "inurl",
+    "allinurl",
+    "intext",
+    "related",
+    "cache",
+    "define",
+    "before",
+    "after",
+    "near",
+    "inanchor",
+    "inbody",
+    "loc",
+    "language",
 ];
 
 /// Token kinds produced by [`classify`].
@@ -208,9 +222,7 @@ pub fn rewrite(query: &str, engine: SearchEngine) -> Cow<'_, str> {
         // changes (wildcard/paren strip), so operator-bearing queries that
         // pass through unchanged don't allocate per token.
         let mut t: Cow<'_, str> = Cow::Borrowed(token);
-        if matches!(engine, SearchEngine::Brave | SearchEngine::Bing)
-            && token.contains('*')
-        {
+        if matches!(engine, SearchEngine::Brave | SearchEngine::Bing) && token.contains('*') {
             // Wildcard-in-phrase (and standalone `*`) is unsupported:
             // remove '*' chars; collapse spaces left inside quoted phrases.
             let stripped = t.replace('*', "");
@@ -307,7 +319,8 @@ mod tests {
 
     #[test]
     fn universal_operators_kept_on_google_and_brave() {
-        let q = "site:github.com \"exact phrase\" -excluded filetype:pdf intitle:x inurl:y intext:z";
+        let q =
+            "site:github.com \"exact phrase\" -excluded filetype:pdf intitle:x inurl:y intext:z";
         for engine in [SearchEngine::Google, SearchEngine::Brave] {
             assert_eq!(rewrite(q, engine), q);
         }
@@ -403,9 +416,6 @@ mod tests {
     #[test]
     fn operator_query_is_owned() {
         let q = "react cache:react.dev hooks";
-        assert!(matches!(
-            rewrite(q, SearchEngine::Google),
-            Cow::Owned(_)
-        ));
+        assert!(matches!(rewrite(q, SearchEngine::Google), Cow::Owned(_)));
     }
 }

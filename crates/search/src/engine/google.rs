@@ -250,7 +250,8 @@ static SUBSTITUTED_TEMPLATE: Mutex<Option<(usize, String)>> = Mutex::new(None);
 /// Return the extraction JS with `__COUNT__` substituted for `count`. The
 /// template is embedded once; the substitution is cached per count.
 fn extraction_js(count: usize) -> String {
-    let raw = TEMPLATE.get_or_init(|| include_str!("../../templates/search_extract.js").to_string());
+    let raw =
+        TEMPLATE.get_or_init(|| include_str!("../../templates/search_extract.js").to_string());
     let mut cached = SUBSTITUTED_TEMPLATE.lock().unwrap();
     if let Some((c, js)) = cached.as_ref() {
         if *c == count {
@@ -297,11 +298,11 @@ fn map_cdp_error(err: CdpError) -> SearchEngineError {
 /// suffixes are stripped from titles; arbitrary uppercase words are kept.
 fn is_domain_suffix(suffix: &str) -> bool {
     const TLDS: &[&str] = &[
-        "com", "org", "net", "io", "edu", "gov", "co", "uk", "us", "ca", "de", "fr", "jp",
-        "au", "info", "biz", "me", "tv", "xyz", "dev", "app", "ai", "ru", "cn", "in", "br",
-        "it", "es", "nl", "se", "pl", "ch", "at", "be", "dk", "fi", "no", "pt", "gr", "cz",
-        "hu", "ro", "ua", "tr", "il", "kr", "tw", "hk", "sg", "my", "th", "vn", "ph", "id",
-        "nz", "za", "mx", "ar", "cl", "pe", "ve",
+        "com", "org", "net", "io", "edu", "gov", "co", "uk", "us", "ca", "de", "fr", "jp", "au",
+        "info", "biz", "me", "tv", "xyz", "dev", "app", "ai", "ru", "cn", "in", "br", "it", "es",
+        "nl", "se", "pl", "ch", "at", "be", "dk", "fi", "no", "pt", "gr", "cz", "hu", "ro", "ua",
+        "tr", "il", "kr", "tw", "hk", "sg", "my", "th", "vn", "ph", "id", "nz", "za", "mx", "ar",
+        "cl", "pe", "ve",
     ];
     let lower = suffix.to_ascii_lowercase();
     TLDS.iter().any(|tld| lower.ends_with(&format!(".{tld}")))
@@ -425,7 +426,9 @@ mod tests {
         assert!(is_captcha_url(
             "https://www.google.com/sorry/index?continue=https://www.google.com/search?q=x"
         ));
-        assert!(is_captcha_url("https://google.com/sorry/?continue=https://www.google.com/"));
+        assert!(is_captcha_url(
+            "https://google.com/sorry/?continue=https://www.google.com/"
+        ));
         assert!(!is_captcha_url("https://www.google.com/search?q=rust"));
         assert!(!is_captcha_url("https://example.com/page"));
         assert!(!is_captcha_url(""));
@@ -484,11 +487,21 @@ mod tests {
     fn post_process_filters_junk_and_dedups() {
         let mut items = vec![
             result("Junk", "https://accounts.google.com/signin", "snippet", 1),
-            result("Fragment", "https://example.com/page#:~:text=hello", "snippet", 2),
+            result(
+                "Fragment",
+                "https://example.com/page#:~:text=hello",
+                "snippet",
+                2,
+            ),
             result("Empty", "https://example.com/empty", "   ", 3),
             result("First", "https://example.com/page#1", "first snippet", 4),
             result("Duplicate", "https://example.com/page#2", "dup snippet", 5),
-            result("Kept", "https://en.wikipedia.org/wiki/Entropy", "real snippet", 6),
+            result(
+                "Kept",
+                "https://en.wikipedia.org/wiki/Entropy",
+                "real snippet",
+                6,
+            ),
         ];
         post_process_results(&mut items);
         assert_eq!(items.len(), 2);

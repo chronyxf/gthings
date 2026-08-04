@@ -219,7 +219,14 @@ async fn handle_search_parallel(
     run_with_timeout(
         "parallel search",
         60,
-        commands::cmd_batch(universal, queries, count, extract_results, max_chars, engine),
+        commands::cmd_batch(
+            universal,
+            queries,
+            count,
+            extract_results,
+            max_chars,
+            engine,
+        ),
     )
     .await
     .unwrap_or_else(|e| e)
@@ -335,8 +342,11 @@ async fn handle_pdf_file(
 /// self-discover the full CLI capability at runtime. Respects `--output json`.
 fn handle_describe(universal: &commands::UniversalFlags) -> i32 {
     let guide = build_describe_guide();
-    let formatted =
-        commands::format_output(&guide, universal.resolved_output(), universal.query.as_deref());
+    let formatted = commands::format_output(
+        &guide,
+        universal.resolved_output(),
+        universal.query.as_deref(),
+    );
     println!("{formatted}");
     0
 }

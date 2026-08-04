@@ -88,7 +88,10 @@ mod tests {
         let mut store = PacingStore::new();
         assert_eq!(store.last_call_ms(SearchEngine::Brave), None);
         store.record(SearchEngine::Brave, 1_700_000_000_000);
-        assert_eq!(store.last_call_ms(SearchEngine::Brave), Some(1_700_000_000_000));
+        assert_eq!(
+            store.last_call_ms(SearchEngine::Brave),
+            Some(1_700_000_000_000)
+        );
         assert_eq!(store.last_call_ms(SearchEngine::Google), None);
     }
 

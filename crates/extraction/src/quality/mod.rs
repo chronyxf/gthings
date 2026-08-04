@@ -168,7 +168,10 @@ mod tests {
         // Non-ASCII text: entropy is computed per character, not per byte.
         let text = "héllo wörld 日本語テスト";
         let h = shannon_entropy(text);
-        assert!(h > 0.0, "non-ASCII text should have positive entropy, got {h}");
+        assert!(
+            h > 0.0,
+            "non-ASCII text should have positive entropy, got {h}"
+        );
 
         // A repeated single multi-byte char must have ~0 entropy regardless of
         // its byte width (é is 2 bytes in UTF-8).

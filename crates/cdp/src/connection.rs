@@ -256,7 +256,10 @@ impl Connection {
         })
         .await
         .map_err(|_| CdpError::ConnectionFailed {
-            detail: format!("Connection timed out after {}s", CONNECTION_TIMEOUT.as_secs()),
+            detail: format!(
+                "Connection timed out after {}s",
+                CONNECTION_TIMEOUT.as_secs()
+            ),
         })?
     }
 
@@ -338,9 +341,7 @@ impl Connection {
                 tracing::debug!("post-osascript probe failed: {e}");
             }
             Ok(Err(_)) => {
-                tracing::debug!(
-                    "post-osascript probe timed out after {WS_PROBE_TIMEOUT:?}"
-                );
+                tracing::debug!("post-osascript probe timed out after {WS_PROBE_TIMEOUT:?}");
             }
             Err(_) => {
                 tracing::debug!("post-osascript probe join error");

@@ -12,7 +12,7 @@ use gthings_cdp::{CdpError, Session, TabGuard};
 use gthings_common::provenance::Provenance;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::router::{map_engine_results, SearchRouter};
+use crate::engine::router::{SearchRouter, map_engine_results};
 use crate::engine::{EngineChoice, SearchEngineError};
 use crate::follow::TimedSearchOutcome;
 

@@ -198,7 +198,10 @@ mod tests {
 
     #[test]
     fn strips_tags() {
-        assert_eq!(strip_tags("<b>bold</b> and <i>italic</i>"), "bold and italic");
+        assert_eq!(
+            strip_tags("<b>bold</b> and <i>italic</i>"),
+            "bold and italic"
+        );
         assert_eq!(strip_tags("<div class=\"x\">text</div>"), "text");
         assert_eq!(strip_tags("no tags"), "no tags");
     }
@@ -212,15 +215,9 @@ mod tests {
             "before <div class=\"x\" after"
         );
         // Unterminated tag bounded at a newline.
-        assert_eq!(
-            strip_tags("a <span\nb"),
-            "a <span\nb"
-        );
+        assert_eq!(strip_tags("a <span\nb"), "a <span\nb");
         // Well-formed tags still stripped after an unterminated one.
-        assert_eq!(
-            strip_tags("<b>ok</b> <div"),
-            "ok <div"
-        );
+        assert_eq!(strip_tags("<b>ok</b> <div"), "ok <div");
     }
 
     #[test]

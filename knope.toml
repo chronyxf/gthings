@@ -2,31 +2,48 @@
 ignore_conventional_commits = true
 
 [packages.gthings-common]
-versioned_files = ["crates/common/Cargo.toml"]
+versioned_files = ["crates/common/Cargo.toml", "Cargo.lock"]
 changelog = "crates/common/CHANGELOG.md"
 
 [packages.gthings-cdp]
-versioned_files = ["crates/cdp/Cargo.toml", { path = "crates/search/Cargo.toml", dependency = "gthings-cdp" }, { path = "crates/cli/Cargo.toml", dependency = "gthings-cdp" }]
+versioned_files = ["crates/cdp/Cargo.toml", "Cargo.lock", { path = "crates/search/Cargo.toml", dependency = "gthings-cdp" }, { path = "crates/cli/Cargo.toml", dependency = "gthings-cdp" }]
 changelog = "crates/cdp/CHANGELOG.md"
 
 [packages.gthings-extraction]
-versioned_files = ["crates/extraction/Cargo.toml", { path = "crates/search/Cargo.toml", dependency = "gthings-extraction" }, { path = "crates/cli/Cargo.toml", dependency = "gthings-extraction" }]
+versioned_files = ["crates/extraction/Cargo.toml", "Cargo.lock", { path = "crates/search/Cargo.toml", dependency = "gthings-extraction" }, { path = "crates/cli/Cargo.toml", dependency = "gthings-extraction" }]
 changelog = "crates/extraction/CHANGELOG.md"
 
 [packages.gthings-search]
-versioned_files = ["crates/search/Cargo.toml", { path = "crates/cli/Cargo.toml", dependency = "gthings-search" }]
+versioned_files = ["crates/search/Cargo.toml", "Cargo.lock", { path = "crates/cli/Cargo.toml", dependency = "gthings-search" }]
 changelog = "crates/search/CHANGELOG.md"
 
 [packages.gthings]
-versioned_files = ["crates/cli/Cargo.toml"]
+versioned_files = ["crates/cli/Cargo.toml", "Cargo.lock"]
 changelog = "crates/cli/CHANGELOG.md"
+
+[[workflows]]
+name = "prepare-release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+allow_empty = true
+
+[[workflows.steps]]
+type = "Command"
+command = "git add -A"
+
+[[workflows.steps]]
+type = "Command"
+command = "git commit -m \"chore: prepare release\""
 
 [[workflows]]
 name = "release"
 
 [[workflows.steps]]
-type = "PrepareRelease"
+type = "Release"
+
+[[workflows]]
+name = "document-change"
 
 [[workflows.steps]]
-type = "Command"
-command = "git add -A"
+type = "CreateChangeFile"

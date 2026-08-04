@@ -83,10 +83,13 @@ impl SearchEngineBackend for BingBackend {
             });
         }
 
-        let body = response.text().await.map_err(|e| SearchEngineError::Network {
-            engine,
-            detail: format!("failed to read response body: {e}"),
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| SearchEngineError::Network {
+                engine,
+                detail: format!("failed to read response body: {e}"),
+            })?;
 
         let results = match parse_results(&body) {
             Ok(items) => items,
@@ -111,9 +114,8 @@ impl SearchEngineBackend for BingBackend {
 }
 
 /// Matches a full `<item>...</item>` block inside Bing's RSS channel.
-static ITEM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<item\b[^>]*>(.*?)</item>").expect("valid bing item regex")
-});
+static ITEM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<item\b[^>]*>(.*?)</item>").expect("valid bing item regex"));
 
 /// `<title>` field inside an item block.
 static TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -121,13 +123,13 @@ static TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// `<link>` field inside an item block.
-static LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<link\b[^>]*>(.*?)</link>").expect("valid bing link regex")
-});
+static LINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<link\b[^>]*>(.*?)</link>").expect("valid bing link regex"));
 
 /// `<description>` field inside an item block.
 static DESC_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<description\b[^>]*>(.*?)</description>").expect("valid bing description regex")
+    Regex::new(r"(?s)<description\b[^>]*>(.*?)</description>")
+        .expect("valid bing description regex")
 });
 
 /// Parses a Bing RSS 2.0 response into normalized results with 1-based
@@ -264,10 +266,14 @@ mod tests {
         assert!(body_has_block_markers(
             "<html><form action=\"/consent\">Choose your cookies</form></html>"
         ));
-        assert!(body_has_block_markers("verifying you are not a bot... challenge"));
+        assert!(body_has_block_markers(
+            "verifying you are not a bot... challenge"
+        ));
         assert!(body_has_block_markers("captcha required"));
         assert!(!body_has_block_markers(FIXTURE));
-        assert!(!body_has_block_markers("<html><body>plain page</body></html>"));
+        assert!(!body_has_block_markers(
+            "<html><body>plain page</body></html>"
+        ));
     }
 
     #[test]
@@ -296,7 +302,13 @@ mod tests {
         assert!(url.starts_with("https://www.bing.com/search?"));
         assert!(url.contains("format=rss"), "existing params preserved");
         assert!(url.contains("q=rust+docs"), "query must be form-encoded");
-        assert!(url.contains("setlang=en"), "English language param must be present");
-        assert!(url.contains("mkt=en-US"), "English-US market param must be present");
+        assert!(
+            url.contains("setlang=en"),
+            "English language param must be present"
+        );
+        assert!(
+            url.contains("mkt=en-US"),
+            "English-US market param must be present"
+        );
     }
 }

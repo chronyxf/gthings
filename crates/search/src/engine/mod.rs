@@ -9,9 +9,9 @@ pub mod bing;
 pub mod brave;
 pub mod google;
 pub mod html;
-pub mod technique;
 mod pacing;
 pub mod router;
+pub mod technique;
 
 use std::sync::OnceLock;
 
@@ -74,15 +74,30 @@ pub struct EngineSearchResult {
 #[derive(Debug, thiserror::Error)]
 pub enum SearchEngineError {
     #[error("{engine:?} rate limited: {detail}")]
-    RateLimited { engine: SearchEngine, detail: String },
+    RateLimited {
+        engine: SearchEngine,
+        detail: String,
+    },
     #[error("{engine:?} captcha/block page: {detail}")]
-    Captcha { engine: SearchEngine, detail: String },
+    Captcha {
+        engine: SearchEngine,
+        detail: String,
+    },
     #[error("{engine:?} network error: {detail}")]
-    Network { engine: SearchEngine, detail: String },
+    Network {
+        engine: SearchEngine,
+        detail: String,
+    },
     #[error("{engine:?} parse error: {detail}")]
-    Parse { engine: SearchEngine, detail: String },
+    Parse {
+        engine: SearchEngine,
+        detail: String,
+    },
     #[error("{engine:?} unavailable: {detail}")]
-    Unavailable { engine: SearchEngine, detail: String },
+    Unavailable {
+        engine: SearchEngine,
+        detail: String,
+    },
     #[error("all search engines failed: {0:?}")]
     AllEnginesFailed(Vec<SearchEngineError>),
 }
@@ -127,7 +142,10 @@ pub(crate) fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(USER_AGENT, reqwest::header::HeaderValue::from_static(BROWSER_UA));
+        headers.insert(
+            USER_AGENT,
+            reqwest::header::HeaderValue::from_static(BROWSER_UA),
+        );
         headers.insert(
             ACCEPT_LANGUAGE,
             reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),

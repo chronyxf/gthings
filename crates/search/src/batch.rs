@@ -146,12 +146,13 @@ async fn search_single(
 ) -> Result<Vec<crate::SearchResult>, CdpError> {
     // Acquire a permit BEFORE creating a tab; OwnedSemaphorePermit auto-releases
     // on drop (including cancellation), bounding concurrent CDP tabs.
-    let _permit = semaphore.acquire_owned().await.map_err(|e| {
-        CdpError::CdpCallFailed {
+    let _permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|e| CdpError::CdpCallFailed {
             method: "batch_search".into(),
             detail: format!("semaphore acquire failed: {e}"),
-        }
-    })?;
+        })?;
 
     // 1. Search (tab lifecycle managed by helper; shared router → cross-query
     //    pacing via the single in-memory PacingStore)
@@ -288,7 +289,9 @@ mod tests {
             })
         });
 
-        let results = collect_results(join_set, 2).await.expect("batch must not abort");
+        let results = collect_results(join_set, 2)
+            .await
+            .expect("batch must not abort");
 
         // Both queries appear in the output, each with its own result or error.
         assert_eq!(results.len(), 2);

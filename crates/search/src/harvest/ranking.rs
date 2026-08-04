@@ -71,9 +71,8 @@ pub(super) fn rank_results(
                     let query_count = *url_query_count.get(&norm).unwrap_or(&1);
                     let diversity_bonus = 1.0 / query_count as f64;
                     let norm_snippet = r.snippet.len() as f64 / max_snippet_len as f64;
-                    let score = 0.5 * r.domain_authority
-                        + 0.3 * norm_snippet
-                        + 0.2 * diversity_bonus;
+                    let score =
+                        0.5 * r.domain_authority + 0.3 * norm_snippet + 0.2 * diversity_bonus;
                     // Use idx as tiebreaker for stable sorting
                     (score, idx, query, r)
                 })

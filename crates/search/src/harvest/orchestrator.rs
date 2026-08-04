@@ -15,8 +15,8 @@ use gthings_extraction::article::QualityScore;
 use tokio::task::JoinSet;
 
 use crate::SearchResult;
-use crate::engine::router::{SearchRouter, map_engine_results};
 use crate::engine::EngineChoice;
+use crate::engine::router::{SearchRouter, map_engine_results};
 
 use super::quality::{compute_quality_with_flags, extract_sections, is_nav_heavy};
 use super::ranking::{dedup_results, rank_results};
@@ -94,7 +94,10 @@ async fn phase_search(
     // run as permits free up instead of all failing at once.
     let search_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
 
-    tracing::info!("harvest search: spawning {} parallel queries", req.queries.len());
+    tracing::info!(
+        "harvest search: spawning {} parallel queries",
+        req.queries.len()
+    );
 
     for query in &req.queries {
         let router = Arc::clone(&router);
@@ -430,7 +433,12 @@ async fn phase_follow(
                 // Acquire a permit before opening a tab; released when the task ends.
                 // Bound the wait so queued tasks give up rather than waiting
                 // unboundedly behind the 4-permit cap.
-                let _permit = match tokio::time::timeout(Duration::from_secs(30), semaphore.acquire()).await {
+                let _permit = match tokio::time::timeout(
+                    Duration::from_secs(30),
+                    semaphore.acquire(),
+                )
+                .await
+                {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => {
                         return (
@@ -490,7 +498,8 @@ async fn phase_follow(
                             gthings_common::provenance::ExtractionMethod::Pdf
                                 | gthings_common::provenance::ExtractionMethod::Arxiv
                         );
-                        let quality = compute_quality_with_flags(&fr.content, skip_len, &fr.quality_flags);
+                        let quality =
+                            compute_quality_with_flags(&fr.content, skip_len, &fr.quality_flags);
                         let sections = extract_sections(&fr.content);
                         let body_status = classify_body_status(&fr, &quality);
                         HarvestedResult {
@@ -885,7 +894,9 @@ mod tests {
     }
 
     #[test]
-    fn test_follow_failure_preserves_search_hits() {        let sr = make_result("https://example.com/page", 1, "snippet", 0.5);        let provenance = sr.provenance.clone();
+    fn test_follow_failure_preserves_search_hits() {
+        let sr = make_result("https://example.com/page", 1, "snippet", 0.5);
+        let provenance = sr.provenance.clone();
 
         // Simulate a followed result (success)
         let success = HarvestedResult {
@@ -1328,7 +1339,10 @@ mod tests {
     fn test_select_follow_candidates_empty() {
         let (selected, domains) = select_follow_candidates(vec![], 10);
         assert!(selected.is_empty(), "empty input must produce empty output");
-        assert!(domains.is_empty(), "empty input must produce empty domain set");
+        assert!(
+            domains.is_empty(),
+            "empty input must produce empty domain set"
+        );
 
         let (selected, _) = select_follow_candidates(vec![], 0);
         assert!(
@@ -1389,7 +1403,7 @@ mod tests {
         let fr = FollowResult {
             url: "https://example.com/article".into(),
             title: "t".into(),
-            content: content.clone().into(),
+            content: content.clone(),
             error: String::new(),
             provenance: Provenance {
                 source_url: "https://www.google.com/search?q=test".into(),
