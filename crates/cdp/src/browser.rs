@@ -2,6 +2,7 @@ use crate::connection::Connection;
 use crate::error::{CdpError, Result};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+#[cfg(any(test, target_os = "macos"))]
 use std::time::Duration;
 
 /// Info about a running browser discovered by [`detect`].
@@ -88,6 +89,7 @@ pub async fn connect(ws_url: &str) -> Result<Connection> {
 /// Worst-case dialog budget when the dialog never appears:
 /// `max_attempts × (osascript_timeout + inter_attempt_sleep)` =
 /// 1 × (1s + 1s) ≈ **2s**.
+#[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DialogDismissParams {
     /// Per-attempt timeout for a single `osascript` invocation.
@@ -98,6 +100,7 @@ pub(crate) struct DialogDismissParams {
     pub(crate) inter_attempt_sleep: Duration,
 }
 
+#[cfg(any(test, target_os = "macos"))]
 impl DialogDismissParams {
     /// Default parameters: 1 attempt, 1s `osascript` timeout, 1s sleep
     /// between attempts — worst-case budget ≈ 1 × (1s + 1s) ≈ 2s.
