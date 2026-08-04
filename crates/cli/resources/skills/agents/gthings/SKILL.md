@@ -23,7 +23,7 @@ User says: "search" "research" "look up" "find" "gthings" "web research" "extrac
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FORMAT>` | Output format: text, json, nd-json (default: text) |
-| `-q, --query <JMES>` | JMESPath filter on JSON output |
+| `-q, --query <DOT>` | Custom dot-notation filter on JSON output (e.g. `.data`, `.[].url`, `.results[].snippet` — not full JMESPath) |
 | `--cdp-port <PORT>` | CDP port (default: 9222) |
 | `--cdp-url <URL>` | CDP WebSocket URL (overrides port) |
 | `--timeout <SECS>` | Timeout for CDP/extraction (default: 30) |
@@ -31,11 +31,37 @@ User says: "search" "research" "look up" "find" "gthings" "web research" "extrac
 | `-q, --quiet` | Suppress non-error output |
 | `--json` | Backward-compat alias for `--output json` |
 
+## Output Envelope
+
+Every command emits a `{status, data, error}` envelope:
+
+```json
+{
+  "status": "ok" | "error",
+  "data": <command-specific result>,
+  "error": { "code": "ERROR_CODE", "detail": "...", "hint": "..." }
+}
+```
+
+On success `status` is `"ok"` and `error` is `null`; on failure `status` is `"error"` and `data` is `null`. Use `--query .data` to unwrap the payload.
+
 ## Commands
 
-### `gthings search <queries...> [--count N] [--strategy simple|parallel|harvest] [--extract-results] [--max-chars N] [--dedup STR] [--rank STR] [--follow-top N] [--warn-tabs N]`
+### `gthings search <queries...> [--count N] [--strategy simple|parallel|harvest] [--engine auto|brave|bing|google] [--extract-results] [--max-chars N] [--dedup STR] [--rank STR] [--follow-top N] [--warn-tabs N]`
 
-Google SERP search with strategy-based processing. Returns `SearchResult[]` (simple), `SearchResult[][]` (parallel), or `HarvestedResult[]` with summary (harvest). Default strategy: simple.
+Google SERP search with strategy-based processing. Returns `{"results": [...], "query": "..."}` (simple), `{"results": [...]}` (parallel), or `{"results": [...], "summary": {...}}` (harvest). Default strategy: simple.
+
+**Strategies:**
+- `simple` (default): single-query search
+- `parallel`: multi-query search, one entry per query (`{"ok": results}` or `{"error": ...}`)
+- `harvest`: full pipeline — search → dedup → rank → select → follow → quality score → summary
+
+**Engines (HTTP vs CDP):**
+- `brave`, `bing`: plain-HTTP, no browser required
+- `google`: requires a CDP browser (Chrome/Dia with `--remote-debugging-port=9222`)
+- `auto` (default): uses a browser if available, otherwise degrades to HTTP engines
+
+**Search operators:** `site:`, `-exclusion`, `"quoted"`, `filetype:`, `intitle:`, `inurl:`, `AROUND(n)`, `before:`/`after:`, `OR`/`AND`, `(...)`. Unsupported operators are stripped per-engine rather than failing.
 
 ### `gthings extract <url> [--max-chars N] [--offset N]`
 

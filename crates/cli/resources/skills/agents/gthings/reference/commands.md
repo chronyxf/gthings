@@ -7,7 +7,7 @@ All commands support `--output json` (or `--json` for backward compat) for struc
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FORMAT>` | Output format: text, json, nd-json (default: text) |
-| `-q, --query <JMES>` | JMESPath filter on JSON output |
+| `-q, --query <DOT>` | Custom dot-notation filter on JSON output (e.g. `.data`, `.[].url`, `.results[].snippet` — not full JMESPath) |
 | `--cdp-port <PORT>` | CDP port (default: 9222, env: GTHINGS_CDP_PORT) |
 | `--cdp-url <URL>` | CDP WebSocket URL (overrides port) |
 | `--timeout <SECS>` | Timeout for CDP/extraction (default: 30) |
@@ -41,8 +41,8 @@ gthings search <queries...> [--count N] [--strategy simple|parallel|harvest]
 Google SERP search via CDP browser with strategy-based processing.
 
 **Strategies:**
-- `simple` (default): Single-query search, returns `SearchResult[]`
-- `parallel`: Multi-query parallel search, returns `SearchResult[][]`
+- `simple` (default): Single-query search, returns `{"results": [...], "query": "..."}`
+- `parallel`: Multi-query parallel search, returns `{"results": [...]}` (one `{"ok": results}` or `{"error": ...}` entry per query)
 - `--strategy harvest`: Full research pipeline — search → dedup → rank → select → follow → quality score → summary
 
 **Output** (simple — `SearchResult[]`):
@@ -100,18 +100,18 @@ Google SERP search via CDP browser with strategy-based processing.
 | `--count` | 5 | Results per query |
 | `--strategy` | simple | simple, parallel, or harvest |
 | `--extract-results` | false | Extract content from result URLs (parallel/harvest) |
-| `--max-chars` | 15000 | Max chars per extracted page |
+| `--max-chars` | 40000 | Max chars per extracted page |
 | `--dedup` | url | Dedup strategy |
-| `--rank` | composite | serp_order, domain_authority, snippet_length, composite |
+| `--rank` | composite | serp, authority, snippet, composite |
 | `--follow-top` | 8 | Max URLs to follow (harvest) |
 | `--warn-tabs` | 20 | Warn when tabs exceed threshold (harvest) |
 
 **BodyStatus values:** `ok` | `snippet_only` | `extract_failed` | `pdf_unextracted` | `chrome_or_empty`
 
 **Rank strategies:**
-- `serp_order` — Google's original order, interleaved round-robin across queries
-- `domain_authority` — Descending by domain authority score
-- `snippet_length` — Descending by SERP snippet length
+- `serp` — Google's original order, interleaved round-robin across queries
+- `authority` — Descending by domain authority score
+- `snippet` — Descending by SERP snippet length
 - `composite` (default) — `0.5 * authority + 0.3 * norm_snippet + 0.2 * diversity_bonus`
 
 ---
@@ -216,8 +216,10 @@ gthings status
 Browser connection check.
 
 ```json
-{ "status": "running", "pid": 12345, "ws_url": "ws://127.0.0.1:9222/..." }
+{ "status": "running", "ws_url": "ws://127.0.0.1:9222/...", "browser": "Chrome", "version": "..." }
 ```
+
+When no browser is detected, status returns `{ "status": "stopped" }`.
 
 ---
 
@@ -241,4 +243,5 @@ Update gthings to the latest version.
 |------|---------|
 | 0 | Success |
 | 1 | Operational error (bad URL, empty results, PDF parse failure) |
+| 2 | Timeout (command exceeded its time budget) |
 | 101+ | Panic (report as bug) |

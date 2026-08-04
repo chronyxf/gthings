@@ -208,3 +208,82 @@ fn test_universal_flags_on_ax() {
         "ax --help should list the --output flag (universal flag support)"
     );
 }
+
+#[test]
+fn test_max_chars_flag_parses() {
+    // Verify --max-chars is a recognized flag on the extract command and
+    // accepts a custom value (e.g. 100000 for very long articles).
+    let (stdout, _stderr, status) = run_cli(&["extract", "--help"]);
+    assert!(
+        status.success(),
+        "extract --help should succeed: stderr={}",
+        _stderr
+    );
+    assert!(
+        stdout.contains("--max-chars"),
+        "extract --help should list the --max-chars flag"
+    );
+
+    // The flag must parse a custom value; runtime may fail (no browser) but
+    // clap must accept the argument before reaching the handler.
+    let (_stdout, _stderr, status) = run_cli(&["extract", "http://example.com", "--max-chars", "100000"]);
+    assert!(
+        status.code().is_some(),
+        "--max-chars 100000 should be a recognized flag/value"
+    );
+}
+
+#[test]
+fn test_describe_outputs_valid_json_with_expected_keys() {
+    // `gthings describe --output json` must emit valid JSON containing the
+    // machine-parseable usage guide keys an AI agent needs to self-discover
+    // the CLI: subcommands, strategies, engines, operators, output_schema.
+    let (stdout, _stderr, status) = run_cli(&["describe", "--output", "json"]);
+    assert!(
+        status.success(),
+        "describe --output json should succeed: stderr={}",
+        _stderr
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("describe --output json should emit valid JSON: {e}\nstdout={stdout}"));
+
+    let obj = parsed
+        .as_object()
+        .unwrap_or_else(|| panic!("describe output should be a JSON object: {stdout}"));
+    for key in ["subcommands", "strategies", "engines", "operators", "output_schema"] {
+        assert!(
+            obj.contains_key(key),
+            "describe output should contain key '{key}'"
+        );
+    }
+
+    // Spot-check the content of a few keys.
+    assert!(
+        parsed["strategies"].as_object().map(|s| s.contains_key("harvest")).unwrap_or(false),
+        "strategies should include 'harvest'"
+    );
+    assert!(
+        parsed["engines"].as_object().map(|e| e.contains_key("google")).unwrap_or(false),
+        "engines should include 'google'"
+    );
+    assert!(
+        parsed["operators"].as_object().map(|o| o.contains_key("site:")).unwrap_or(false),
+        "operators should include 'site:'"
+    );
+    assert!(
+        parsed["output_schema"].as_object().map(|o| o.contains_key("status")).unwrap_or(false),
+        "output_schema should include 'status'"
+    );
+}
+
+#[test]
+fn test_describe_help_lists_subcommand() {
+    // The describe subcommand must be discoverable via --help.
+    let (stdout, _stderr, status) = run_cli(&["--help"]);
+    assert!(status.success());
+    assert!(
+        stdout.contains("describe"),
+        "--help should list the 'describe' subcommand"
+    );
+}

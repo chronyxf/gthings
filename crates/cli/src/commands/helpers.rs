@@ -27,7 +27,7 @@ pub(crate) struct UniversalFlags {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output: OutputFormat,
 
-    /// JMESPath-like query filter (dot notation, e.g. '.[].url' or '.title').
+    /// JMESPath-like query filter (dot notation, e.g. '.title' or '.[].url'). Applied after the output envelope is built.
     #[arg(long, value_name = "QUERY")]
     pub query: Option<String>,
 

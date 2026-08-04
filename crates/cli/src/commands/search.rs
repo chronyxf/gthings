@@ -1,14 +1,25 @@
-//! `gthings search` — Google search via CDP.
+//! `gthings search` — multi-engine search via CDP.
 //!
-//! Uses isolated background tab pattern: each search creates its own tab,
-//! preventing cross-process blocking when concurrent searches run.
+//! Uses the multi-engine facade (`gthings_search::search_with_engine`):
+//! backends own their background tabs, so no isolated-tab plumbing is needed.
+//! Plain-HTTP engines (Brave, Bing) never require a browser;
+//! Google does, so a CDP session is only opened when one is needed.
 
-use gthings_search::search;
+use std::sync::Arc;
 
-use crate::commands::{UniversalFlags, connect, emit_output};
+use gthings_search::search_with_engine;
 
-/// Search: detect → connect → isolated search → disconnect → output.
-pub(crate) async fn cmd_search(flags: &UniversalFlags, term: &str, count: usize) -> i32 {
+use crate::commands::{UniversalFlags, connect, disconnect_session, emit_output};
+use crate::EngineFlag;
+
+/// Search: detect → connect (only when a browser engine needs it) → search
+/// (engine facade) → disconnect (only when connected) → output.
+pub(crate) async fn cmd_search(
+    flags: &UniversalFlags,
+    term: &str,
+    count: usize,
+    engine: EngineFlag,
+) -> i32 {
     if term.trim().is_empty() {
         emit_output(
             None,
@@ -22,23 +33,36 @@ pub(crate) async fn cmd_search(flags: &UniversalFlags, term: &str, count: usize)
         );
         return 1;
     }
-    let session = match connect(flags).await {
-        Ok(s) => s,
-        Err(c) => return c,
-    };
 
     let query_for_output = term.to_string();
     let term_owned = term.to_string();
-    let result = match session
-        .with_isolated_tab(|session, tab| {
-            Box::pin(async move { search(session, tab, &term_owned, count).await })
-        })
-        .await
-    {
+    let choice = engine.to_choice();
+
+    // Open a CDP session only when a browser engine (Google) is involved.
+    // HTTP engines (Brave, Bing) work with `None`; Auto degrades
+    // to the HTTP engines when no browser is available instead of failing.
+    let session: Option<Arc<gthings_cdp::Session>> = match engine {
+        EngineFlag::Brave | EngineFlag::Bing => None,
+        EngineFlag::Google => match connect(flags).await {
+            Ok(s) => Some(Arc::new(s)),
+            Err(c) => return c,
+        },
+        EngineFlag::Auto => match connect(flags).await {
+            Ok(s) => Some(Arc::new(s)),
+            Err(c) => {
+                tracing::warn!(
+                    "Browser unavailable (connect code {c}); Google disabled, falling back to HTTP engines (brave, bing)"
+                );
+                None
+            }
+        },
+    };
+
+    let result = match search_with_engine(session.as_ref(), &term_owned, count, choice).await {
         Ok(r) => r,
         Err(e) => {
-            if let Err(e) = session.disconnect().await {
-                tracing::warn!("disconnect failed after search error: {e}");
+            if let Some(s) = &session {
+                disconnect_session(Arc::clone(s)).await;
             }
             emit_output(
                 None,
@@ -54,8 +78,8 @@ pub(crate) async fn cmd_search(flags: &UniversalFlags, term: &str, count: usize)
         }
     };
 
-    if let Err(e) = session.disconnect().await {
-        tracing::warn!("disconnect failed: {e}");
+    if let Some(s) = &session {
+        disconnect_session(Arc::clone(s)).await;
     }
 
     let data = serde_json::json!({

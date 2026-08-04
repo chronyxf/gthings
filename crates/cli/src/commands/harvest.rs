@@ -9,8 +9,10 @@ use gthings_common::pagination::ExtractParams;
 use gthings_search::harvest::{BatchHarvestRequest, DedupStrategy, RankStrategy, harvest};
 
 use crate::commands::{UniversalFlags, emit_output, with_session};
+use crate::EngineFlag;
 
 /// Harvest: detect → connect → harvest → disconnect → output.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_harvest(
     flags: &UniversalFlags,
     queries: Vec<String>,
@@ -19,6 +21,7 @@ pub(crate) async fn cmd_harvest(
     follow_top: usize,
     max_chars: usize,
     warn_tabs: usize,
+    engine: EngineFlag,
 ) -> i32 {
     let dedup_strategy = if dedup.as_str() == "url" {
         DedupStrategy::UrlOnly
@@ -81,6 +84,10 @@ pub(crate) async fn cmd_harvest(
             max_chars,
         },
         reputation: Some(reputation),
+        engine: match engine {
+            EngineFlag::Auto => None,
+            other => Some(other.to_search_engine()),
+        },
     };
 
     with_session(flags, |session| async move {

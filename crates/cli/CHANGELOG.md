@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.8 (2026-08-04)
+
+### Features
+
+#### - feat: add --engine flag and multi-engine search wiring (main.rs:98)
+
+- feat: add machine-parseable describe subcommand (main.rs:405)
+- feat: open CDP only when a browser engine is needed (search.rs:36)
+- feat: emit per-query result/error entries in batch output (batch.rs:49)
+- chore: bump cdp/search/extraction dependency versions (Cargo.toml:10)
+- chore: raise default max_chars to 40000 and search timeout to 60s (main.rs:189)
+- chore: update agent skill docs for envelope/engines/operators (SKILL.md:34)
+- chore: add CLI tests for max-chars and describe (cli_tests.rs:211)
+
 ## 0.6.7 (2026-07-30)
 
 ### Fixes

@@ -1,4 +1,5 @@
 use clap::Parser;
+use gthings_search::{EngineChoice, SearchEngine};
 use std::time::Duration;
 
 mod commands;
@@ -30,19 +31,22 @@ enum Command {
         /// Number of results per query
         #[arg(long, default_value = "5")]
         count: usize,
-        /// Strategy: simple (default), parallel, harvest
+        /// Strategy: simple (single query, snippet results), parallel (multi-query, snippet results), harvest (full research pipeline: search + follow + extract content)
         #[arg(long, value_enum, default_value = "simple")]
         strategy: SearchStrategy,
-        /// Extract content from result URLs (parallel/harvest)
+        /// Engine: auto (default), brave (HTTP, no browser), bing (HTTP, no browser), google (needs CDP browser)
+        #[arg(long, value_enum, default_value = "auto")]
+        engine: EngineFlag,
+        /// Extract content from result URLs (applies to parallel; harvest always follows)
         #[arg(long)]
         extract_results: bool,
-        /// Max chars per extracted page (parallel/harvest)
-        #[arg(long, default_value = "15000")]
+        /// Max chars per extracted page (default: 40000)
+        #[arg(long, default_value = "40000")]
         max_chars: usize,
-        /// Dedup strategy for harvest
+        /// Dedup strategy for harvest (accepted values: url)
         #[arg(long, default_value = "url")]
         dedup: String,
-        /// Rank strategy for harvest
+        /// Rank strategy for harvest (accepted values: serp, authority, snippet, composite)
         #[arg(long, default_value = "composite")]
         rank: String,
         /// Number of top results to follow in harvest
@@ -64,7 +68,7 @@ enum Command {
         #[command(flatten)]
         universal: commands::UniversalFlags,
         url: String,
-        #[arg(long, default_value = "15000")]
+        #[arg(long, default_value = "40000")]
         max_chars: usize,
         #[arg(long, default_value = "0")]
         offset: usize,
@@ -84,7 +88,7 @@ enum Command {
         #[command(flatten)]
         universal: commands::UniversalFlags,
         url: String,
-        #[arg(long, default_value = "15000")]
+        #[arg(long, default_value = "40000")]
         max_chars: usize,
         #[arg(long, default_value = "0")]
         offset: usize,
@@ -94,19 +98,72 @@ enum Command {
         #[command(flatten)]
         universal: commands::UniversalFlags,
         path: std::path::PathBuf,
-        #[arg(long, default_value = "15000")]
+        #[arg(long, default_value = "40000")]
         max_chars: usize,
         #[arg(long, default_value = "0")]
         offset: usize,
+    },
+    /// Emit a machine-parseable JSON usage guide for AI agents (subcommands, strategies, engines, operators, output schema)
+    Describe {
+        #[command(flatten)]
+        universal: commands::UniversalFlags,
     },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum SearchStrategy {
+    /// simple: single query, snippet results
     Simple,
+    /// parallel: multi-query, snippet results
     Parallel,
+    /// harvest: full research pipeline (search + follow + extract content)
     Harvest,
 }
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum EngineFlag {
+    /// auto (default): picks best engine; falls back to HTTP engines when no browser is available
+    #[value(name = "auto")]
+    Auto,
+    /// brave: HTTP, no browser needed
+    #[value(name = "brave")]
+    Brave,
+    /// bing: HTTP, no browser needed
+    #[value(name = "bing")]
+    Bing,
+    /// google: needs CDP browser
+    #[value(name = "google")]
+    Google,
+}
+
+impl EngineFlag {
+    fn to_choice(&self) -> EngineChoice {
+        match self {
+            EngineFlag::Auto => EngineChoice::Auto,
+            EngineFlag::Brave => EngineChoice::Pin(SearchEngine::Brave),
+            EngineFlag::Bing => EngineChoice::Pin(SearchEngine::Bing),
+            EngineFlag::Google => EngineChoice::Pin(SearchEngine::Google),
+        }
+    }
+
+    fn to_search_engine(&self) -> SearchEngine {
+        match self {
+            EngineFlag::Brave => SearchEngine::Brave,
+            EngineFlag::Bing => SearchEngine::Bing,
+            EngineFlag::Google => SearchEngine::Google,
+            EngineFlag::Auto => panic!("EngineFlag::Auto has no concrete SearchEngine"),
+        }
+    }
+}
+
+/// Overall timeout for single-query searches (simple strategy, auto/pinned engine).
+///
+/// Google single queries can legitimately reach ~22s, and brave pin-mode can wait
+/// up to 30s of pacing before the search even starts, so a 30s cap produced
+/// spurious "timed out" failures on healthy runs. The error message derives from
+/// this constant via `as_secs()` so the two cannot drift (same pattern as
+/// `gthings_cdp::CONNECTION_TIMEOUT`).
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Run a future with a timeout, printing an error on timeout.
 /// Returns `Ok(result)` on success, `Err(2)` on timeout.
@@ -127,6 +184,7 @@ async fn handle_search_simple(
     universal: &mut commands::UniversalFlags,
     queries: Vec<String>,
     count: usize,
+    engine: EngineFlag,
 ) -> i32 {
     if queries.is_empty() {
         commands::emit_output(
@@ -143,8 +201,8 @@ async fn handle_search_simple(
     }
     run_with_timeout(
         "search",
-        30,
-        commands::cmd_search(universal, &queries[0], count),
+        SEARCH_TIMEOUT.as_secs(),
+        commands::cmd_search(universal, &queries[0], count, engine),
     )
     .await
     .unwrap_or_else(|e| e)
@@ -156,16 +214,18 @@ async fn handle_search_parallel(
     count: usize,
     extract_results: bool,
     max_chars: usize,
+    engine: EngineFlag,
 ) -> i32 {
     run_with_timeout(
         "parallel search",
         60,
-        commands::cmd_batch(universal, queries, count, extract_results, max_chars),
+        commands::cmd_batch(universal, queries, count, extract_results, max_chars, engine),
     )
     .await
     .unwrap_or_else(|e| e)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_search_harvest(
     universal: &mut commands::UniversalFlags,
     queries: Vec<String>,
@@ -174,12 +234,13 @@ async fn handle_search_harvest(
     follow_top: usize,
     max_chars: usize,
     warn_tabs: usize,
+    engine: EngineFlag,
 ) -> i32 {
     run_with_timeout(
         "harvest",
         120,
         commands::cmd_harvest(
-            universal, queries, dedup, rank, follow_top, max_chars, warn_tabs,
+            universal, queries, dedup, rank, follow_top, max_chars, warn_tabs, engine,
         ),
     )
     .await
@@ -270,6 +331,102 @@ async fn handle_pdf_file(
     .unwrap_or_else(|e| e)
 }
 
+/// Emit a machine-parseable structured usage guide as JSON so AI agents can
+/// self-discover the full CLI capability at runtime. Respects `--output json`.
+fn handle_describe(universal: &commands::UniversalFlags) -> i32 {
+    let guide = build_describe_guide();
+    let formatted =
+        commands::format_output(&guide, universal.resolved_output(), universal.query.as_deref());
+    println!("{formatted}");
+    0
+}
+
+/// Build the structured usage guide consumed by `gthings describe`.
+fn build_describe_guide() -> serde_json::Value {
+    serde_json::json!({
+        "tool": "gthings",
+        "description": "Multi-engine web search tool for AI agents: search, extract, and harvest web content via CDP.",
+        "subcommands": {
+            "search": {
+                "purpose": "Search one or more engines and return results with strategy-based processing.",
+                "flags": {
+                    "queries": "Positional search term(s); multiple for parallel/harvest.",
+                    "--count": "Number of results per query (default 5).",
+                    "--strategy": "simple | parallel | harvest (default simple).",
+                    "--engine": "auto | brave | bing | google (default auto).",
+                    "--extract-results": "Extract content from result URLs (parallel; harvest always follows).",
+                    "--max-chars": "Max chars per extracted page (default 40000).",
+                    "--dedup": "Dedup strategy for harvest (accepted: url).",
+                    "--rank": "Rank strategy for harvest (accepted: serp, authority, snippet, composite).",
+                    "--follow-top": "Number of top results to follow in harvest (default 8).",
+                    "--warn-tabs": "Warn when tabs exceed this threshold in harvest (default 20)."
+                }
+            },
+            "status": { "purpose": "Check browser connection (JSON with status/running/stopped)." },
+            "update": { "purpose": "Update gthings to the latest version." },
+            "extract": {
+                "purpose": "Extract content from any URL (auto-detects PDF, GitHub, arXiv, web).",
+                "flags": {
+                    "url": "Positional URL to extract.",
+                    "--max-chars": "Max chars to extract (default 40000).",
+                    "--offset": "Content offset (default 0)."
+                }
+            },
+            "ax": {
+                "purpose": "Fetch compressed accessibility tree for a URL (AX tree).",
+                "flags": {
+                    "url": "Positional URL.",
+                    "--max-nodes": "Max nodes in compressed output, 0 = unlimited (default 500)."
+                }
+            },
+            "pdf-url": {
+                "purpose": "Extract text from PDF at URL.",
+                "flags": { "url": "Positional URL.", "--max-chars": "default 40000.", "--offset": "default 0." }
+            },
+            "pdf-file": {
+                "purpose": "Extract text from local PDF file.",
+                "flags": { "path": "Positional file path.", "--max-chars": "default 40000.", "--offset": "default 0." }
+            },
+            "describe": { "purpose": "Emit this machine-parseable JSON usage guide." }
+        },
+        "strategies": {
+            "simple": { "when": "Single query, snippet results. Fastest; use for quick lookups." },
+            "parallel": { "when": "Multiple queries in parallel, snippet results. Use to broaden coverage across queries." },
+            "harvest": { "when": "Full research pipeline: search + follow + extract content. Use for deep research on a topic." }
+        },
+        "engines": {
+            "auto": { "transport": "auto", "note": "Default. Picks best engine; falls back to HTTP engines (brave, bing) when no browser is available." },
+            "brave": { "transport": "HTTP", "note": "No browser needed." },
+            "bing": { "transport": "HTTP", "note": "No browser needed. RSS backend ignores most advanced operators." },
+            "google": { "transport": "CDP", "note": "Requires a CDP browser connection." }
+        },
+        "operators": {
+            "site:": { "engines": ["google", "brave"], "note": "Restrict results to a domain." },
+            "-exclusion": { "engines": ["google", "brave", "bing"], "note": "Exclude a term or site (e.g. -reddit, -site:github.com)." },
+            "\"quoted\"": { "engines": ["google", "brave", "bing"], "note": "Exact phrase match." },
+            "filetype:": { "engines": ["google", "brave"], "note": "Restrict to a file type (e.g. filetype:pdf)." },
+            "intitle:": { "engines": ["google", "brave"], "note": "Term must appear in the title." },
+            "inurl:": { "engines": ["google", "brave"], "note": "Term must appear in the URL." },
+            "AROUND(n)": { "engines": ["google"], "note": "Proximity operator; Google only." },
+            "before:": { "engines": ["google", "brave"], "note": "Results before a date." },
+            "after:": { "engines": ["google", "brave"], "note": "Results after a date." }
+        },
+        "output_schema": {
+            "status": "ok | error",
+            "data": "Command result payload (null on error).",
+            "error": "null on success, else {code, detail, hint}."
+        },
+        "examples": [
+            "gthings search 'rust async' --strategy simple --engine brave",
+            "gthings search 'rust async' 'tokio' --strategy parallel --extract-results",
+            "gthings search 'rust async' --strategy harvest --rank composite --dedup url",
+            "gthings search 'site:github.com rust' --engine google",
+            "gthings extract https://example.com --max-chars 100000",
+            "gthings describe --output json"
+        ]
+    })
+}
+
 #[tokio::main]
 async fn main() {
     let mut cli = Cli::parse();
@@ -290,6 +447,7 @@ async fn main() {
             queries,
             count,
             strategy,
+            engine,
             extract_results,
             max_chars,
             dedup,
@@ -299,14 +457,23 @@ async fn main() {
         } => {
             universal.merge_from(&cli.universal);
             match strategy {
-                SearchStrategy::Simple => handle_search_simple(universal, queries, count).await,
+                SearchStrategy::Simple => {
+                    handle_search_simple(universal, queries, count, engine).await
+                }
                 SearchStrategy::Parallel => {
-                    handle_search_parallel(universal, queries, count, extract_results, max_chars)
-                        .await
+                    handle_search_parallel(
+                        universal,
+                        queries,
+                        count,
+                        extract_results,
+                        max_chars,
+                        engine,
+                    )
+                    .await
                 }
                 SearchStrategy::Harvest => {
                     handle_search_harvest(
-                        universal, queries, dedup, rank, follow_top, max_chars, warn_tabs,
+                        universal, queries, dedup, rank, follow_top, max_chars, warn_tabs, engine,
                     )
                     .await
                 }
@@ -336,6 +503,7 @@ async fn main() {
             max_chars,
             offset,
         } => handle_pdf_file(universal, &cli.universal, path, max_chars, offset).await,
+        Command::Describe { ref universal } => handle_describe(universal),
     };
     std::process::exit(code);
 }
