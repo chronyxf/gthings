@@ -1,18 +1,12 @@
 //! PDF text extraction (`pdf-url` and `pdf-file` commands).
 
-use crate::commands::{UniversalFlags, emit_output};
+use crate::util::{UniversalFlags, emit_error, emit_success};
 use gthings_common::pagination::ExtractParams;
+use gthings_common::taxonomy::ErrorCode;
 use gthings_extraction::PdfExtractor;
 
-/// Emit a uniform error envelope for PDF extraction failures.
-fn emit_error(code: &str, detail: &str, hint: &str, flags: &UniversalFlags) {
-    emit_output(
-        None,
-        Some((code, detail, hint)),
-        flags.resolved_output(),
-        flags.query.as_deref(),
-    );
-}
+/// `file://` URL prefix for local PDF paths.
+const FILE_URL_PREFIX: &str = "file://";
 
 /// Shared helper: run `PdfExtractor::extract_article` and emit the result.
 fn handle_pdf_extraction(
@@ -25,22 +19,11 @@ fn handle_pdf_extraction(
     let extractor = PdfExtractor;
     match extractor.extract_article(url, bytes, &params) {
         Ok(article) => {
-            let value = serde_json::json!(article);
-            emit_output(
-                Some(value),
-                None,
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
+            emit_success(flags, serde_json::json!(article));
             0
         }
         Err(e) => {
-            emit_output(
-                None,
-                Some(("PDF_EXTRACT_FAILED", &e.to_string(), hint)),
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
+            emit_error(flags, ErrorCode::ExtractFailed, &e.to_string(), hint);
             1
         }
     }
@@ -53,22 +36,22 @@ pub(crate) async fn cmd_pdf_url(
     max_chars: usize,
     offset: usize,
 ) -> i32 {
-    let client = crate::commands::http_client();
+    let client = crate::util::http_client();
 
     let resp = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
-            emit_error("PDF_FETCH_FAILED", &e.to_string(), "Check URL", flags);
+            emit_error(flags, ErrorCode::ExtractFailed, &e.to_string(), "Check URL");
             return 1;
         }
     };
 
     if !resp.status().is_success() {
         emit_error(
-            "PDF_HTTP_ERROR",
+            flags,
+            ErrorCode::ExtractFailed,
             &format!("HTTP {}", resp.status()),
             "Verify URL",
-            flags,
         );
         return 1;
     }
@@ -76,7 +59,7 @@ pub(crate) async fn cmd_pdf_url(
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            emit_error("PDF_READ_FAILED", &e.to_string(), "Retry", flags);
+            emit_error(flags, ErrorCode::ExtractFailed, &e.to_string(), "Retry");
             return 1;
         }
     };
@@ -95,17 +78,17 @@ pub(crate) async fn cmd_pdf_file(
     let bytes = match tokio::fs::read(path).await {
         Ok(b) => b,
         Err(e) => {
-            emit_output(
-                None,
-                Some(("PDF_READ_FAILED", &e.to_string(), "Check file path")),
-                flags.resolved_output(),
-                flags.query.as_deref(),
+            emit_error(
+                flags,
+                ErrorCode::ExtractFailed,
+                &e.to_string(),
+                "Check file path",
             );
             return 1;
         }
     };
 
-    let url = format!("file://{}", path.display());
+    let url = format!("{FILE_URL_PREFIX}{}", path.display());
     let params = ExtractParams { offset, max_chars };
     handle_pdf_extraction(flags, &url, &bytes, params, "File may not be a valid PDF")
 }

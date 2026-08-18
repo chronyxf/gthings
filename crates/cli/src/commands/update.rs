@@ -12,16 +12,31 @@ const REF_COMMANDS: &str =
 const REF_QUALITY: &str =
     include_str!("../../resources/skills/agents/gthings/reference/quality.md");
 
-/// Determine the opencode config root (`~/.config/opencode`).
+/// Resolve the user's home directory once from `$HOME`.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+/// Determine the opencode config root (`~/.config/opencode`), derived from
+/// [`home_dir`].
 fn opencode_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config").join("opencode"))
+    Some(home_dir()?.join(".config").join("opencode"))
 }
 
 /// Update gthings binary and install/refresh skill files.
+///
+/// `update` has no output flags and is human-only: every message goes to
+/// **stderr**, keeping stdout clean for machine consumers. When
+/// `GTHINGS_UPDATE_DISABLED` is set the command is a no-op (used by the Go
+/// integration contract to prevent background mutations of the environment).
 pub(crate) async fn cmd_update() -> i32 {
-    // ── Step 1: cargo install ──────────────────────────────────────────
-    println!("Updating gthings from cargo...");
+    if gthings_common::config::Config::load().update_disabled {
+        eprintln!("gthings update disabled (GTHINGS_UPDATE_DISABLED set); skipping.");
+        return 0;
+    }
+
+    // Step 1: install the latest binary.
+    eprintln!("Updating gthings from cargo...");
 
     let status = Command::new("cargo")
         .args(["install", "gthings"])
@@ -42,21 +57,22 @@ pub(crate) async fn cmd_update() -> i32 {
         }
     }
 
-    // ── Step 2: install skill files ────────────────────────────────────
-    println!("Installing skill files...");
+    // Step 2: install the skill files.
+    eprintln!("Installing skill files...");
 
-    let Some(base) = opencode_dir() else {
+    // Resolve the home directory once; both the opencode and agent skill
+    // destinations derive from it.
+    let Some(home_dir) = home_dir() else {
         eprintln!("Warning: could not determine home directory; skill files not installed.");
         eprintln!("Set $HOME to install skill files under ~/.config/opencode/.");
         return 0;
     };
+    let base = opencode_dir().unwrap_or_else(|| home_dir.join(".config").join("opencode"));
 
     // Destination paths
     let skill_dir = base.join("skills").join("gthings");
-    let home_dir = base
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("opencode_dir path must have at least 2 parent directories");
+    // `base` is `~/.config/opencode`; the agent skills live under `~/.agents`,
+    // so derive them from the shared home directory.
     let agent_dir = home_dir.join(".agents").join("skills").join("gthings");
     let ref_dir = agent_dir.join("reference");
 
@@ -101,14 +117,14 @@ pub(crate) async fn cmd_update() -> i32 {
             );
             ok = false;
         } else {
-            println!("  ✓ {} → {}", label, path.display());
+            eprintln!("  ✓ {} → {}", label, path.display());
         }
     }
 
     if ok {
-        println!("Done! gthings updated to latest version.");
+        eprintln!("Done! gthings updated to latest version.");
     } else {
-        println!("Done (with warnings — see above).");
+        eprintln!("Done (with warnings — see above).");
     }
 
     0

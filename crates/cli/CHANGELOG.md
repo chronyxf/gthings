@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.9 (2026-08-18)
+
+### Changed
+
+- refactor: replace connect/helpers modules with config/health/serve; cmd_search owns the strategy split
+- feat: add serve subcommand wrapping the gthings-serve daemon
+- refactor: shared emit_success/emit_error envelope helpers, describe guide from a const table, RankFlag ValueEnum, command timeout table
+- fix: status emits null browser/version when only the env URL is known
+- chore: add gthings-serve dependency
+
 ## 0.6.8 (2026-08-04)
 
 ### Features

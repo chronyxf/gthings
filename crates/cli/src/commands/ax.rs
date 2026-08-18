@@ -9,7 +9,9 @@
 //!
 //! Use `--max-nodes N` to limit the number of compressed nodes (default 500, 0 = unlimited).
 
-use crate::commands::{UniversalFlags, connect, emit_output};
+use gthings_common::taxonomy::ErrorCode;
+
+use crate::util::{UniversalFlags, connect, emit_error, emit_success};
 
 /// Fetch and display the compressed accessibility tree for a URL.
 pub(crate) async fn cmd_ax(flags: &UniversalFlags, url: &str, max_nodes: Option<usize>) -> i32 {
@@ -20,35 +22,35 @@ pub(crate) async fn cmd_ax(flags: &UniversalFlags, url: &str, max_nodes: Option<
 
     match gthings_cdp::ax_tree::ax_tree(&session, url, max_nodes).await {
         Ok(result) => {
-            if !flags.json && flags.output == crate::commands::helpers::OutputFormat::Text {
-                println!("{}", result.tree);
-            } else {
-                let value = serde_json::json!({
-                    "tree": result.tree,
-                    "total_nodes": result.total_nodes,
-                    "truncated": result.truncated,
-                    "url": url,
-                    "command": "ax",
-                });
-                emit_output(
-                    Some(value),
-                    None,
-                    flags.resolved_output(),
-                    flags.query.as_deref(),
+            // Guard against an empty/errored tree — report failure (exit 1)
+            // instead of silently succeeding with `data.tree=""`.
+            if result.tree.is_empty() {
+                emit_error(
+                    flags,
+                    ErrorCode::ExtractFailed,
+                    "AX_TREE_EMPTY: compressed AX tree is empty",
+                    "Check URL and browser connection",
                 );
+                return 1;
             }
+            // stdout carries only envelopes; the compressed tree rides in
+            // `data.tree` for every output format (including text).
+            let value = serde_json::json!({
+                "tree": result.tree,
+                "total_nodes": result.total_nodes,
+                "truncated": result.truncated,
+                "url": url,
+                "command": "ax",
+            });
+            emit_success(flags, value);
             0
         }
         Err(e) => {
-            emit_output(
-                None,
-                Some((
-                    "AX_TREE_FAILED",
-                    &e.to_string(),
-                    "Check URL and browser connection",
-                )),
-                flags.resolved_output(),
-                flags.query.as_deref(),
+            emit_error(
+                flags,
+                ErrorCode::ExtractFailed,
+                &e.to_string(),
+                "Check URL and browser connection",
             );
             1
         }

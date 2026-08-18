@@ -6,57 +6,31 @@ use std::sync::Arc;
 
 use gthings_common::domain_reputation::DomainReputation;
 use gthings_common::pagination::ExtractParams;
-use gthings_search::harvest::{BatchHarvestRequest, DedupStrategy, RankStrategy, harvest};
+use gthings_common::taxonomy::ErrorCode;
+use gthings_search::harvest::{BatchHarvestRequest, RankStrategy, harvest};
 
 use crate::EngineFlag;
-use crate::commands::{UniversalFlags, emit_output, with_session};
+use crate::args::RankFlag;
+use crate::util::{UniversalFlags, emit_error, emit_success, with_session};
+
+/// Default reputation cache directory name under the OS temp dir.
+const REPUTATION_DIR_NAME: &str = "gthings-reputation";
 
 /// Harvest: detect → connect → harvest → disconnect → output.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_harvest(
     flags: &UniversalFlags,
     queries: Vec<String>,
-    dedup: String,
-    rank: String,
+    rank: RankFlag,
     follow_top: usize,
     max_chars: usize,
     warn_tabs: usize,
     engine: EngineFlag,
 ) -> i32 {
-    let dedup_strategy = if dedup.as_str() == "url" {
-        DedupStrategy::UrlOnly
-    } else {
-        emit_output(
-            None,
-            Some((
-                "INVALID_DEDUP",
-                &format!("Unknown dedup strategy: {dedup}"),
-                "Use --dedup=url",
-            )),
-            flags.resolved_output(),
-            flags.query.as_deref(),
-        );
-        return 1;
-    };
-
-    let rank_strategy = match rank.as_str() {
-        "serp" => RankStrategy::SerpOrder,
-        "authority" => RankStrategy::DomainAuthority,
-        "snippet" => RankStrategy::SnippetLength,
-        "composite" => RankStrategy::Composite,
-        _ => {
-            emit_output(
-                None,
-                Some((
-                    "INVALID_RANK",
-                    &format!("Unknown rank strategy: {rank}"),
-                    "Use --rank=serp|authority|snippet|composite",
-                )),
-                flags.resolved_output(),
-                flags.query.as_deref(),
-            );
-            return 1;
-        }
+    let rank_strategy = match rank {
+        RankFlag::Serp => RankStrategy::SerpOrder,
+        RankFlag::Authority => RankStrategy::DomainAuthority,
+        RankFlag::Snippet => RankStrategy::SnippetLength,
+        RankFlag::Composite => RankStrategy::Composite,
     };
 
     let total_tabs = queries.len() + follow_top;
@@ -69,40 +43,36 @@ pub(crate) async fn cmd_harvest(
         );
     }
 
+    // Reputation cache location/TTL from env (`GTHINGS_REPUTATION_DIR`,
+    // `GTHINGS_REPUTATION_TTL_SECS`); defaults are the OS temp dir + 24h.
+    let cfg = gthings_common::config::Config::load();
+    let reputation_dir = cfg
+        .reputation_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(REPUTATION_DIR_NAME));
     let reputation = Arc::new(DomainReputation::new(
-        std::env::temp_dir().join("gthings-reputation"),
-        86400, // 24-hour TTL
+        reputation_dir,
+        cfg.reputation_ttl_secs, // default 86400
     ));
 
-    let req = BatchHarvestRequest {
+    let req = build_harvest_request(
         queries,
-        dedup: dedup_strategy,
-        rank_by: rank_strategy,
-        follow_top_n: follow_top,
-        extract_params: ExtractParams {
-            offset: 0,
-            max_chars,
-        },
-        reputation: Some(reputation),
-        engine: match engine {
-            EngineFlag::Auto => None,
-            other => Some(other.to_search_engine()),
-        },
-    };
+        rank_strategy,
+        follow_top,
+        max_chars,
+        Some(reputation),
+        engine,
+    );
 
     with_session(flags, |session| async move {
         let (results, summary) = match harvest(session, req).await {
             Ok(r) => r,
             Err(e) => {
-                emit_output(
-                    None,
-                    Some((
-                        "HARVEST_FAILED",
-                        &e.to_string(),
-                        "Check browser connection and network",
-                    )),
-                    flags.resolved_output(),
-                    flags.query.as_deref(),
+                emit_error(
+                    flags,
+                    ErrorCode::EngineFailed,
+                    &e.to_string(),
+                    "Check browser connection and network",
                 );
                 return 1;
             }
@@ -112,13 +82,32 @@ pub(crate) async fn cmd_harvest(
             "results": results,
             "summary": summary,
         });
-        emit_output(
-            Some(value),
-            None,
-            flags.resolved_output(),
-            flags.query.as_deref(),
-        );
+        emit_success(flags, value);
         0
     })
     .await
+}
+
+/// Build the [`BatchHarvestRequest`] for the harvest pipeline, threading the
+/// CLI's pinned `--engine brave|bing|google` value into `engine`; the search
+/// phase's routing mode is resolved by the router from `GTHINGS_ENGINE_MODE`.
+fn build_harvest_request(
+    queries: Vec<String>,
+    rank_by: RankStrategy,
+    follow_top_n: usize,
+    max_chars: usize,
+    reputation: Option<Arc<DomainReputation>>,
+    engine: EngineFlag,
+) -> BatchHarvestRequest {
+    BatchHarvestRequest {
+        queries,
+        rank_by,
+        follow_top_n,
+        extract_params: ExtractParams {
+            offset: 0,
+            max_chars,
+        },
+        reputation,
+        engine: engine.to_search_engine(),
+    }
 }

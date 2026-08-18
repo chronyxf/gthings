@@ -1,16 +1,18 @@
 //! Batch search (dispatched via `search --strategy parallel`).
 
+use gthings_common::taxonomy::ErrorCode;
 use gthings_search::{BatchProcessor, BatchSearchConfig};
 
 use crate::EngineFlag;
-use crate::commands::{UniversalFlags, emit_output, with_session};
+use crate::util::{UniversalFlags, emit_error, emit_success, with_session};
 
 /// Batch: detect → connect → batch → disconnect → output.
 ///
 /// BatchProcessor::search creates and closes tabs internally, so we only
 /// manage the session lifecycle at this level. The batch strategy always
-/// auto-routes engines; `--engine` is accepted for CLI consistency but
-/// ignored (a warning is emitted when a non-auto engine is requested).
+/// auto-routes engines under the router's env-resolved routing mode
+/// (`GTHINGS_ENGINE_MODE`); pinned engines (brave/bing/google) are ignored
+/// with a warning.
 pub(crate) async fn cmd_batch(
     flags: &UniversalFlags,
     queries: Vec<String>,
@@ -19,9 +21,11 @@ pub(crate) async fn cmd_batch(
     max_chars: usize,
     engine: EngineFlag,
 ) -> i32 {
-    if !matches!(engine, EngineFlag::Auto) {
+    // The batch strategy always auto-routes engines; pinned engines are
+    // ignored (a warning is emitted).
+    if engine.to_search_engine().is_some() {
         eprintln!(
-            "gthings: --engine is ignored for the parallel (batch) strategy; batch always auto-routes"
+            "gthings: --engine brave|bing|google is ignored for the parallel (batch) strategy; batch always auto-routes under GTHINGS_ENGINE_MODE"
         );
     }
     let config = BatchSearchConfig {
@@ -34,15 +38,11 @@ pub(crate) async fn cmd_batch(
         let all_results = match BatchProcessor::search(session, &queries, count, config).await {
             Ok(r) => r,
             Err(e) => {
-                emit_output(
-                    None,
-                    Some((
-                        "BATCH_FAILED",
-                        &e.to_string(),
-                        "Retry with fewer queries or longer timeout",
-                    )),
-                    flags.resolved_output(),
-                    flags.query.as_deref(),
+                emit_error(
+                    flags,
+                    ErrorCode::EngineFailed,
+                    &e.to_string(),
+                    "Retry with fewer queries or longer timeout",
                 );
                 return 1;
             }
@@ -57,12 +57,7 @@ pub(crate) async fn cmd_batch(
             })
             .collect();
 
-        emit_output(
-            Some(serde_json::json!({"results": serializable})),
-            None,
-            flags.resolved_output(),
-            flags.query.as_deref(),
-        );
+        emit_success(flags, serde_json::json!({"results": serializable}));
         0
     })
     .await
