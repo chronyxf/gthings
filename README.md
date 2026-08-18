@@ -1,134 +1,79 @@
 # gthings
 
-Single Rust binary, zero external dependencies.
+A browser-automated web research toolkit. One binary, two modes: **CLI** and **Docker daemon**.
 
-## Architecture
+## What it is
 
-```
-AI Agent → gthings CLI
-               │
-               ├── Persistent Dia/Chrome (port 9222)
-               ├── Tab create → navigate → extract → tab close
-               └── --json output
-```
+gthings turns a browser (Chrome/CDP) and plain-HTTP engines into a single research tool for AI agents and scripts. Every command returns one JSON envelope, so there is a single parse path regardless of success or failure.
 
 ## Install
-
-### From crates.io
 
 ```bash
 cargo install gthings
 ```
 
-### From source
+Requires Rust 1.85+ and a Chromium-based browser (Chrome, Brave, Edge) for browser-backed commands.
+
+## Quick start
 
 ```bash
-git clone https://github.com/chronyxf/gthings
-cd gthings
-cargo build --release
-./target/release/gthings --help
+gthings search "rust programming" --output json
 ```
 
-Requires Rust 1.85+ and a Chromium-based browser (Dia, Chrome, Brave, Edge).
+Chrome/CDP is used when needed (google engine, `ax`); HTTP engines (bing, brave) work without a browser.
 
-## Quick Start
+## Core capabilities
 
-```bash
-# Browser auto-launches on first command, persists across calls
+- **search** — strategies `simple` / `parallel` / `harvest`; engines `auto` → `google` / `bing` / `brave`, plus `brave-api` / `tavily` for paid keys.
+- **extract** — web article / PDF / arXiv / GitHub content extraction.
+- **ax** — accessibility tree.
+- **pdf-url** / **pdf-file** — PDF extraction from a URL or local file.
+- **batch / harvest** — follow-up content extraction on search results.
 
-# Simple search (5 results by default)
-./target/release/gthings search "Rust async" --json
+## Search strategies + engines
 
-# Multi-query search (parallel)
-./target/release/gthings search "Rust async" "Tokio tutorial" --strategy parallel --json
+| Strategy | What it does |
+|----------|--------------|
+| `simple` | Single-query search |
+| `parallel` | Multi-query search |
+| `harvest` | Search + follow top results (`--follow-top M`) |
 
-# Search + follow top results (harvest)
-./target/release/gthings search "rust borrow checker" --strategy harvest --follow-top 5 --json
+| Engine | Notes |
+|--------|-------|
+| `auto` | Default; degrades to HTTP engines when no browser is available |
+| `google` | Requires a CDP browser |
+| `bing` / `brave` | Plain HTTP, no browser needed |
+| `brave-api` / `tavily` | Paid API keys |
 
-# Extract content from a URL
-./target/release/gthings extract "https://www.rust-lang.org" --max-chars 20000 --json
+Select with `--engine <engine>` and `--strategy <strategy>`.
 
-# Accessibility tree
-./target/release/gthings ax "https://www.rust-lang.org" --json
+## Output
 
-# Extract PDF from URL
-./target/release/gthings pdf-url "https://arxiv.org/pdf/2401.12345" --json
-
-# Extract PDF from local file
-./target/release/gthings pdf-file "paper.pdf" --json
-
-# Check browser status
-./target/release/gthings status --json
-
-# Update gthings
-./target/release/gthings update
-```
-
-All commands accept `--output text|json|nd-json` (or legacy `--json`) and `--query <dot-notation>` for field filtering (a custom dot-notation subset, e.g. `.data`, `.[].url`, `.results[].snippet` — not full JMESPath).
-
-## For AI Agents
-
-Install the gthings skill so AI agents know how to use the tool:
-
-```bash
-bash scripts/install-skills.sh
-```
-
-Then agents load it via `skill gthings`. The skill provides:
-- Command reference with flags and JSON return types
-- Quality gate documentation (how content is scored)
-- Agent prompt template with workflow patterns
-- Error code reference for troubleshooting
-- Trace telemetry format for analyzing agent behavior
-
-## Commands
-
-| Command | Description | JSON Output |
-|---------|-------------|-------------|
-| `search <q> --strategy simple` | Google search | `{"results": [...], "query": "..."}` |
-| `search <q1> <q2> --strategy parallel` | Multi-query parallel search | `{"results": [...]}` |
-| `search <q1>... --strategy harvest --follow-top M` | Search + follow pipeline | `{"results": [...], "summary": {...}}` |
-| `extract <url>` | HTTP/Readability extraction (auto-detects PDF, arXiv, GitHub) | `{title, body, quality, provenance}` |
-| `ax <url>` | Accessibility tree | `{tree, url, total_nodes, truncated}` |
-| `pdf-url <url>` | PDF from URL | `{Pdf:{pages, text}, quality}` |
-| `pdf-file <path>` | Local PDF file | `{Pdf:{pages, text}, quality}` |
-| `status` | Browser connection check | `{browser, status, version}` |
-| `update` | Update gthings to latest version | version info |
-
-All commands support `--output text|json|nd-json` (or `--json` for JSON output) and `--query <dot-notation>` for field filtering (a custom dot-notation subset, not JMESPath).
-
-## Output Envelope
-
-Every command emits a `{status, data, error}` envelope so agents have one parse path regardless of success or failure:
+Every command emits a single JSON envelope:
 
 ```json
-{
-  "status": "ok" | "error",
-  "data": <command-specific result>,
-  "error": {
-    "code": "ERROR_CODE",
-    "detail": "human-readable detail",
-    "hint": "recovery hint"
-  }
-}
+{ "status": "ok" | "error", "data": <result>, "error": { "code", "detail", "hint" }, "trace_id": "..." }
 ```
 
-On success `status` is `"ok"` and `error` is `null`; on failure `status` is `"error"` and `data` is `null`. Use `--query .data` to unwrap the payload.
+Use `--output text|json|ndjson` to choose the format.
 
-## Search Operators
+## Daemon / Docker
 
-Queries support standard search operators (rewritten per-engine; unsupported operators are stripped rather than failing):
+```bash
+docker run -p 9080:9080 -e GTHINGS_ENGINE_MODE=free datnguyennnx/gthings:latest
+```
 
-| Operator | Example | Meaning |
-|----------|---------|---------|
-| `site:` | `rust site:github.com` | Restrict to a domain |
-| `-exclusion` | `rust -tutorial` | Exclude a term |
-| `"quoted"` | `"borrow checker"` | Exact phrase |
-| `filetype:` | `rust filetype:pdf` | Restrict to a file type |
-| `intitle:` | `intitle:async rust` | Term in page title |
-| `inurl:` | `inurl:docs rust` | Term in URL |
-| `AROUND(n)` | `docker AROUND(3) compose` | Terms within n words |
-| `before:` / `after:` | `rust after:2024` | Date range filter |
-| `OR` / `AND`, `(...)` | `(docker OR podman) compose` | Boolean grouping |
+Environment variables:
 
-`--engine auto|brave|bing|google` selects the search engine. Brave and Bing are plain-HTTP (no browser needed); Google requires a CDP browser; `auto` degrades to HTTP engines when no browser is available.
+- `GTHINGS_ENGINE_MODE` — `free` / `hybrid` / `api`
+- `GTHINGS_CDP_HOST` / `GTHINGS_CDP_PORT` — CDP browser connection
+- `GTHINGS_SERVE_BIND` — daemon bind address
+
+Endpoints: `/healthz`, `/metrics`, `POST /job`.
+
+## Ecosystem
+
+Six crates on crates.io: `gthings-common`, `gthings-extraction`, `gthings-cdp`, `gthings-search`, `gthings-serve`, `gthings`.
+
+- Docs: `gthings describe` exposes full command reference and flags.
+- Versioning / release workflow: [VERSION.md](VERSION.md).
