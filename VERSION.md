@@ -148,3 +148,42 @@ cargo publish -p <package>
 ```
 
 Repeat for each changed crate in dependency order. Never batch crates or commits.
+
+---
+
+## Docker Image Build & Push
+
+The daemon image (Dockerfile) ships `gthings serve` for Docker deployments.
+The image version tracks the `gthings-serve` crate version.
+
+### Prerequisites
+- Docker daemon running
+- Authenticated to the target registry (`docker login`)
+
+### Build (release)
+```bash
+docker build -t <namespace>/gthings:<gthings-serve-version> .
+```
+- Build from the workspace root (the Dockerfile is at the repo root).
+- The builder stage runs `cargo build --release --locked -p gthings`.
+- Example: `docker build -t yourname/gthings:0.1.0 .`
+
+### Tag
+```bash
+docker tag <namespace>/gthings:<gthings-serve-version> <namespace>/gthings:latest
+```
+- `latest` is optional and only pushed intentionally.
+
+### Push
+```bash
+docker push <namespace>/gthings:<gthings-serve-version>
+docker push <namespace>/gthings:latest        # only if latest was tagged
+```
+
+### Release integration
+- Build and push the image whenever `gthings-serve` is released (after the crates.io publish of `gthings-serve`).
+- The image contains the full `gthings` binary (serve + all CLI subcommands); the entrypoint runs the daemon.
+
+### Version rule
+- Image tag = the `gthings-serve` crate version at release time.
+- If the daemon image is released independently of a crate publish, use the next unpublished `gthings-serve` version.

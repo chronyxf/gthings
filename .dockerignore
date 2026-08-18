@@ -1,0 +1,11 @@
+target/
+.git/
+.gitignore
+.githooks/
+.github/
+*.md
+Makefile
+knope.toml
+clippy.toml
+rustfmt.toml
+scripts/
