@@ -10,13 +10,12 @@ description = "Shared utilities for gthings: disk cache, config, tracing, agent 
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
-base64 = "0.21"
 url = { workspace = true }
 psl = { workspace = true }
+uuid = { workspace = true }
 
 tokio = { workspace = true }
 

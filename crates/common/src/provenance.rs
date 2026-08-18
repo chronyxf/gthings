@@ -10,17 +10,14 @@ pub enum ExtractionMethod {
     #[default]
     Follow,
     Search,
-    Readability,
     Pdf,
-    Github,
     Arxiv,
 }
 
-/// Provenance chain tracking where content came from.
+/// Provenance record tracking where content came from.
 ///
 /// Every piece of extracted content carries a provenance record that
-/// describes how it was acquired. Chained `derived_from` allows
-/// tracing multi-hop acquisition (e.g., search result → follow).
+/// describes how it was acquired.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provenance {
     pub source_url: String,
@@ -30,7 +27,21 @@ pub struct Provenance {
     #[serde(default = "Utc::now")]
     pub accessed_at: DateTime<Utc>,
     pub duration_ms: u64,
-    pub derived_from: Option<Box<Self>>,
+}
+
+impl Provenance {
+    /// Construct a provenance record with the runtime-resolved agent and the
+    /// current timestamp. Convenience constructor used by extractors that
+    /// only need to record where content came from and how long it took.
+    pub fn new(source_url: String, method: ExtractionMethod, duration_ms: u64) -> Self {
+        Self {
+            source_url,
+            method,
+            agent: crate::user_agent::gthings_agent(),
+            accessed_at: Utc::now(),
+            duration_ms,
+        }
+    }
 }
 
 impl Default for Provenance {
@@ -38,10 +49,9 @@ impl Default for Provenance {
         Self {
             source_url: String::new(),
             method: ExtractionMethod::default(),
-            agent: String::new(),
+            agent: crate::user_agent::gthings_agent(),
             accessed_at: Utc::now(),
             duration_ms: 0,
-            derived_from: None,
         }
     }
 }
@@ -52,6 +62,16 @@ mod tests {
     use chrono::Utc;
 
     #[test]
+    fn test_provenance_default_agent_uses_runtime_agent() {
+        // Default provenance must carry the runtime-resolved agent
+        // (env override-aware, falling back to the compile-time stamp),
+        // not a stale hardcoded version.
+        let p = Provenance::default();
+        assert_eq!(p.agent, crate::user_agent::gthings_agent());
+        assert!(p.agent.starts_with("gthings/"), "got {}", p.agent);
+    }
+
+    #[test]
     fn test_provenance_serde_roundtrip() {
         let p = Provenance {
             source_url: "https://example.com".into(),
@@ -59,45 +79,12 @@ mod tests {
             agent: "gthings/test".into(),
             accessed_at: Utc::now(),
             duration_ms: 100,
-            derived_from: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: Provenance = serde_json::from_str(&json).unwrap();
         assert_eq!(p.source_url, back.source_url);
         assert_eq!(p.method, back.method, "method mismatch");
         assert_eq!(p.agent, back.agent);
-        assert!(back.derived_from.is_none());
-    }
-
-    #[test]
-    fn test_provenance_with_derived_from() {
-        let parent = Provenance {
-            source_url: "https://original.com".into(),
-            method: ExtractionMethod::Search,
-            agent: "gthings/search".into(),
-            accessed_at: Utc::now(),
-            duration_ms: 50,
-            derived_from: None,
-        };
-        let child = Provenance {
-            source_url: "https://example.com".into(),
-            method: ExtractionMethod::Follow,
-            agent: "gthings/follow".into(),
-            accessed_at: Utc::now(),
-            duration_ms: 200,
-            derived_from: Some(Box::new(parent)),
-        };
-        let json = serde_json::to_string(&child).unwrap();
-        let back: Provenance = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.source_url, "https://example.com");
-        assert!(back.derived_from.is_some());
-        let parent_back = back.derived_from.unwrap();
-        assert_eq!(parent_back.source_url, "https://original.com");
-        assert_eq!(
-            parent_back.method,
-            ExtractionMethod::Search,
-            "method should be Search"
-        );
     }
 
     #[test]
@@ -122,9 +109,7 @@ mod tests {
         let methods = vec![
             ExtractionMethod::Follow,
             ExtractionMethod::Search,
-            ExtractionMethod::Readability,
             ExtractionMethod::Pdf,
-            ExtractionMethod::Github,
             ExtractionMethod::Arxiv,
         ];
         for m in methods {
