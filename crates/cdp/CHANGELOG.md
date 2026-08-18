@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.6 (2026-08-18)
+
+### Changed
+
+- refactor: split ax_tree/browser/connection/session/tab into submodule directories
+- feat: add discovery module (check_alive, rewrite_ws_host) and SharedConnection pool
+- fix: validate URL scheme before navigation to prevent SSRF
+- refactor: box the Ws error variant and add env_or helper
+- chore: drop the similar dependency
+
 ## 0.5.5 (2026-08-04)
 
 ### Features
