@@ -4,6 +4,7 @@ mod active_port;
 mod dialog;
 
 pub(crate) use active_port::probe_devtools_active_port;
+#[cfg(target_os = "macos")]
 pub(crate) use dialog::dismiss_allow_debugging_dialog;
 
 /// Environment variable that bypasses detection with a direct WebSocket URL.

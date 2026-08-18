@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.7 (2026-08-18)
+
+### Fixed
+
+- fix: remove dead non-macOS dismiss_allow_debugging_dialog stub (fails clippy on Linux)
+
 ## 0.5.6 (2026-08-18)
 
 ### Changed

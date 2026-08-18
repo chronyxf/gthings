@@ -73,7 +73,3 @@ pub(crate) async fn dismiss_allow_debugging_dialog() {
 
     tracing::warn!("Remote debugging dialog not found — continuing");
 }
-
-/// Non-macOS: no-op.
-#[cfg(not(target_os = "macos"))]
-pub(crate) async fn dismiss_allow_debugging_dialog() {}
