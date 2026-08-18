@@ -19,11 +19,9 @@ use tokio::task::JoinSet;
 
 use crate::SearchResult;
 use crate::engine::router::SearchRouter;
+use crate::engine::{MAX_CONCURRENT_TABS, OP_TIMEOUT};
 use crate::follow::TimedSearchOutcome;
 use crate::search::search_with_router_tab;
-
-/// Maximum number of concurrent CDP tabs opened across a batch.
-const MAX_CONCURRENT_TABS: usize = 4;
 
 /// Configuration for a batch search operation.
 #[derive(Clone)]
@@ -80,11 +78,13 @@ impl BatchProcessor {
         count: usize,
         config: BatchSearchConfig,
     ) -> Result<Vec<Result<Vec<SearchResult>, CdpError>>, CdpError> {
-        let timeout = Duration::from_secs(30);
+        let timeout = OP_TIMEOUT;
         // ONE shared router for the whole batch: every concurrent query
         // dispatches through the same `SearchRouter`, so its single in-memory
         // `PacingStore` coordinates engine pacing across the entire batch
-        // (pick_and_reserve + the wait loop serialize engine dispatch).
+        // (pick_and_reserve + the wait loop serialize engine dispatch). The
+        // routing mode is resolved from `GTHINGS_ENGINE_MODE` (a daemon-level
+        // concern) inside `SearchRouter::new`.
         let router = Arc::new(SearchRouter::new(Some(Arc::clone(&session))));
         // ONE shared semaphore bounds concurrent CDP tabs across the batch.
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TABS));
@@ -118,10 +118,10 @@ async fn collect_results(
         match task {
             Ok(result) => all_results.push(result),
             Err(join_err) => {
-                return Err(CdpError::CdpCallFailed {
-                    method: "batch_search".into(),
-                    detail: format!("join error: {join_err}"),
-                });
+                return Err(crate::harvest::orchestrator::map_join_err(
+                    "batch_search",
+                    join_err,
+                ));
             }
         }
     }
@@ -156,7 +156,7 @@ async fn search_single(
 
     // 1. Search (tab lifecycle managed by helper; shared router → cross-query
     //    pacing via the single in-memory PacingStore)
-    let outcome = search_with_router_tab(&router, &session, &query, count, timeout).await?;
+    let outcome = search_with_router_tab(router.clone(), &session, &query, count, timeout).await?;
 
     let results = match outcome {
         TimedSearchOutcome::Success(results) => results,
@@ -219,7 +219,7 @@ async fn follow_with_tab(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{EngineChoice, SearchEngine, SearchEngineError};
+    use crate::engine::{EngineChoice, EngineMode, SearchEngine, SearchEngineError};
     use crate::search::search_with_router;
     use gthings_common::provenance::Provenance;
     use std::time::Instant;
@@ -233,6 +233,11 @@ mod tests {
             provenance: Provenance::default(),
             domain_authority: 0.5,
             source_type: "web".into(),
+            engine: SearchEngine::Brave,
+            score: 0.0,
+            published_date: None,
+            favicon: None,
+            mode: EngineMode::Hybrid,
         }
     }
 
@@ -245,13 +250,18 @@ mod tests {
     /// router is shared rather than rebuilt per query.
     #[tokio::test]
     async fn shared_router_pacing_visible_across_queries() {
-        let router = SearchRouter::new(None);
+        let router = Arc::new(SearchRouter::new(None));
 
         // First "batch query": pin Google → fails fast (no browser session),
         // but stamps Google's pacing reservation under the pick lock.
-        let err = search_with_router(&router, "q1", 5, EngineChoice::Pin(SearchEngine::Google))
-            .await
-            .unwrap_err();
+        let err = search_with_router(
+            router.clone(),
+            "q1",
+            5,
+            EngineChoice::Pin(SearchEngine::Google),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, SearchEngineError::Unavailable { .. }),
             "pinned Google without a session must fail fast"
@@ -262,9 +272,14 @@ mod tests {
         // before dispatching. The wait is the observable proof that the
         // first query's reservation lives in the shared router's PacingStore.
         let start = Instant::now();
-        let err = search_with_router(&router, "q2", 5, EngineChoice::Pin(SearchEngine::Google))
-            .await
-            .unwrap_err();
+        let err = search_with_router(
+            router.clone(),
+            "q2",
+            5,
+            EngineChoice::Pin(SearchEngine::Google),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, SearchEngineError::Unavailable { .. }),
             "pinned Google without a session still fails after the pacing wait"

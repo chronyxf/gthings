@@ -1,10 +1,21 @@
-use std::sync::LazyLock;
+//! Quality scoring and section extraction.
+//!
+//! Delegates standard length/word-count checks to [`ContentQuality::validate`],
+//! then applies harvest-specific overrides (skip-length for PDF/Arxiv, entropy
+//! adjustments). Split into sub-modules:
+//! - [`sections`] — Section-like structure extraction from plain text content
+
+mod sections;
 
 use gthings_common::domain_reputation::QualityFlag;
-use gthings_extraction::article::{QualityScore, Section};
+use gthings_extraction::NAV_TOKENS;
+use gthings_extraction::article::QualityScore;
 use gthings_extraction::quality::QualityReason;
 use gthings_extraction::quality::shannon_entropy;
-use regex::Regex;
+
+// Re-export section extraction at `harvest` visibility (the follow path uses
+// `super::quality::extract_sections`).
+pub(super) use sections::extract_sections;
 
 /// Detect nav-heavy chrome text (unambiguous nav-menu tokens repeated).
 ///
@@ -13,13 +24,6 @@ use regex::Regex;
 /// *mostly* nav menu text repeats many of these tokens. Dense prose is never
 /// nav-heavy, so it is never penalized as boilerplate or dropped as chrome.
 pub(super) fn is_nav_heavy(content: &str) -> bool {
-    static NAV: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?i)\b(about us|contact us|privacy policy|terms of service|careers|pricing|blog|sign in|log in|faq|help center|get started)\b",
-        )
-        .expect("valid regex: nav tokens")
-    });
-
     let len = content.len();
 
     // Length guard: a long article (thousands of chars) that merely contains a
@@ -29,7 +33,7 @@ pub(super) fn is_nav_heavy(content: &str) -> bool {
         return false;
     }
 
-    let count = NAV.find_iter(content).count();
+    let count = NAV_TOKENS.find_iter(content).count();
     if count < 3 {
         return false;
     }
@@ -160,96 +164,6 @@ pub(super) fn compute_quality_with_flags(
         reasons,
         entropy_bits_per_char: entropy,
     }
-}
-
-/// Extract section-like structure from plain text content.
-///
-/// Uses double-newline block splitting: if a block's first line is a short
-/// line that doesn't end with sentence punctuation, it's treated as a heading.
-///
-/// Supports two formats:
-/// - **Format A** — Heading and content in the same `\n\n` block, separated
-///   by a single newline: `"Heading\nContent line 1\nContent line 2"`.
-/// - **Format B** — Heading and content in separate `\n\n` blocks:
-///   `"Heading\n\nContent paragraph"`.
-pub(super) fn extract_sections(content: &str) -> Vec<Section> {
-    if content.len() < 50 {
-        return Vec::new();
-    }
-
-    let mut sections = Vec::new();
-    let blocks: Vec<&str> = content.split("\n\n").collect();
-    let mut offset = 0;
-    let mut i = 0;
-
-    // Returns `true` if `line` looks like a section heading.
-    let is_heading = |s: &str| -> bool {
-        let t = s.trim();
-        !t.is_empty()
-            && t.len() < 100
-            && !t.ends_with('.')
-            && !t.ends_with('!')
-            && !t.ends_with('?')
-            && t.chars().filter(|&c| c == ' ').count() < 12
-    };
-
-    while i < blocks.len() {
-        let raw = blocks[i];
-        let block = raw.trim();
-        let block_start = offset;
-        offset += raw.len() + 2;
-
-        if block.is_empty() {
-            i += 1;
-            continue;
-        }
-
-        let lines: Vec<&str> = block.lines().collect();
-
-        // Format A: multi-line block with heading as first line
-        if lines.len() >= 2 && is_heading(lines[0]) {
-            sections.push(Section {
-                heading: lines[0].trim().to_string(),
-                depth: 2,
-                offset: block_start,
-                length: raw.len(),
-                content: lines[1..].join("\n"),
-                subsections: Vec::new(),
-            });
-            i += 1;
-            continue;
-        }
-
-        // Format B: single-line heading followed by content in next block
-        if lines.len() == 1 && is_heading(block) && i + 1 < blocks.len() {
-            let next_raw = blocks[i + 1];
-            let next_block = next_raw.trim();
-            if !next_block.is_empty() {
-                let next_lines: Vec<&str> = next_block.lines().collect();
-                let next_is_heading =
-                    next_lines.len() == 1 && next_block.len() < 100 && is_heading(next_block);
-
-                if !next_is_heading {
-                    sections.push(Section {
-                        heading: block.to_string(),
-                        depth: 2,
-                        offset: block_start,
-                        length: raw.len() + 2 + next_raw.len(),
-                        content: next_block.to_string(),
-                        subsections: Vec::new(),
-                    });
-                    // Skip the content block too
-                    offset += next_raw.len() + 2;
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-
-        i += 1;
-    }
-
-    sections
 }
 
 #[cfg(test)]
@@ -441,26 +355,6 @@ mod tests {
             "short no-punctuation content should be empty_shell, got: {:?}",
             q.reasons
         );
-    }
-
-    // ── Section extraction tests ─────────────────────────────────────────
-
-    #[test]
-    fn test_extract_sections_empty() {
-        let sections = extract_sections("");
-        assert!(sections.is_empty());
-    }
-
-    #[test]
-    fn test_extract_sections_finds_headings() {
-        let text = "Introduction\n\nHere is some introductory content.\n\n\
-                     Background\n\nThis section provides background information.\n\n\
-                     Conclusion\n\nThe final section wraps up.";
-        let sections = extract_sections(text);
-        assert!(!sections.is_empty());
-        let headings: Vec<&str> = sections.iter().map(|s| s.heading.as_str()).collect();
-        assert!(headings.contains(&"Introduction"));
-        assert!(headings.contains(&"Background"));
     }
 
     #[test]

@@ -133,9 +133,13 @@ pub(crate) fn strip_tags(s: &str) -> String {
     out
 }
 
-/// Collapses runs of whitespace into single spaces, trimming leading and
-/// trailing whitespace — equivalent to `split_whitespace().join(" ")` but in
-/// a single pass with no intermediate `Vec`.
+/// Collapses runs of ANY whitespace (including newlines) into single spaces,
+/// trimming leading and trailing whitespace — equivalent to
+/// `split_whitespace().join(" ")` but in a single pass with no intermediate
+/// `Vec`.
+///
+/// Note: this differs from `follow::clean::collapse_whitespace`, which
+/// preserves newlines as paragraph breaks.
 pub(crate) fn collapse_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut pending_space = false;

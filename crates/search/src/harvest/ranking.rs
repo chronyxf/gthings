@@ -5,27 +5,20 @@ use indexmap::IndexMap;
 use crate::SearchResult;
 use gthings_common::url_normalizer::dedup_key;
 
-use super::types::{DedupStrategy, RankStrategy};
+use super::types::RankStrategy;
 
-/// Deduplicate search results, keeping the first occurrence of each
-/// normalized URL.
-pub(super) fn dedup_results(
-    results: Vec<(String, SearchResult)>,
-    strategy: &DedupStrategy,
-) -> Vec<(String, SearchResult)> {
-    match strategy {
-        DedupStrategy::UrlOnly => {
-            let mut seen = HashSet::new();
-            let mut deduped = Vec::new();
-            for (query, r) in results {
-                let key = dedup_key(&r.url);
-                if seen.insert(key) {
-                    deduped.push((query, r));
-                }
-            }
-            deduped
+/// Deduplicate search results by normalized URL, keeping the first
+/// occurrence of each normalized URL.
+pub(super) fn dedup_results(results: Vec<(String, SearchResult)>) -> Vec<(String, SearchResult)> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for (query, r) in results {
+        let key = dedup_key(&r.url);
+        if seen.insert(key) {
+            deduped.push((query, r));
         }
     }
+    deduped
 }
 
 /// Rank deduplicated results according to the chosen strategy.
@@ -125,6 +118,7 @@ fn interleave_by_query(results: Vec<(String, SearchResult)>) -> Vec<(String, Sea
 mod tests {
     use super::*;
     use crate::SearchResult;
+    use crate::engine::{EngineMode, SearchEngine};
     use chrono::Utc;
     use gthings_common::provenance::{ExtractionMethod, Provenance};
 
@@ -137,13 +131,17 @@ mod tests {
             provenance: Provenance {
                 source_url: "https://www.google.com/search?q=test".into(),
                 method: ExtractionMethod::Search,
-                agent: gthings_common::GTHINGS_AGENT.into(),
+                agent: gthings_common::user_agent::gthings_agent(),
                 accessed_at: Utc::now(),
                 duration_ms: 100,
-                derived_from: None,
             },
             domain_authority: authority as f64,
             source_type: "web".into(),
+            engine: SearchEngine::Brave,
+            score: 0.0,
+            published_date: None,
+            favicon: None,
+            mode: EngineMode::Hybrid,
         }
     }
 
@@ -166,7 +164,7 @@ mod tests {
                 make_result("https://example.com/page?fbclid=abc&a=1", 2, "s2", 0.5),
             ),
         ];
-        let deduped = dedup_results(results, &DedupStrategy::UrlOnly);
+        let deduped = dedup_results(results);
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].1.position, 1); // first occurrence kept
     }
@@ -183,7 +181,7 @@ mod tests {
                 make_result("https://example.com/page", 2, "s2", 0.5),
             ),
         ];
-        let deduped = dedup_results(results, &DedupStrategy::UrlOnly);
+        let deduped = dedup_results(results);
         assert_eq!(deduped.len(), 1);
     }
 
@@ -199,7 +197,7 @@ mod tests {
                 make_result("http://example.com/path", 2, "s2", 0.5),
             ),
         ];
-        let deduped = dedup_results(results, &DedupStrategy::UrlOnly);
+        let deduped = dedup_results(results);
         assert_eq!(deduped.len(), 1, "dedup_key lowercases host and path");
     }
 
@@ -220,7 +218,7 @@ mod tests {
                 make_result("https://example.com/page?keep=1", 2, "s2", 0.5),
             ),
         ];
-        let deduped = dedup_results(results, &DedupStrategy::UrlOnly);
+        let deduped = dedup_results(results);
         assert_eq!(deduped.len(), 1, "dedup strips utm tracking params");
         // Verify the kept result has keep=1
         assert!(deduped[0].1.url.contains("keep=1"));
@@ -285,7 +283,7 @@ mod tests {
     #[test]
     fn test_empty_query_list() {
         let empty: Vec<(String, SearchResult)> = vec![];
-        let deduped = dedup_results(empty.clone(), &DedupStrategy::UrlOnly);
+        let deduped = dedup_results(empty.clone());
         assert!(deduped.is_empty(), "dedup of empty list must be empty");
 
         let ranked = rank_results(empty, &RankStrategy::SerpOrder);
@@ -316,7 +314,7 @@ mod tests {
                 make_result("https://example.com/5", 5, "fifth", 0.5),
             ),
         ];
-        let deduped = dedup_results(results.clone(), &DedupStrategy::UrlOnly);
+        let deduped = dedup_results(results.clone());
         assert_eq!(deduped.len(), 5, "5 results should stay 5 after dedup");
 
         let ranked = rank_results(results, &RankStrategy::SerpOrder);

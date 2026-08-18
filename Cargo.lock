@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "gthings-search"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "gthings-cdp",

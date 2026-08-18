@@ -15,8 +15,12 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::html::{body_has_block_markers, collapse_whitespace, decode_entities, strip_tags};
-use super::{EngineSearchResult, SearchEngine, SearchEngineBackend, SearchEngineError};
+use crate::engine::html::{
+    body_has_block_markers, collapse_whitespace, decode_entities, strip_tags,
+};
+use crate::engine::{
+    EngineSearchResult, SearchEngine, SearchEngineBackend, SearchEngineError, SearchOptions,
+};
 
 /// Stateless Bing backend (plain HTTP, no browser).
 #[derive(Default)]
@@ -55,17 +59,15 @@ impl SearchEngineBackend for BingBackend {
         &self,
         query: &str,
         count: usize,
+        _options: &SearchOptions,
     ) -> Result<Vec<EngineSearchResult>, SearchEngineError> {
         let engine = self.name();
         let url = rss_url(query);
-        let response = crate::engine::http_client()
-            .get(url.as_str())
-            .send()
-            .await
-            .map_err(|e| SearchEngineError::Network {
-                engine,
-                detail: format!("request failed: {e}"),
-            })?;
+        let response = crate::engine::send_and_map(
+            engine,
+            crate::engine::http_client().get(url.as_str()).send(),
+        )
+        .await?;
 
         let status = response.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -74,6 +76,7 @@ impl SearchEngineBackend for BingBackend {
             return Err(SearchEngineError::RateLimited {
                 engine,
                 detail: format!("HTTP {status}"),
+                retry_after_ms: None,
             });
         }
         if !status.is_success() {
@@ -176,6 +179,9 @@ fn parse_results(body: &str) -> Result<Vec<EngineSearchResult>, SearchEngineErro
             snippet,
             position: results.len() + 1,
             engine: SearchEngine::Bing,
+            score: 0.0,
+            published_date: None,
+            favicon: None,
         });
     }
     Ok(results)

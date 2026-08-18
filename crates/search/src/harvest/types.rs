@@ -14,8 +14,6 @@ use serde::{Deserialize, Serialize};
 pub struct BatchHarvestRequest {
     /// One or more search queries to execute.
     pub queries: Vec<String>,
-    /// Strategy for removing duplicate results.
-    pub dedup: DedupStrategy,
     /// Strategy for ordering results after dedup.
     pub rank_by: RankStrategy,
     /// Number of top-ranked results to follow for full content extraction.
@@ -37,7 +35,6 @@ impl std::fmt::Debug for BatchHarvestRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BatchHarvestRequest")
             .field("queries", &self.queries)
-            .field("dedup", &self.dedup)
             .field("rank_by", &self.rank_by)
             .field("follow_top_n", &self.follow_top_n)
             .field("extract_params", &self.extract_params)
@@ -45,14 +42,6 @@ impl std::fmt::Debug for BatchHarvestRequest {
             .field("engine", &self.engine)
             .finish()
     }
-}
-
-/// URL deduplication strategy.
-#[derive(Debug, Clone)]
-pub enum DedupStrategy {
-    /// Normalize URLs (strip tracking params, lowercase scheme+host,
-    /// strip trailing slash) and keep the first occurrence.
-    UrlOnly,
 }
 
 /// Status of body content for a harvested result — lets agents triage without re-inferring

@@ -8,7 +8,7 @@
 //! - [`types`] — Data types and enums
 //! - [`orchestrator`] — Top-level orchestration (harvest, phase_search, phase_follow)
 //! - [`ranking`] — Dedup and ranking logic
-//! - [`quality`] — Quality scoring and section extraction
+//! - [`quality`] — Quality scoring (directory module; `quality::sections` extracts sections)
 
 pub(crate) mod orchestrator;
 mod quality;
@@ -19,6 +19,6 @@ pub(crate) mod types;
 pub use orchestrator::harvest;
 pub(crate) use orchestrator::is_junk_url;
 pub use types::{
-    BatchHarvestRequest, BodyStatus, DedupStrategy, HarvestRunSummary, HarvestWarning,
-    HarvestedResult, QueryCoverage, RankStrategy,
+    BatchHarvestRequest, BodyStatus, HarvestRunSummary, HarvestWarning, HarvestedResult,
+    QueryCoverage, RankStrategy,
 };

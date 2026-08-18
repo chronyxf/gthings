@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.1 (2026-08-18)
+
+### Changed
+
+- refactor: split engine backends into api/ (brave, tavily) and scrape/ (bing, brave, google) with shared types/http helpers
+- feat: add streaming search facade (search_streaming, SearchEvent, EngineMode)
+- fix: keyword dedup keeps the first occurrence of repeated plain tokens
+- refactor: share parse_organic_results, send_and_map, dedup_by_base_key, acquire_permit, map_join_err helpers
+- chore: remove DuckDuckGo backend and DedupStrategy
+
 ## 0.8.0 (2026-08-04)
 
 ### Breaking Changes

@@ -4,8 +4,7 @@
 //! `-exclusion`, `"exact phrase"`, `OR`/`AND`, parentheses, `AROUND(n)`,
 //! numeric ranges, wildcards, `filetype:`, `intitle:`, ...) and strips the
 //! operators a target engine does not support, per the canonical capability
-//! matrix. Queries without operators pass through byte-for-byte unchanged;
-//! DuckDuckGo is a stub and always returns the query unchanged.
+//! matrix. Queries without operators pass through byte-for-byte unchanged.
 
 use std::borrow::Cow;
 
@@ -147,7 +146,9 @@ fn kw_supported(engine: SearchEngine, kw: &str) -> bool {
         // `related:`, `define:`, `cache:` are all ignored. Only exclusions
         // (`-term`), quoted phrases, and plain tokens survive.
         SearchEngine::Bing => false,
-        SearchEngine::DuckDuckGo => true,
+        // Paid API backends: forward keyword operators to the provider and let
+        // it decide — neither docs a strict unsupported set, so pass through.
+        SearchEngine::BraveApi | SearchEngine::Tavily => true,
     }
 }
 
@@ -175,28 +176,80 @@ fn has_operator_chars(query: &str) -> bool {
         || query.contains("..")
 }
 
+/// Collect plain tokens (lowercased) in order, marking each as a duplicate
+/// when the same plain keyword appeared earlier (case-insensitive). This is
+/// the single tokenize/classify/dedup routine shared by the fast-path
+/// duplicate check and the tokenized rewrite, so both agree on what counts
+/// as a repeated plain keyword.
+fn plain_tokens(query: &str) -> Vec<(String, bool)> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for token in tokenize(query) {
+        if classify(token) != TokenKind::Plain {
+            continue;
+        }
+        let lower = token.to_lowercase();
+        let dup = seen.contains(&lower);
+        if !dup {
+            seen.push(lower.clone());
+        }
+        out.push((lower, dup));
+    }
+    out
+}
+
+/// True when `query` repeats a plain keyword case-insensitively. Only
+/// consulted when no operator chars are present; used to route
+/// duplicate-bearing queries through the tokenized dedup path while keeping
+/// duplicate-free queries on the borrowing fast path.
+fn has_duplicate_plain_tokens(query: &str) -> bool {
+    plain_tokens(query).iter().any(|(_, dup)| *dup)
+}
+
 /// Rewrite `query` for `engine`, dropping operators the engine does not
 /// support while keeping supported tokens in original order, joined by
 /// single spaces. Operator keyword case is preserved as typed.
 ///
+/// Repeated plain keywords are deduplicated case-insensitively (first
+/// occurrence wins, original order preserved) so queries stay focused on
+/// distinct concepts. Non-plain tokens (exclusions, quoted phrases,
+/// `keyword:` operators, ranges, ...) are never deduplicated.
+///
 /// Returns [`Cow::Borrowed`] when the query passes through unchanged (no
-/// operators, DuckDuckGo stub, or empty input) and [`Cow::Owned`] only when
-/// operators are actually stripped.
+/// operators, no duplicate keywords, or empty input) and [`Cow::Owned`]
+/// only when operators are stripped or keywords deduplicated. If every
+/// token is stripped, the original raw query is returned as a fallback.
 pub fn rewrite(query: &str, engine: SearchEngine) -> Cow<'_, str> {
-    // DuckDuckGo is a stub; empty/whitespace queries pass through untouched.
-    if engine == SearchEngine::DuckDuckGo || query.trim().is_empty() {
+    // Empty/whitespace queries pass through untouched.
+    if query.trim().is_empty() {
         return Cow::Borrowed(query);
     }
 
-    // Fast path: no operator trigger chars → passthrough unchanged without
-    // tokenizing or rebuilding.
-    if !has_operator_chars(query) {
+    // Fast path: no operator trigger chars and no repeated plain keywords →
+    // passthrough unchanged without tokenizing or rebuilding. Queries with
+    // duplicate keywords still need dedup, so they route through the
+    // tokenized path below.
+    if !has_operator_chars(query) && !has_duplicate_plain_tokens(query) {
         return Cow::Borrowed(query);
     }
 
     let mut out: Vec<Cow<'_, str>> = Vec::with_capacity(query.len() / 4 + 1);
+    // Reuses the shared tokenize/classify/dedup routine: `plain_tokens`
+    // yields each Plain keyword in order with a `dup` flag marking whether
+    // the same (case-insensitive) keyword appeared earlier. We walk it in
+    // lockstep with the token stream, skipping only the duplicate
+    // occurrences so the first occurrence of each keyword is retained.
+    let plain = plain_tokens(query);
+    let mut plain_idx = 0;
     for token in tokenize(query) {
         let kind = classify(token);
+        if kind == TokenKind::Plain {
+            let (_, dup) = plain[plain_idx];
+            plain_idx += 1;
+            if dup {
+                continue;
+            }
+        }
         let keep = match kind {
             TokenKind::Quoted
             | TokenKind::Exclusion
@@ -222,7 +275,14 @@ pub fn rewrite(query: &str, engine: SearchEngine) -> Cow<'_, str> {
         // changes (wildcard/paren strip), so operator-bearing queries that
         // pass through unchanged don't allocate per token.
         let mut t: Cow<'_, str> = Cow::Borrowed(token);
-        if matches!(engine, SearchEngine::Brave | SearchEngine::Bing) && token.contains('*') {
+        if matches!(
+            engine,
+            SearchEngine::Brave
+                | SearchEngine::Bing
+                | SearchEngine::BraveApi
+                | SearchEngine::Tavily
+        ) && token.contains('*')
+        {
             // Wildcard-in-phrase (and standalone `*`) is unsupported:
             // remove '*' chars; collapse spaces left inside quoted phrases.
             let stripped = t.replace('*', "");
@@ -239,6 +299,11 @@ pub fn rewrite(query: &str, engine: SearchEngine) -> Cow<'_, str> {
             out.push(t);
         }
     }
+    // Every token was stripped (e.g. Bing dropping all keyword operators):
+    // fall back to the original raw query rather than returning "".
+    if out.is_empty() {
+        return Cow::Borrowed(query);
+    }
     Cow::Owned(out.join(" "))
 }
 
@@ -246,7 +311,7 @@ pub fn rewrite(query: &str, engine: SearchEngine) -> Cow<'_, str> {
 mod tests {
     use super::*;
 
-    /// Engines with real operator support (DuckDuckGo is a passthrough stub).
+    /// Engines with real (partial or full) operator support.
     const ALL: [SearchEngine; 3] = [
         SearchEngine::Brave,
         SearchEngine::Bing,
@@ -274,7 +339,9 @@ mod tests {
     #[test]
     fn bing_strips_site_after_before_filetype_intitle() {
         let q = "site:github.com after:2025 before:2024 filetype:pdf intitle:x inurl:y intext:z";
-        assert_eq!(rewrite(q, SearchEngine::Bing), "");
+        // All tokens are stripped; the empty-output fallback returns the
+        // original raw query rather than "".
+        assert_eq!(rewrite(q, SearchEngine::Bing), q);
     }
 
     #[test]
@@ -367,7 +434,6 @@ mod tests {
     fn empty_and_whitespace_query_unchanged() {
         assert_eq!(rewrite("", SearchEngine::Google), "");
         assert_eq!(rewrite("   ", SearchEngine::Brave), "   ");
-        assert_eq!(rewrite("", SearchEngine::DuckDuckGo), "");
     }
 
     #[test]
@@ -376,7 +442,6 @@ mod tests {
         for engine in ALL {
             assert_eq!(rewrite(q, engine), q);
         }
-        assert_eq!(rewrite(q, SearchEngine::DuckDuckGo), q);
     }
 
     #[test]
@@ -396,26 +461,52 @@ mod tests {
     }
 
     #[test]
-    fn ddg_returns_query_unchanged() {
-        let q = "site:foo -bar AROUND(2) cache:x \"quoted\"";
-        assert_eq!(rewrite(q, SearchEngine::DuckDuckGo), q);
-    }
-
-    #[test]
     fn no_operator_query_is_borrowed() {
         let q = "redis streams";
         for engine in ALL {
             assert!(matches!(rewrite(q, engine), Cow::Borrowed(_)));
         }
-        assert!(matches!(
-            rewrite(q, SearchEngine::DuckDuckGo),
-            Cow::Borrowed(_)
-        ));
     }
 
     #[test]
     fn operator_query_is_owned() {
         let q = "react cache:react.dev hooks";
         assert!(matches!(rewrite(q, SearchEngine::Google), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn keyword_order_and_dedup_for_google_and_brave() {
+        // Order stability: keyword order is preserved verbatim for plain
+        // queries (fast path) and across mixed queries (tokenized path).
+        for engine in [SearchEngine::Google, SearchEngine::Brave] {
+            assert_eq!(
+                rewrite("kubernetes networking basics", engine),
+                "kubernetes networking basics"
+            );
+            assert_eq!(
+                rewrite("kubernetes networking basics site:github.com", engine),
+                "kubernetes networking basics site:github.com"
+            );
+        }
+        // Dedup: repeated plain keywords collapse case-insensitively, first
+        // occurrence wins, for both Google and Brave.
+        assert_eq!(
+            rewrite("rust rust programming", SearchEngine::Google),
+            "rust programming"
+        );
+        assert_eq!(rewrite("Rust rust", SearchEngine::Google), "Rust");
+        assert_eq!(
+            rewrite("rust rust programming", SearchEngine::Brave),
+            "rust programming"
+        );
+        // Duplicates elsewhere (operator keywords, exclusions, quoted
+        // phrases) are never deduplicated.
+        assert_eq!(
+            rewrite(
+                "site:github.com site:github.com -foo -foo",
+                SearchEngine::Google
+            ),
+            "site:github.com site:github.com -foo -foo"
+        );
     }
 }
