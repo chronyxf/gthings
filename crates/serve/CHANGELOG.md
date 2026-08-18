@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 (2026-08-18)
+
+### Changed
+
+- chore: version bump for CI/CD pipeline validation
+
 ## 0.1.0 (2026-08-18)
 
 ### Added
