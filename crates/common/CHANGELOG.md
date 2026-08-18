@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.9 (2026-08-18)
+
+### Changed
+
+- refactor: split into submodules and add shared env/time helpers
+
 ## 0.3.8 (2026-08-04)
 
 ### Fixes
