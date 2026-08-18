@@ -1,58 +1,9 @@
-use gthings_common::pagination::ExtractParams;
-
-use crate::article::{Article, ExtractionError, ExtractionMethod};
-
-/// Every extractor implements this trait.
-/// Input varies by source, output is always Article.
-/// `params` controls offset/max_chars slicing of the extracted text.
-#[async_trait::async_trait]
-pub trait Extractor: Send + Sync {
-    type Input: Send + 'static;
-    async fn extract(
-        &self,
-        input: Self::Input,
-        params: ExtractParams,
-    ) -> Result<Article, ExtractionError>;
-    fn method(&self) -> ExtractionMethod;
-}
-
-/// Source type detected from URL.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SourceType {
-    Web,
-    Pdf,
-    Arxiv,
-    GitHub,
-}
-
-impl SourceType {
-    /// Detect source type from URL string.
-    pub fn from_url(url: &str) -> Self {
-        let lower = url.to_lowercase();
-        if lower.contains("arxiv.org") {
-            SourceType::Arxiv
-        } else if lower.contains("github.com") {
-            SourceType::GitHub
-        } else if lower.ends_with(".pdf") || lower.contains("/pdf/") {
-            SourceType::Pdf
-        } else {
-            SourceType::Web
-        }
-    }
-}
-
 /// Compute a domain authority score (0.0-1.0) for a hostname.
 ///
 /// Uses a curated list of academic, technical, news, and government domains.
 /// Unknown domains default to 0.5. The score helps AI agents assess source trustworthiness.
-#[allow(clippy::cast_precision_loss)]
-pub fn domain_authority(host: &str) -> f32 {
-    authority_for_domain(host) as f32
-}
-
-/// Internal helper: look up authority value for a normalized domain string.
-fn authority_for_domain(domain: &str) -> f64 {
-    let domain = domain.to_lowercase();
+pub fn domain_authority(host: &str) -> f64 {
+    let domain = host.to_lowercase();
 
     // Consolidated authority tiers: (score, domain_list)
     let tiers: &[(f64, &[&str])] = &[
@@ -134,10 +85,12 @@ fn authority_for_domain(domain: &str) -> f64 {
     ];
 
     for (score, domains) in tiers {
-        if domains
-            .iter()
-            .any(|h| domain == *h || domain.ends_with(&format!(".{}", h)))
-        {
+        if domains.iter().any(|h| {
+            domain == *h
+                || domain
+                    .strip_suffix(*h)
+                    .is_some_and(|rest| rest.ends_with('.'))
+        }) {
             return *score;
         }
     }
@@ -166,7 +119,7 @@ pub fn compute_domain_authority(url: &str) -> f64 {
             .unwrap_or("")
             .to_lowercase()
     });
-    domain_authority(&domain) as f64
+    domain_authority(&domain)
 }
 
 #[cfg(test)]

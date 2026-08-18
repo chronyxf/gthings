@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.5 (2026-08-18)
+
+### Changed
+
+#### - split dispatch.rs, extractor.rs, pdf.rs, web.rs into submodules
+
+- split dispatch.rs into dispatch/ (arxiv, github, language, rate_limit, mod.rs)
+- split extractor.rs into extractor/ (authority, source, trait, mod.rs)
+- split pdf.rs into pdf/ (metadata, mod.rs)
+- split web.rs into web/ (dom, quality, sections, mod.rs)
+
+#### - split quality/ into patterns, detect, and validate
+
+- move compiled detection regexes (bot/paywall/captcha, text metrics, boilerplate) into quality/patterns.rs
+- move page-signal detection (detect_all) and the empty-shell heuristic into quality/detect.rs
+- reduce quality/validate.rs to the scoring pipeline and its tests; drop duplicate in-browser sync docs
+- remove unused QualityFlag import and QualityResult.flags field
+
+#### - share quality/extraction helpers
+
+- centralize penalties into a single PENALTY_TABLE + penalty_for() mapping reason to score delta
+- add QualityReason::as_str() stable snake_case encoding, shared with the serde wire format so the two can never drift
+- add QualityScore::from_result() to build an article QualityScore from a typed QualityResult
+- export NAV_TOKENS and is_nav_dense from quality/mod.rs for nav-chrome detection
+- add JSON-LD first_name helper, deduplicating the structurally identical author and publisher branches
+- remove unused ExtractionMethod variants (Cetd, CdpEvaluate)
+
 ## 0.5.4 (2026-08-04)
 
 ### Features

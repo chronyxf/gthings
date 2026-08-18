@@ -1,15 +1,70 @@
 //! Content quality assessment: validation, detection, and entropy metrics.
 //!
-//! The module is intentionally kept to two files:
+//! Split across submodules in the `quality/` directory:
 //! - `mod.rs` — shared types, constants, and the entropy metric.
-//! - `validate.rs` — the [`ContentQuality`] validation and detection logic.
+//! - `patterns.rs` — compiled regexes (bot/paywall/captcha detection, text
+//!   metrics, boilerplate heuristics).
+//! - `detect.rs` — page-signal detection ([`ContentQuality::detect_all`]) and the
+//!   shared empty-shell heuristic.
+//! - `validate.rs` — the [`ContentQuality::validate`] scoring pipeline and its tests.
 
+mod detect;
+mod patterns;
 mod validate;
+
+pub(crate) use detect::is_empty_shell;
+pub use patterns::{NAV_TOKENS, is_nav_dense};
 
 use std::collections::HashMap;
 
 /// Shared constant for paywall teaser detection.
 pub const READ_MORE_INDICATOR: &str = "Read More \u{00bb}";
+
+/// Minimum content length (bytes) before text is considered substantive.
+pub(crate) const MIN_CONTENT_LEN: usize = 80;
+/// Minimum word count for short text to avoid the empty-shell heuristic.
+pub(crate) const MIN_WORDS: usize = 15;
+
+/// Penalty applied when content is too short to be useful.
+pub(crate) const PENALTY_TOO_SHORT: f64 = 0.4;
+/// Penalty applied for browser error / connection / 404 pages.
+pub(crate) const PENALTY_ERROR_PAGE: f64 = 0.5;
+/// Penalty applied for a paywall teaser.
+pub(crate) const PENALTY_PAYWALL: f64 = 0.5;
+/// Penalty applied for navigation chrome.
+pub(crate) const PENALTY_NAV_CHROME: f64 = 0.3;
+/// Penalty applied for boilerplate content.
+pub(crate) const PENALTY_BOILERPLATE: f64 = 0.3;
+/// Penalty applied for too few words.
+pub(crate) const PENALTY_TOO_FEW_WORDS: f64 = 0.2;
+/// Penalty applied for missing punctuation.
+pub(crate) const PENALTY_NO_PUNCTUATION: f64 = 0.1;
+/// Bonus for natural-language punctuation (smaller than the NoPunctuation penalty).
+pub(crate) const BONUS_PUNCTUATION: f64 = 0.05;
+/// Bonus for natural-language long words.
+pub(crate) const BONUS_LONG_WORDS: f64 = 0.05;
+
+/// Single source of truth mapping each quality reason to its score penalty.
+pub(crate) const PENALTY_TABLE: &[(QualityReason, f64)] = &[
+    (QualityReason::TooShort, PENALTY_TOO_SHORT),
+    (QualityReason::BrowserErrorPage, PENALTY_ERROR_PAGE),
+    (QualityReason::ConnectionError, PENALTY_ERROR_PAGE),
+    (QualityReason::NotFound, PENALTY_ERROR_PAGE),
+    (QualityReason::PaywallTeaser, PENALTY_PAYWALL),
+    (QualityReason::NavigationChrome, PENALTY_NAV_CHROME),
+    (QualityReason::Boilerplate, PENALTY_BOILERPLATE),
+    (QualityReason::TooFewWords, PENALTY_TOO_FEW_WORDS),
+    (QualityReason::NoPunctuation, PENALTY_NO_PUNCTUATION),
+];
+
+/// Look up the score penalty for a quality reason.
+pub(crate) fn penalty_for(reason: QualityReason) -> f64 {
+    PENALTY_TABLE
+        .iter()
+        .find(|(r, _)| *r == reason)
+        .map(|(_, p)| *p)
+        .unwrap_or(0.0)
+}
 
 /// Quality flag for domain-level reputation tracking.
 ///
@@ -50,6 +105,37 @@ pub enum QualityReason {
     Boilerplate,
 }
 
+/// Stable snake_case string encoding, matching the `serde`
+/// `rename_all = "snake_case"` serialization. Single source shared by
+/// [`QualityReason::as_str`] and the wire format so the two can never drift.
+const REASON_STR: &[(QualityReason, &str)] = &[
+    (QualityReason::EmptyContent, "empty_content"),
+    (QualityReason::TooShort, "too_short"),
+    (QualityReason::BrowserErrorPage, "browser_error_page"),
+    (QualityReason::ConnectionError, "connection_error"),
+    (QualityReason::NotFound, "not_found"),
+    (QualityReason::WhitespaceOnly, "whitespace_only"),
+    (QualityReason::PaywallTeaser, "paywall_teaser"),
+    (QualityReason::NavigationChrome, "navigation_chrome"),
+    (QualityReason::TooFewWords, "too_few_words"),
+    (QualityReason::NoPunctuation, "no_punctuation"),
+    (QualityReason::Boilerplate, "boilerplate"),
+];
+
+impl QualityReason {
+    /// Stable snake_case string encoding, matching the `serde`
+    /// `rename_all = "snake_case"` serialization. Used wherever reasons are
+    /// surfaced as strings (e.g. `QualityScore::reasons`) instead of relying
+    /// on `Debug` formatting.
+    pub(crate) fn as_str(&self) -> &'static str {
+        REASON_STR
+            .iter()
+            .find(|(r, _)| *r == *self)
+            .map(|(_, s)| *s)
+            .unwrap_or("unknown")
+    }
+}
+
 /// Result of a content quality validation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QualityResult {
@@ -63,8 +149,23 @@ pub struct QualityResult {
     pub length: usize,
     /// Character-level Shannon entropy (bits/char) of the extracted text.
     pub entropy_bits_per_char: f32,
-    /// Domain-level quality flags derived from content analysis (e.g., ThinContent, Garbled).
-    pub flags: Vec<QualityFlag>,
+}
+
+impl crate::article::QualityScore {
+    /// Build a [`crate::article::QualityScore`] from a typed [`QualityResult`],
+    /// encoding reasons as stable snake_case strings.
+    pub fn from_result(result: &QualityResult) -> Self {
+        Self {
+            score: result.score,
+            is_ok: result.is_ok,
+            reasons: result
+                .reasons
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .collect(),
+            entropy_bits_per_char: result.entropy_bits_per_char,
+        }
+    }
 }
 
 /// Content quality validation — all methods are stateless.

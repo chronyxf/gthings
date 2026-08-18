@@ -41,11 +41,9 @@ pub struct ExtractionInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ExtractionMethod {
     Readability,
-    Cetd,
     PdfText,
     RawFile,
     ArxivOai,
-    CdpEvaluate,
 }
 
 /// The extracted content body — can be structured article, code, or PDF.

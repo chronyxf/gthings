@@ -1,258 +1,16 @@
-/// PDF metadata extraction and PdfExtractor API.
-///
-/// Extracts text via `pdf-extract` (bundled MuPDF, no system dependencies).
-use pdf_extract::extract_text_from_mem;
-use regex::Regex;
-use std::io::Read;
-use std::time::Instant;
-
-use gthings_common::pagination::ExtractParams;
-use gthings_common::provenance::{ExtractionMethod as ProvenanceMethod, Provenance};
-
-use crate::article::{
-    Article, ContentTree, ContinuationSignals, ExtractionError, ExtractionInfo, ExtractionMethod,
-    QualityScore, SourceInfo,
-};
-use crate::extractor::Extractor;
-use async_trait::async_trait;
-
 /// Metadata extracted from a PDF document's /Info dictionary and XMP metadata.
 #[derive(Debug, Clone, Default)]
-pub struct PdfMetadata {
+pub(crate) struct PdfMetadata {
     pub author: Option<String>,
     pub title: Option<String>,
     pub creator: Option<String>,
     pub creation_date: Option<String>,
 }
 
-/// PDF text extractor using `pdf-extract` (bundled MuPDF).
-///
-/// # Examples
-///
-/// ```ignore
-/// let pdf_bytes = std::fs::read("document.pdf").unwrap();
-/// let extractor = PdfExtractor;
-/// let article = extractor.extract_article("https://example.com/doc.pdf", &pdf_bytes).unwrap();
-/// ```
-pub struct PdfExtractor;
+use regex::Regex;
+use std::io::Read;
 
-impl PdfExtractor {
-    /// Extract PDF content as an Article.
-    ///
-    /// Uses `pdf-extract` (bundled MuPDF) to extract text from PDF bytes.
-    /// `params` controls offset/max_chars slicing of the extracted text.
-    pub fn extract_article(
-        &self,
-        url: &str,
-        bytes: &[u8],
-        params: &ExtractParams,
-    ) -> Result<Article, ExtractionError> {
-        let start = Instant::now();
-
-        if !Self::is_pdf(bytes) {
-            return Err(ExtractionError::Parse("not a valid PDF".into()));
-        }
-
-        let text = match Self::try_pdf_extract(bytes) {
-            Some(t) => t,
-            None => {
-                return Err(ExtractionError::Empty(
-                    "pdf-extract could not extract any text from PDF".into(),
-                ));
-            }
-        };
-
-        let pages = Self::count_pages(bytes);
-        let total_len = text.len();
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        // Apply offset and max_chars slicing
-        let effective_text: String = text
-            .chars()
-            .skip(params.offset)
-            .take(params.max_chars)
-            .collect();
-        let effective_len = effective_text.len();
-
-        let pagination =
-            gthings_common::pagination::build_pagination(params, url, total_len, effective_len)
-                .map_err(|e| ExtractionError::Parse(e.to_string()))?;
-
-        // Extract PDF metadata — try /Info dict first, fall back to XMP
-        let pdf_meta = extract_pdf_info_metadata(bytes)
-            .ok()
-            .flatten()
-            .or_else(|| extract_pdf_xmp_metadata(bytes).ok().flatten());
-
-        let author = pdf_meta.as_ref().and_then(|m| m.author.clone());
-        let published = pdf_meta.as_ref().and_then(|m| {
-            m.creation_date
-                .as_ref()
-                .and_then(|d| normalize_pdf_date(d))
-                .or_else(|| m.creation_date.clone())
-        });
-        let title = pdf_meta.as_ref().and_then(|m| m.title.clone());
-        let source_site = pdf_meta
-            .as_ref()
-            .and_then(|m| m.creator.clone())
-            .unwrap_or_default();
-
-        let q_score = compute_readability_score(&effective_text, effective_len);
-        let mut quality_reasons = Vec::new();
-        if effective_len <= 500 {
-            quality_reasons.push("too_short".into());
-        }
-        if q_score <= 0.3 && effective_len > 500 {
-            quality_reasons.push("readability_artifacts".into());
-        }
-        let quality = QualityScore {
-            score: crate::article::round_score(q_score),
-            is_ok: q_score >= 0.5,
-            reasons: quality_reasons,
-            entropy_bits_per_char: 0.0,
-        };
-
-        let now = chrono::Utc::now();
-        let provenance = Provenance {
-            source_url: url.to_string(),
-            method: ProvenanceMethod::Pdf,
-            agent: gthings_common::GTHINGS_AGENT.into(),
-            accessed_at: now,
-            duration_ms,
-            derived_from: None,
-        };
-
-        Ok(Article {
-            url: url.to_string(),
-            title: title.unwrap_or_default(),
-            source: SourceInfo {
-                author,
-                published,
-                site_name: source_site,
-                domain_authority: crate::article::round_score(
-                    crate::extractor::compute_domain_authority(url),
-                ),
-                language: None,
-            },
-            extraction: ExtractionInfo {
-                method: ExtractionMethod::PdfText,
-                confidence: quality.score,
-                accessed_at: now.to_rfc3339(),
-                duration_ms,
-            },
-            body: ContentTree::Pdf {
-                pages,
-                text: effective_text,
-                has_toc: false,
-            },
-            signals: ContinuationSignals {
-                truncated: pagination.truncated,
-                total_length: total_len,
-                returned_length: effective_len,
-                is_paywall: false,
-                is_bot_blocked: false,
-                is_empty_shell: total_len < 200,
-                related_urls: Vec::new(),
-            },
-            quality,
-            provenance: Some(provenance),
-            pagination: Some(pagination),
-        })
-    }
-
-    /// Check if bytes start with the PDF magic number `%PDF-`.
-    fn is_pdf(bytes: &[u8]) -> bool {
-        bytes.len() >= 5 && bytes[..5] == *b"%PDF-"
-    }
-
-    /// Count pages in PDF by counting `/Type /Page` entries (heuristic).
-    fn count_pages(bytes: &[u8]) -> usize {
-        let src = String::from_utf8_lossy(bytes);
-        let re = Regex::new(r"/Type\s*/Page[^s]")
-            .expect("valid static regex: /Type /Page pattern in PDF content");
-        re.find_iter(&src).count()
-    }
-
-    /// PDF text extraction via `pdf-extract` (bundled MuPDF).
-    ///
-    /// Parses the PDF in memory and extracts text from all pages.
-    /// Returns `None` when the document cannot be parsed or yields no text.
-    fn try_pdf_extract(bytes: &[u8]) -> Option<String> {
-        match extract_text_from_mem(bytes) {
-            Ok(text) => {
-                let text = text.trim().to_string();
-                if text.is_empty() { None } else { Some(text) }
-            }
-            Err(_) => None,
-        }
-    }
-}
-
-/// Compute readability-based quality score from extracted text.
-///
-/// Detects letter-spacing artifacts (e.g. "P r o c e e d i n g s") that
-/// produce garbled text yet pass a pure-length heuristic.
-fn compute_readability_score(text: &str, total_length: usize) -> f64 {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let word_count = words.len();
-
-    if word_count == 0 {
-        return 0.3;
-    }
-
-    // Average word length
-    let total_chars: usize = words.iter().map(|w| w.len()).sum();
-    let avg_word_length = total_chars as f64 / word_count as f64;
-
-    // Percentage of single-letter "words"
-    let single_letter_count = words.iter().filter(|w| w.len() == 1).count();
-    let single_letter_pct = single_letter_count as f64 / word_count as f64;
-
-    // Letter-spacing merged into one long string (no whitespace between chars)
-    if avg_word_length > 20.0 {
-        return 0.3;
-    }
-
-    // Unmerged letter-spacing: mostly single-char "words"
-    if avg_word_length < 2.0 {
-        return 0.3;
-    }
-
-    // Too many single-letter words (indicates spacing artifacts)
-    if single_letter_pct > 0.40 {
-        return 0.3;
-    }
-
-    // Length heuristic with punctuation boost
-    if total_length > 500 {
-        // Boost to 0.9 if text contains reasonable punctuation
-        if text.contains('.') || text.contains(',') || text.contains(';') {
-            0.9
-        } else {
-            0.8
-        }
-    } else {
-        0.3
-    }
-}
-
-#[async_trait]
-impl Extractor for PdfExtractor {
-    type Input = (String, Vec<u8>);
-
-    async fn extract(
-        &self,
-        input: (String, Vec<u8>),
-        params: ExtractParams,
-    ) -> Result<Article, ExtractionError> {
-        let (url, bytes) = input;
-        self.extract_article(&url, &bytes, &params)
-    }
-
-    fn method(&self) -> ExtractionMethod {
-        ExtractionMethod::PdfText
-    }
-}
+use crate::article::ExtractionError;
 
 // ---------------------------------------------------------------------------
 // PDF metadata extraction (regex-based, no parser module dependency)
@@ -370,7 +128,9 @@ fn parse_pdf_dict_value(dict_content: &str, key: &str) -> Option<String> {
 }
 
 /// Extract metadata from PDF /Info dictionary by finding the object and parsing it.
-fn extract_pdf_info_metadata(bytes: &[u8]) -> Result<Option<PdfMetadata>, ExtractionError> {
+pub(super) fn extract_pdf_info_metadata(
+    bytes: &[u8],
+) -> Result<Option<PdfMetadata>, ExtractionError> {
     let (info_num, info_gen, _) = match parse_pdf_trailer(bytes)? {
         Some(v) => v,
         None => return Ok(None),
@@ -391,12 +151,16 @@ fn extract_pdf_info_metadata(bytes: &[u8]) -> Result<Option<PdfMetadata>, Extrac
 }
 
 /// Extract PDF creation date from XMP metadata or /Info dict.
-/// Converts PDF date format (D:20240726123456+02'00') to ISO 8601.
-fn normalize_pdf_date(date_str: &str) -> Option<String> {
+/// Converts PDF date format (D:20240726123456+02'00') to ISO 8601,
+/// preserving the UTC offset instead of hardcoding `Z`.
+pub(super) fn normalize_pdf_date(date_str: &str) -> Option<String> {
     let date_str = date_str.trim();
-    // PDF date format: D:YYYYMMDDHHmmSSOHH'mm'
-    let re = Regex::new(r"^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?")
-        .expect("valid static regex: PDF date format D:YYYYMMDDHHmmSS");
+    // PDF date format: D:YYYYMMDDHHmmSSOHH'mm' where O is the UTC offset
+    // sign (`+`, `-`, or `Z`) and HH'mm' the offset hours/minutes.
+    let re = Regex::new(
+        r"^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([Z+-])?(\d{2})?'?(\d{2})?'?",
+    )
+    .expect("valid static regex: PDF date format D:YYYYMMDDHHmmSS");
     let caps = re.captures(date_str)?;
 
     let year = &caps[1];
@@ -406,15 +170,45 @@ fn normalize_pdf_date(date_str: &str) -> Option<String> {
     let min = caps.get(5).map_or("00", |m| m.as_str());
     let sec = caps.get(6).map_or("00", |s| s.as_str());
 
-    Some(format!(
-        "{}-{}-{}T{}:{}:{}Z",
-        year, month, day, hour, min, sec
-    ))
+    let naive = chrono::NaiveDateTime::parse_from_str(
+        &format!("{year}-{month}-{day} {hour}:{min}:{sec}"),
+        "%Y-%m-%d %H:%M:%S",
+    )
+    .ok()?;
+
+    // Preserve the PDF UTC offset rather than assuming `Z`.
+    let offset_secs = match caps.get(7).map(|m| m.as_str()) {
+        Some("+") => {
+            let oh = caps
+                .get(8)
+                .map_or(0, |m| m.as_str().parse::<i32>().unwrap_or(0));
+            let om = caps
+                .get(9)
+                .map_or(0, |m| m.as_str().parse::<i32>().unwrap_or(0));
+            oh * 3600 + om * 60
+        }
+        Some("-") => {
+            let oh = caps
+                .get(8)
+                .map_or(0, |m| m.as_str().parse::<i32>().unwrap_or(0));
+            let om = caps
+                .get(9)
+                .map_or(0, |m| m.as_str().parse::<i32>().unwrap_or(0));
+            -(oh * 3600 + om * 60)
+        }
+        _ => 0,
+    };
+    let offset = chrono::FixedOffset::east_opt(offset_secs)?;
+    let dt = chrono::TimeZone::from_local_datetime(&offset, &naive).single()?;
+
+    Some(dt.to_rfc3339())
 }
 
 /// Find and extract XMP metadata from a PDF file.
 /// XMP is stored as a stream object referenced from the catalog's /Metadata entry.
-fn extract_pdf_xmp_metadata(bytes: &[u8]) -> Result<Option<PdfMetadata>, ExtractionError> {
+pub(super) fn extract_pdf_xmp_metadata(
+    bytes: &[u8],
+) -> Result<Option<PdfMetadata>, ExtractionError> {
     // Find /Metadata reference in the catalog (root) object
     // First find the root object number from trailer
     let (_, _, root_num) = parse_pdf_trailer(bytes)?
@@ -465,15 +259,16 @@ fn extract_pdf_xmp_metadata(bytes: &[u8]) -> Result<Option<PdfMetadata>, Extract
         .map_err(|e| ExtractionError::Parse(format!("XMP stream is not valid UTF-8: {e}")))?;
 
     // Extract Dublin Core metadata from XMP
+    let to_opt = |val: Option<String>| val.filter(|s| !s.is_empty());
     let author = extract_xmp_field(xml_str, "creator");
     let title = extract_xmp_field(xml_str, "title");
     let date = extract_xmp_field(xml_str, "date");
 
     Ok(Some(PdfMetadata {
-        author: author.filter(|s| !s.is_empty()),
-        title: title.filter(|s| !s.is_empty()),
+        author: to_opt(author),
+        title: to_opt(title),
         creator: None,
-        creation_date: date.filter(|s| !s.is_empty()),
+        creation_date: to_opt(date),
     }))
 }
 

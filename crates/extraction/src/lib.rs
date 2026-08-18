@@ -12,7 +12,7 @@ pub use article::{
 pub use dispatch::AutoExtractor;
 pub use extractor::{Extractor, SourceType, domain_authority};
 pub use pdf::PdfExtractor;
-pub use quality::ContentQuality;
+pub use quality::{ContentQuality, NAV_TOKENS, is_nav_dense};
 pub use web::WebExtractor;
 
 pub mod web;

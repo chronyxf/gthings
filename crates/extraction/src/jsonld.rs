@@ -1,12 +1,8 @@
-/// JSON-LD structured data extraction.
-///
-/// Parses raw JSON-LD strings (from `<script type="application/ld+json">` blocks)
-/// to extract author, published date, and other structured metadata.
-/// Accepts the combined inner text of all JSON-LD script blocks
-/// (each chunk is parsed separately and results are unioned).
-///
 /// Extract author and published date from raw JSON-LD script content.
-/// `chunks` is the inner text of each `<script type="application/ld+json">` block.
+///
+/// `chunks` is the inner text of each `<script type="application/ld+json">`
+/// block; each chunk is parsed independently and the first author/published
+/// values win.
 pub fn extract_jsonld(chunks: &[String]) -> (Option<String>, Option<String>) {
     let mut author = None;
     let mut published = None;
@@ -32,14 +28,8 @@ pub fn extract_jsonld(chunks: &[String]) -> (Option<String>, Option<String>) {
 
         for item in &items {
             if author.is_none() {
-                if let Some(a) = item.get("author") {
-                    if let Some(s) = a.as_str() {
-                        author = Some(s.to_string());
-                    } else if let Some(obj) = a.as_object() {
-                        if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
-                            author = Some(name.to_string());
-                        }
-                    }
+                if let Some(a) = item.get("author").and_then(first_name) {
+                    author = Some(a);
                 }
             }
             if published.is_none() {
@@ -48,18 +38,28 @@ pub fn extract_jsonld(chunks: &[String]) -> (Option<String>, Option<String>) {
                 }
             }
             if author.is_none() {
-                if let Some(pub_val) = item.get("publisher") {
-                    if let Some(obj) = pub_val.as_object() {
-                        if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
-                            author = Some(name.to_string());
-                        }
-                    }
+                if let Some(p) = item.get("publisher").and_then(first_name) {
+                    author = Some(p);
                 }
             }
         }
     }
 
     (author, published)
+}
+
+/// Extract a display name from a JSON-LD value that is either a plain string
+/// (e.g. `"author": "John"`) or an object carrying a `name` field (e.g.
+/// `{"@type":"Person","name":"Jane Doe"}`). Shared by the `author` and
+/// `publisher` branches, which are structurally identical.
+fn first_name(val: &serde_json::Value) -> Option<String> {
+    if let Some(s) = val.as_str() {
+        Some(s.to_string())
+    } else if let Some(obj) = val.as_object() {
+        obj.get("name").and_then(|n| n.as_str()).map(str::to_string)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
