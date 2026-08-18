@@ -16,6 +16,7 @@ members = [
     "crates/common",
     "crates/extraction",
     "crates/search",
+    "crates/serve",
 ]
 
 [workspace.package]
