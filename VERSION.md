@@ -7,6 +7,7 @@ Each crate versioned independently. One crate per commit. Never batch.
 1. **Diff overview**: `git diff --stat` — read the full list. Do not skip this step.
 2. **Map files to crates** using the crate-prefix table below.
 3. **Blockers**: `cargo test --workspace`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo fmt --all -- --check` MUST pass first. If any fails, stop. Do not proceed until fixed.
+4. **CI parity**: the same three gates also run automatically on Linux via GitHub Actions (ci.yml `check` job) — this verifies cross-platform, it does not replace the local pre-flight.
 
 ### Crate-prefix table
 
@@ -114,14 +115,17 @@ cargo fmt --all -- --check
 
 Must be clean and formatted. If not, investigate and fix before proceeding.
 
-### Step 7 — Publish
+### Step 7 — Release (automated)
+
+Release = create and push the version tag; the CI/CD `release` job then publishes the crate to crates.io (and, for `gthings-serve` tags, builds and pushes the Docker image):
 
 ```bash
-cargo publish -p <package>
+git tag <crate>/v<version>          # e.g. gthings-serve/v0.1.1
+git push origin <crate>/v<version>
 ```
 
-- Skip if no crates.io token configured (`cargo login` not set).
-- Publish in dependency order (bottom-up per table above).
+- The tag version MUST match the crate manifest version (CI validates it).
+- Manual `cargo publish -p <package>` remains possible as a fallback, but the tag flow is the standard path.
 
 ---
 
@@ -144,7 +148,7 @@ cargo publish -p <package>
 [ ] knope release (or manual fallback after 2 failures)
 [ ] git commit -m "type(crate): description"  (must pass pre-commit hook)
 [ ] git status --short                         (must be clean)
-[ ] cargo publish -p <package>                 (skip if no token)
+[ ] git tag <crate>/v<version> && git push origin <crate>/v<version>   (CD publishes)
 ```
 
 Repeat for each changed crate in dependency order. Never batch crates or commits.
@@ -156,11 +160,9 @@ Repeat for each changed crate in dependency order. Never batch crates or commits
 The daemon image (Dockerfile) ships `gthings serve` for Docker deployments.
 The image version tracks the `gthings-serve` crate version.
 
-### Prerequisites
-- Docker daemon running
-- Authenticated to the target registry (`docker login`)
+The CI/CD `release` job builds and pushes the image automatically when a `gthings-serve/v<version>` tag is pushed (image tag = the `gthings-serve` crate version).
 
-### Build (release)
+### Local build (testing / fallback)
 ```bash
 docker build -t <namespace>/gthings:<gthings-serve-version> .
 ```
@@ -168,22 +170,18 @@ docker build -t <namespace>/gthings:<gthings-serve-version> .
 - The builder stage runs `cargo build --release --locked -p gthings`.
 - Example: `docker build -t yourname/gthings:0.1.0 .`
 
-### Tag
-```bash
-docker tag <namespace>/gthings:<gthings-serve-version> <namespace>/gthings:latest
-```
-- `latest` is optional and only pushed intentionally.
-
-### Push
-```bash
-docker push <namespace>/gthings:<gthings-serve-version>
-docker push <namespace>/gthings:latest        # only if latest was tagged
-```
-
-### Release integration
-- Build and push the image whenever `gthings-serve` is released (after the crates.io publish of `gthings-serve`).
-- The image contains the full `gthings` binary (serve + all CLI subcommands); the entrypoint runs the daemon.
-
 ### Version rule
 - Image tag = the `gthings-serve` crate version at release time.
 - If the daemon image is released independently of a crate publish, use the next unpublished `gthings-serve` version.
+
+---
+
+## CI/CD Automation (GitHub Actions)
+
+| Trigger | What runs |
+|---------|-----------|
+| push to `main` / PR | `check` (Linux fmt + clippy -D warnings + build + test) and `package` (crates.io dry-run for all crates) |
+| tag `<crate>/v<version>` | `check` + `package` + `release` (publish the tagged crate; on `gthings-serve/*` tags also build+push the Docker image) |
+
+- Secrets live in the `gthings-prod` environment: `CRATES_IO_TOKEN`, `DOCKER_USERNAME`, `DOCKER_PASSWORD`.
+- The tag glob is `**` (slash-containing tags like `gthings-serve/v0.1.1` are supported).
